@@ -2,18 +2,20 @@
 """Filesystem email-inbox bridge.
 
 Watches `agents/*/email_inbox/` for new files. When a top-level file
-appears in `agents/<self>/email_inbox/<filename>`, appends a line to
-`bus/email_inbox/<self>.md` and moves the source file to
-`agents/<self>/email_inbox/processed/`.
+appears, appends an email-shaped line to `bus/email_inbox/<self>.md`
+and moves the source file to `agents/<self>/email_inbox/processed/`.
 
-If the file looks RFC822-shaped (has `From:`/`Subject:` headers),
-the bus line is formatted with those headers. Otherwise the body is
-treated as plain content with sender parsed from the filename.
+Sender is determined from the file's UID (kernel-set owner) — not
+parsed from the filename. This makes attribution unforgeable as long
+as agents run under distinct unix users. If a `From:` header is
+present in the body, it takes precedence (operator override).
 
-Newly-created agents (mkdir under agents/) are watched automatically.
+Newly-created agent dirs (mkdir under agents/) are watched
+automatically.
 """
 import os
 import pathlib
+import pwd
 import shutil
 import sys
 import time
@@ -30,23 +32,17 @@ def now():
     return time.strftime("%Y%m%dT%H%M%S")
 
 
-def known_agents():
-    if not AGENTS_DIR.is_dir():
-        return []
-    return [d.name for d in AGENTS_DIR.iterdir() if d.is_dir()]
-
-
-def parse_sender_from_filename(filename: str, agents: list[str]) -> str:
-    """Longest known-agent name that filename starts with, followed by '-'."""
-    candidates = sorted(
-        (n for n in agents if filename.startswith(n + "-")),
-        key=len, reverse=True,
-    )
-    if candidates:
-        return candidates[0]
-    if "-" in filename:
-        return filename.split("-", 1)[0]
-    return filename
+def sender_from_uid(path: pathlib.Path) -> str:
+    """Use the file's owner UID as the sender id. Falls back to numeric uid
+    if the username can't be resolved."""
+    try:
+        uid = path.stat().st_uid
+    except OSError:
+        return "?"
+    try:
+        return pwd.getpwuid(uid).pw_name
+    except KeyError:
+        return f"uid:{uid}"
 
 
 def parse_email(text: str) -> tuple[dict[str, str], str]:
@@ -97,22 +93,17 @@ def deliver(drop: pathlib.Path):
     text = file_text(drop)
     headers, body = parse_email(text)
     body = body.rstrip("\n")
-    if headers:
-        sender = headers.get("from") or parse_sender_from_filename(drop.name, known_agents())
-        ts = headers.get("date") or now()
-        subject = headers.get("subject", "")
-        head_line = f"[{sender} {ts}]"
-        if subject:
-            head_line += f" Subject: {subject}"
-        if "\n" in body:
-            line = f"{head_line}\n```\n{body}\n```\n"
-        else:
-            line = f"{head_line} {body}\n"
+    # UID is the source of truth for sender. `From:` only overrides if
+    # explicitly set (operator scripts may want to attribute to a logical
+    # role rather than the running unix user).
+    sender = headers.get("from") or sender_from_uid(drop)
+    ts = headers.get("date") or now()
+    subject = headers.get("subject", "(no subject)")
+    head_line = f"[{sender} {ts}] Subject: {subject}"
+    if "\n" in body:
+        line = f"{head_line}\n{body}\n---\n"
     else:
-        sender = parse_sender_from_filename(drop.name, known_agents())
-        if "\n" in body:
-            body = "```\n" + body + "\n```"
-        line = f"[{sender} {now()}] {body}\n"
+        line = f"{head_line}\n{body}\n---\n"
     BUS_INBOX_DIR.mkdir(parents=True, exist_ok=True)
     with inbox_md.open("a") as f:
         f.write(line)

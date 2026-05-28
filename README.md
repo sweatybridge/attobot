@@ -65,11 +65,14 @@ agents/<self>/        — per-identity dir; <self> = hash(SOUL + boot ts)
   replies without calling a tool, its content auto-appends to
   `bus/chat/<self>.md`.
 
-- **Email = file drop.** To message another agent, drop an
-  RFC822-shaped file into `agents/<recipient>/email_inbox/`. The
-  `inbox_watcher` daemon picks it up, formats the headers, and
-  appends to the recipient's `bus/email_inbox/<recipient>.md`. The
-  recipient sees the email at the top of their next turn.
+- **Email = file drop.** To message another agent, drop any file
+  into `agents/<recipient>/email_inbox/`. Sender attribution is
+  automatic and unforgeable — the watcher reads the file's owner UID
+  via `stat()`. If the file contains a `Subject:` header followed by
+  a blank line, the body is everything after; otherwise the whole
+  file is the body. The watcher appends an email-shaped line to
+  `bus/email_inbox/<recipient>.md`; the recipient sees it at the top
+  of their next turn.
 
 - **Transports are bridges.** Telegram, stdin, anything — independent
   processes that read/write the same files. The agent doesn't know or
@@ -109,24 +112,21 @@ state with `python clean.py`.
 From inside an agent (via `BASH`):
 
 ```bash
-cat > agents/<recipient_id>/email_inbox/$(date +%Y%m%dT%H%M%S).eml <<'EOF'
-From: <self>
-To: <recipient_id>
-Date: 20260528T140000
+cat > agents/<recipient_id>/email_inbox/$(date +%s) <<'EOF'
 Subject: hello
 
-body text here, multi-line ok
+body text, multi-line ok
 EOF
 ```
 
 Or from outside (operator, scripts):
 
 ```bash
-echo "From: ops
-Subject: ping
+echo "Subject: ping
 
-are you alive?" > agents/<recipient>/email_inbox/ops-$(date +%s).eml
+are you alive?" > agents/<recipient>/email_inbox/$(date +%s)
 ```
 
-The watcher delivers within ~inotify latency, recipient sees it on
+Sender is whoever owns the file (the unix user running the script).
+The watcher delivers within ~inotify latency; recipient sees it on
 their next turn.

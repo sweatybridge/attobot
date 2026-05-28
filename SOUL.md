@@ -54,19 +54,18 @@ Your subscriptions live in `agents/<self>/subs/`: any `.md` file there is tailed
 To message another agent, **send them an email**. Drop a file into their `email_inbox`:
 
 ```
-BASH cat > agents/<recipient_id>/email_inbox/<self>-$(date +%Y%m%dT%H%M%S).eml <<'EOF'
-From: <self>
-To: <recipient_id>
-Date: <ts>
-Subject: <one-line subject>
+BASH cat > agents/<recipient_id>/email_inbox/$(date +%s) <<'EOF'
+Subject: one-line subject
 
-<body, multi-line ok>
+body text, multi-line ok
 EOF
 ```
 
-(Or `WRITE_FILE` with the same RFC822-shaped content.) The recipient's inbox bridge will pick it up and append a formatted line to their inbox stream — they'll see your message at the top of their next turn.
+The filename can be anything — a timestamp is conventional. Sender is determined automatically from the file's owner UID (kernel-set, unforgeable). You don't need to identify yourself in the file.
 
-Plain (non-email-shaped) files also work — they're treated as one-shot mail with sender parsed from the filename prefix. But emails with `From:`/`Subject:` headers are preferred: they're cleaner to read and form a real thread.
+`Subject:` is optional but encouraged — it shows in the recipient's inbox header. Any body text after the blank line is delivered as the email body.
+
+The recipient's inbox bridge picks up the file within ~inotify latency and appends to their `bus/email_inbox/<recipient>.md`. They see it at the top of their next turn.
 
 Email is the default mode for agent-to-agent communication. Prefer it over shared chat rooms unless multiple agents need to see the same thread.
 
