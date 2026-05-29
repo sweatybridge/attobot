@@ -1,164 +1,40 @@
 #!/usr/bin/env python3
-"""Filesystem email-inbox bridge.
-
-Watches `agents/*/email_inbox/` for new files. When a top-level file
-appears, appends an email-shaped line to `bus/email_inbox/<self>.md`
-and moves the source file to `agents/<self>/email_inbox/processed/`.
-
-Sender is determined from the file's UID (kernel-set owner) — not
-parsed from the filename. This makes attribution unforgeable as long
-as agents run under distinct unix users. If a `From:` header is
-present in the body, it takes precedence (operator override).
-
-Newly-created agent dirs (mkdir under agents/) are watched
-automatically.
-"""
-import os
-import pathlib
-import pwd
-import shutil
-import sys
-import time
-
+"""File in agents/<self>/email_inbox/ → line in bus/email_inbox/<self>.md."""
+import config  # loads .env into os.environ
+import bus
+import os, pathlib, pwd, time
 from inotify_simple import INotify, flags as iflags
 
-AGENTS_DIR = pathlib.Path(os.environ.get("AGENTS_DIR", "agents"))
-BUS_INBOX_DIR = pathlib.Path(os.environ.get("BUS_INBOX_DIR", "bus/email_inbox"))
-INBOX_SUBDIR = "email_inbox"
-PREVIEW_CHARS = 4000
+AGENTS = pathlib.Path(os.environ.get("AGENTS_DIR", "agents"))
+BUS_EMAIL = pathlib.Path(os.environ.get("BUS_DIR", "bus")) / "email"
+PREVIEW = int(os.environ.get("INBOX_PREVIEW", "1000"))
 
+def now(): return time.strftime("%Y%m%dT%H%M%S")
 
-def now():
-    return time.strftime("%Y%m%dT%H%M%S")
+def deliver(drop):
+    sender = pwd.getpwuid(drop.stat().st_uid).pw_name
+    text = drop.read_bytes()[:PREVIEW * 4].decode("utf-8", errors="replace")[:PREVIEW]
+    bus.append(BUS_EMAIL / f"{drop.parent.parent.name}.log", f"[{sender} {now()}] {drop}\n{text}\n---\n")
 
+AGENTS.mkdir(parents=True, exist_ok=True)
+ino = INotify()
+wds = {}
 
-def sender_from_uid(path: pathlib.Path) -> str:
-    """Use the file's owner UID as the sender id. Falls back to numeric uid
-    if the username can't be resolved."""
-    try:
-        uid = path.stat().st_uid
-    except OSError:
-        return "?"
-    try:
-        return pwd.getpwuid(uid).pw_name
-    except KeyError:
-        return f"uid:{uid}"
+def watch(d):
+    inbox = d / "email_inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    wds[ino.add_watch(str(inbox), iflags.CREATE | iflags.MOVED_TO)] = inbox
 
+for d in AGENTS.iterdir():
+    if d.is_dir(): watch(d)
+wds[ino.add_watch(str(AGENTS), iflags.CREATE)] = AGENTS
 
-def parse_email(text: str) -> tuple[dict[str, str], str]:
-    """Extract RFC822-ish headers if present. Returns (headers, body).
-    Headers empty if file isn't email-shaped."""
-    if "\n\n" not in text:
-        return {}, text
-    head, _, body = text.partition("\n\n")
-    headers: dict[str, str] = {}
-    for line in head.splitlines():
-        if ":" in line and not line.startswith(" "):
-            k, _, v = line.partition(":")
-            headers[k.strip().lower()] = v.strip()
-    if "from" not in headers and "subject" not in headers:
-        return {}, text
-    return headers, body
-
-
-def is_top_level_drop(p: pathlib.Path) -> bool:
-    if not p.is_file():
-        return False
-    if p.name.startswith(".") or p.name.endswith(".tmp"):
-        return False
-    if p.parent.name == "processed":
-        return False
-    return True
-
-
-def file_text(path: pathlib.Path) -> str:
-    """First PREVIEW_CHARS as utf-8, or a path marker if binary."""
-    try:
-        with path.open("rb") as f:
-            head = f.read(PREVIEW_CHARS * 4)
-    except OSError as e:
-        return f"[read failed: {e}]"
-    if b"\x00" in head:
-        return f"[binary file at {path}]"
-    try:
-        return head.decode("utf-8", errors="strict")[:PREVIEW_CHARS]
-    except UnicodeDecodeError:
-        return f"[non-utf8 file at {path}]"
-
-
-def deliver(drop: pathlib.Path):
-    """drop = agents/<recipient>/email_inbox/<filename>"""
-    recipient = drop.parent.parent.name
-    inbox_md = BUS_INBOX_DIR / f"{recipient}.md"
-    text = file_text(drop)
-    headers, body = parse_email(text)
-    body = body.rstrip("\n")
-    # UID is the source of truth for sender. `From:` only overrides if
-    # explicitly set (operator scripts may want to attribute to a logical
-    # role rather than the running unix user).
-    sender = headers.get("from") or sender_from_uid(drop)
-    ts = headers.get("date") or now()
-    subject = headers.get("subject", "(no subject)")
-    head_line = f"[{sender} {ts}] Subject: {subject}"
-    if "\n" in body:
-        line = f"{head_line}\n{body}\n---\n"
-    else:
-        line = f"{head_line}\n{body}\n---\n"
-    BUS_INBOX_DIR.mkdir(parents=True, exist_ok=True)
-    with inbox_md.open("a") as f:
-        f.write(line)
-    processed = drop.parent / "processed"
-    processed.mkdir(exist_ok=True)
-    try:
-        shutil.move(str(drop), str(processed / drop.name))
-    except OSError as e:
-        print(f"move failed for {drop}: {e}", file=sys.stderr)
-
-
-def run():
-    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-    ino = INotify()
-    inbox_mask = iflags.CREATE | iflags.MOVED_TO
-    wds: dict[int, pathlib.Path] = {}
-
-    def watch_agent(agent_dir: pathlib.Path):
-        inbox = agent_dir / INBOX_SUBDIR
-        inbox.mkdir(parents=True, exist_ok=True)
-        try:
-            wd = ino.add_watch(str(inbox), inbox_mask)
-            wds[wd] = inbox
-            print(f"watching {inbox}")
-        except OSError as e:
-            print(f"add_watch {inbox}: {e}", file=sys.stderr)
-
-    for d in AGENTS_DIR.iterdir():
-        if d.is_dir():
-            watch_agent(d)
-
-    # Watch AGENTS_DIR itself so new agents get watched on creation.
-    root_wd = ino.add_watch(str(AGENTS_DIR), iflags.CREATE)
-    wds[root_wd] = AGENTS_DIR
-
-    while True:
-        for ev in ino.read(timeout=None):
-            parent = wds.get(ev.wd)
-            if parent is None:
-                continue
-            target = parent / ev.name
-            if parent == AGENTS_DIR:
-                if target.is_dir():
-                    watch_agent(target)
-                continue
-            if is_top_level_drop(target):
-                deliver(target)
-
-
-def main():
-    try:
-        run()
-    except KeyboardInterrupt:
-        pass
-
-
-if __name__ == "__main__":
-    main()
+while True:
+    for ev in ino.read():
+        parent = wds.get(ev.wd)
+        if parent is None: continue
+        t = parent / ev.name
+        if parent == AGENTS:
+            if t.is_dir(): watch(t)
+        elif t.is_file() and not t.name.startswith("."):
+            deliver(t)

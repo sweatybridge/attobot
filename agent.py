@@ -1,40 +1,24 @@
 #!/usr/bin/env python3
 """Minimal blob-memory agent. See README.md for design."""
+import config  # loads .env into os.environ
+import bus
 import json, os, re, sys, time, hashlib, signal, subprocess, litellm
 
-MODEL = "openai/deepseek-v4-pro"
-API_BASE = "https://api.deepseek.com/v1"
-BLOB_DIR = "blobs"
-BUS_DIR = "bus"
-BUS_CHAT_DIR = "bus/chat"
-BUS_INBOX_DIR = "bus/email_inbox"
-CONTEXT_LIMIT = 160000  # ~40k tokens at 4 chars/token
-RESULT_STASH_LIMIT = 2000
-TOOL_TIMEOUT = 60
-LIFE_TAIL = 50
-AGENTS_DIR = "agents"
-MEMORY_LIMIT = 10000
-HEARTBEAT_INTERVAL = 60
+MODEL = os.environ.get("MODEL", "openai/deepseek-v4-pro")
+API_BASE = os.environ.get("API_BASE", "https://api.deepseek.com/v1")
+BLOB_DIR = os.environ.get("BLOB_DIR", "blobs")
+BUS_DIR = os.environ.get("BUS_DIR", "bus")
+CONTEXT_LIMIT = int(os.environ.get("CONTEXT_LIMIT", "160000"))
+RESULT_STASH_LIMIT = int(os.environ.get("RESULT_STASH_LIMIT", "2000"))
+TOOL_TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "60"))
+LIFE_TAIL = int(os.environ.get("LIFE_TAIL", "50"))
+AGENTS_DIR = os.environ.get("AGENTS_DIR", "agents")
+MEMORY_LIMIT = int(os.environ.get("MEMORY_LIMIT", "10000"))
+HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))
 VERBOSE = "--verbose" in sys.argv
-
-REF_RE = re.compile(r'◱hash=(\w+) gist=[^◲]*◲')   # matches blob refs in context
-# escaping: ◱◲ = structure (ref delimiters), ◰◳ = escape wrapper (like HTML & ;)
-# ◰➀◳=◰  ◰➁◳=◳  ◰➂◳=◱  ◰➃◳=◲
-_ESC = {'➀': '◰', '➁': '◳', '➂': '◱', '➃': '◲'}
-_RESC = {v: k for k, v in _ESC.items()}
-
-def escape_refs(text):
-    """Escape structural chars so they won't be parsed as live refs. Single-pass to avoid cascade."""
-    return re.sub(r'[◰◳◱◲]', lambda m: '◰' + _RESC[m.group()] + '◳', text)
-
-def unescape_refs(text):
-    """Reverse escape_refs. Single-pass regex to avoid ordering issues."""
-    return re.sub(r'◰([➀➁➂➃])◳', lambda m: _ESC[m.group(1)], text)
 
 # native tool calling — tool definitions as JSON schemas
 TOOLS = [
-    {"type": "function", "function": {"name": "READ_BLOB", "description": "Read a blob by hash or ref. Optional offset/limit for large blobs.",
-        "parameters": {"type": "object", "properties": {"hash": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["hash"]}}},
     {"type": "function", "function": {"name": "READ_FILE", "description": "Read a file. Optional offset/limit (line numbers) for large files.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
     {"type": "function", "function": {"name": "WRITE_FILE", "description": "Overwrite a file with new content.",
@@ -45,13 +29,11 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"dir": {"type": "string", "default": ""}}, "required": []}}},
     {"type": "function", "function": {"name": "BASH", "description": "Run a shell command (60s timeout).",
         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}},
-    {"type": "function", "function": {"name": "COMPACT", "description": "Dump the first half of context to a blob, leaving a ref in its place.",
-        "parameters": {"type": "object", "properties": {}, "required": []}}},
-    {"type": "function", "function": {"name": "UNCOMPACT", "description": "Rehydrate a compacted blob ref inline in context.",
-        "parameters": {"type": "object", "properties": {"hash": {"type": "string"}}, "required": ["hash"]}}},
+    {"type": "function", "function": {"name": "STASH", "description": "Save text to a blob at blobs/<hash>, return [stash <hash>]. Recall later with READ_FILE blobs/<hash>.",
+        "parameters": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}}},
 ]
 
-for d in (BLOB_DIR, BUS_CHAT_DIR, BUS_INBOX_DIR, AGENTS_DIR): os.makedirs(d, exist_ok=True)
+for d in (BLOB_DIR, BUS_DIR, AGENTS_DIR): os.makedirs(d, exist_ok=True)
 
 SELF = None      # agent identity — hash of (SOUL + boot timestamp), set in main()
 SELF_DIR = None  # agents/<SELF>/
@@ -59,7 +41,6 @@ LIFE_PATH = None # agents/<SELF>/LIFE.md
 MEMORY_PATH = None   # agents/<SELF>/MEMORY.md (per-agent working memory)
 INBOX_PATH = None    # bus/email_inbox/<SELF>.md
 INBOX_DROP_DIR = None  # agents/<SELF>/email_inbox/
-tail_offsets = {}  # chat_id -> last byte offset read
 
 def now():
     return time.strftime("%Y%m%dT%H%M%S")
@@ -71,22 +52,13 @@ def life(event):
     if VERBOSE:
         print(line, flush=True)
 
-def stash(content, gist="", refs=()):
-    """Write content to a blob file, return (hash, ref_string)."""
-    refs_line = " ".join(refs)
-    body = f"---\nat: {now()}\ngist: {gist}\nrefs: {refs_line}\n---\n{content}"
-    h = hashlib.sha256(body.encode()).hexdigest()[:12]
-    open(f"{BLOB_DIR}/{h}", "w").write(body)
-    safe = escape_refs(gist.replace("\n", " "))[:101]
-    return h, f"◱hash={h} gist={safe}◲"
-
-def blob_body(h):
-    """Return blob content (everything after the frontmatter)."""
-    text = open(f"{BLOB_DIR}/{h}").read()
-    return text.split("\n---\n", 1)[1] if "\n---\n" in text else text
+def stash(content):
+    h = hashlib.sha256(content.encode()).hexdigest()[:12]
+    open(f"{BLOB_DIR}/{h}", "w").write(content)
+    return h, f"[stash {h}]"
 
 def llm(prompt, *, strip_reasoning, tools=None):
-    """Call LLM. Returns (content, reasoning, tool_calls). Compaction calls pass tools=None."""
+    """Call LLM. Returns (content, reasoning, tool_calls)."""
     kwargs = dict(model=MODEL, api_base=API_BASE, api_key=os.environ["DEEPSEEK_API_KEY"],
                   messages=[{"role": "user", "content": prompt}])
     if tools:
@@ -98,19 +70,6 @@ def llm(prompt, *, strip_reasoning, tools=None):
     if strip_reasoning:
         return content, "", None
     return content, reasoning, tc
-
-def compact(context):
-    """Dump the first half of context to a blob, leave a ref in its place."""
-    lines = context.splitlines()
-    if len(lines) < 2:
-        return context
-    half = len(lines) // 2
-    head = "\n".join(lines[:half])
-    rest = "\n".join(lines[half:])
-    gist = head[:80].replace("\n", " ").strip()
-    _, ref = stash(head, gist=f"forgotten: {gist}")
-    life(f"compact: {len(context)}ch -> ref {ref} + {len(rest)}ch tail")
-    return f"{ref}\n{rest}"
 
 def _read_lines(path, offset=0, limit=None):
     content = open(path).read()
@@ -135,11 +94,6 @@ def last_turn_number():
 
 def run_tool(name, args):
     """Execute a tool. args is a dict from parsed JSON."""
-    if name == "READ_BLOB":
-        h = args["hash"]
-        m = REF_RE.search(h)  # accept full ref string or bare hash
-        if m: h = m.group(1)
-        return _read_lines(f"{BLOB_DIR}/{h}", args.get("offset", 0), args.get("limit"))
     if name == "READ_FILE":
         return _read_lines(args["path"], args.get("offset", 0), args.get("limit"))
     if name == "WRITE_FILE":
@@ -162,33 +116,29 @@ def run_tool(name, args):
     if name == "BASH":
         p = subprocess.run(args["cmd"], shell=True, capture_output=True, text=True, timeout=TOOL_TIMEOUT)
         return (p.stdout + p.stderr) or f"(exit {p.returncode}, no output)"
+    if name == "STASH":
+        _, ref = stash(args["content"])
+        return f"stashed: {ref}"
     return f"unknown tool: {name}"
 
 def tail_bus():
-    """Read new bytes from all subscribed bus streams, strip own lines, return tagged content."""
+    """Walk subs/ recursively. For each *.log (symlink to bus stream), read new content
+    since this consumer's cursor, strip own lines, return tagged content."""
+    import pathlib as _p
+    subs_dir = _p.Path(SELF_DIR) / "subs"
+    if not subs_dir.is_dir():
+        return ""
     blocks = []
     own_prefix = f"[{SELF} "
-    subs_dir = f"{SELF_DIR}/subs"
-    if not os.path.isdir(subs_dir):
-        return ""
-    for fname in sorted(os.listdir(subs_dir)):
-        if not fname.endswith(".md"):
+    for log_path in sorted(subs_dir.rglob("*.log")):
+        offset_path = log_path.with_suffix(".offset")
+        content = bus.read_new(str(log_path), str(offset_path))
+        if not content:
             continue
-        chat_id = fname[:-3]
-        path = f"{subs_dir}/{fname}"
-        try:
-            data = open(path).read()
-        except FileNotFoundError:
-            continue
-        offset = tail_offsets.get(chat_id, 0)
-        if len(data) <= offset:
-            tail_offsets[chat_id] = len(data)
-            continue
-        new = data[offset:]
-        tail_offsets[chat_id] = len(data)
-        lines = [ln for ln in new.splitlines() if ln and not ln.startswith(own_prefix)]
+        lines = [ln for ln in content.splitlines() if ln and not ln.startswith(own_prefix)]
         if lines:
-            blocks.append(f"[chat:{chat_id}]\n" + "\n".join(lines))
+            rel = log_path.relative_to(subs_dir).with_suffix("")
+            blocks.append(f"[{rel}]\n" + "\n".join(lines))
     return "\n\n".join(blocks)
 
 def main():
@@ -203,25 +153,33 @@ def main():
     else:
         soul_text = open("SOUL.md").read()
         boot_ts = now()
-        SELF, self_ref = stash(
-            f"soul:\n{soul_text}\nboot: {boot_ts}",
-            gist=f"agent identity, booted {boot_ts}",
-        )
+        SELF, self_ref = stash(f"soul:\n{soul_text}\nboot: {boot_ts}")
         resumed = False
     SELF_DIR = f"{AGENTS_DIR}/{SELF}"
     LIFE_PATH = f"{SELF_DIR}/LIFE.md"
     MEMORY_PATH = f"{SELF_DIR}/MEMORY.md"
-    INBOX_PATH = f"{BUS_INBOX_DIR}/{SELF}.md"
     INBOX_DROP_DIR = f"{SELF_DIR}/email_inbox"
-    os.makedirs(f"{SELF_DIR}/subs", exist_ok=True)
     os.makedirs(INBOX_DROP_DIR, exist_ok=True)
     os.makedirs(f"{INBOX_DROP_DIR}/processed", exist_ok=True)
-    os.makedirs(BUS_INBOX_DIR, exist_ok=True)
-    if not os.path.exists(INBOX_PATH):
-        open(INBOX_PATH, "w").write("")
-    inbox_sub = f"{SELF_DIR}/subs/email_inbox.md"
-    if not os.path.lexists(inbox_sub):
-        os.symlink(os.path.abspath(INBOX_PATH), inbox_sub)
+    import pathlib as _p
+    subs_root = _p.Path(SELF_DIR) / "subs"
+    pubs_root = _p.Path(SELF_DIR) / "pubs"
+    for kind in ["email", "telegram"]:
+        bus_path = _p.Path(f"{BUS_DIR}/{kind}/{SELF}.log")
+        bus_path.parent.mkdir(parents=True, exist_ok=True)
+        bus_path.touch(exist_ok=True)
+        sub = subs_root / kind / f"{SELF}.log"
+        sub.parent.mkdir(parents=True, exist_ok=True)
+        if not sub.is_symlink():
+            sub.symlink_to(bus_path.resolve())
+    for kind in ["chat"]:
+        bus_path = _p.Path(f"{BUS_DIR}/{kind}/{SELF}.log")
+        bus_path.parent.mkdir(parents=True, exist_ok=True)
+        bus_path.touch(exist_ok=True)
+        pub = pubs_root / kind / f"{SELF}.log"
+        pub.parent.mkdir(parents=True, exist_ok=True)
+        if not pub.is_symlink():
+            pub.symlink_to(bus_path.resolve())
     if not os.path.exists(MEMORY_PATH):
         open(MEMORY_PATH, "w").write("# Memory\n\nLearned preferences, strategies, and notes. Edit with EDIT_FILE.\n")
     soul = open("SOUL.md").read().replace("<self>", SELF)
@@ -229,13 +187,6 @@ def main():
     if resumed:
         ctx_path = f"{SELF_DIR}/context.md"
         context = open(ctx_path).read() if os.path.exists(ctx_path) else ""
-        subs_dir = f"{SELF_DIR}/subs"
-        for fname in os.listdir(subs_dir):
-            if fname.endswith(".md"):
-                try:
-                    tail_offsets[fname[:-3]] = os.path.getsize(f"{subs_dir}/{fname}")
-                except OSError:
-                    pass
         life(f"resumed self={SELF}")
         context += f"\n[resumed at {now()}]\n"
     else:
@@ -277,15 +228,12 @@ def main():
         resp = ""
         if reasoning: resp += f"<reasoning>\n{reasoning}\n</reasoning>\n"
         if content: resp += content
-        gist_text = resp[:50] + "…" + resp[-50:] if len(resp) > 101 else resp  # 50 + 1 (…) + 50
-        _, resp_ref = stash(resp, gist=f"turn {turn} resp: {gist_text}")
+        _, resp_ref = stash(resp)
         life(f"turn {turn} resp {resp_ref}")
         context += f"\n{resp}\n"
         if not tool_calls:
             if content.strip():
-                chat_path = f"{BUS_CHAT_DIR}/{SELF}.md"
-                with open(chat_path, "a") as f:
-                    f.write(f"[{SELF} {now()}] {content.strip()}\n")
+                bus.append(f"{SELF_DIR}/pubs/chat/{SELF}.log", f"[{SELF} {now()}] {content.strip()}\n")
             tool_called = False
             last_turn_end = time.time()
             open(f"{SELF_DIR}/context.md", "w").write(context)
@@ -298,40 +246,27 @@ def main():
         try:
             prev = signal.signal(signal.SIGALRM, _timeout_handler)
             signal.alarm(TOOL_TIMEOUT)
-            if name == "COMPACT":
-                context = compact(context)
-                result = f"compacted to {len(context)}ch"
-            elif name == "UNCOMPACT":
-                h = tc_args["hash"]
-                m = REF_RE.search(h)
-                if m: h = m.group(1)
-                body = blob_body(h)
-                found = False
-                for cm in REF_RE.finditer(context):
-                    if cm.group(1) == h:
-                        context = context[:cm.start()] + body + context[cm.end():]
-                        found = True
-                        break
-                result = f"uncompacted {h}" if found else f"ref {h} not in context"
-            else:
-                result = run_tool(name, tc_args)
+            result = run_tool(name, tc_args)
         except Exception as e:
             result = f"error: {e}"
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, prev)
         # all tools get their result into context
-        gist_text = result[:50] + "…" + result[-50:] if len(result) > 101 else result  # 50 + 1 (…) + 50
-        _, result_ref = stash(result, gist=f"turn {turn} {name}: {gist_text}")
-        args_str = json.dumps(tc_args, ensure_ascii=False)
-        args_short = args_str[:50] + "…" + args_str[-50:] if len(args_str) > 101 else args_str  # 50 + 1 (…) + 50
-        life(f"turn {turn} {name} `{args_short}` result {result_ref}")
-        if name == "READ_BLOB" or len(result) <= RESULT_STASH_LIMIT:
-            context += f"\n[{name}] {escape_refs(result)}\n"
+        _, result_ref = stash(result)
+        life(f"turn {turn} {name} result {result_ref}")
+        if len(result) <= RESULT_STASH_LIMIT:
+            context += f"\n[{name}] {result}\n"
         else:
             context += f"\n[{name}] {result_ref}\n"
         while len(context) > CONTEXT_LIMIT:
-            context = compact(context)
+            lines = context.splitlines()
+            if len(lines) < 2: break
+            half = len(lines) // 2
+            head, rest = "\n".join(lines[:half]), "\n".join(lines[half:])
+            _, ref = stash(head)
+            context = f"{ref}\n{rest}"
+            life(f"stashed older half -> {ref} (+{len(rest)}ch tail)")
         open(f"{SELF_DIR}/context.md", "w").write(context)
 
 if __name__ == "__main__":
