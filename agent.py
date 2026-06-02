@@ -125,11 +125,9 @@ def compact(messages):
 def serialize_assistant(msg):
     out = {"role": "assistant", "content": msg.content or ""}
     if getattr(msg, "tool_calls", None):
-        out["tool_calls"] = [
-            {"id": tc.id, "type": "function",
-             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-            for tc in msg.tool_calls
-        ]
+        tc = msg.tool_calls[0]
+        out["tool_calls"] = [{"id": tc.id, "type": "function",
+            "function": {"name": tc.function.name, "arguments": tc.function.arguments}}]
     return out
 
 def main():
