@@ -23,6 +23,7 @@ TG_DIR = AGENT / "bridges" / "tg"
 TG_PUB = TG_DIR / "pubs" / "telegram" / f"{SELF}.log"   # writes telegram inbound here (→ bus/telegram)
 TG_SUB = TG_DIR / "subs" / "chat" / f"{SELF}.log"       # reads agent chat here (→ bus/chat)
 TG_SUB_OFFSET = TG_DIR / "subs" / "chat" / f"{SELF}.offset"
+TG_POLL_OFFSET = TG_DIR / "poll.offset"                 # telegram update_id cursor
 
 for kind, link, side in [("telegram", TG_PUB, "pubs"), ("chat", TG_SUB, "subs")]:
     bus_path = pathlib.Path(BUS_DIR) / kind / f"{SELF}.log"
@@ -42,14 +43,19 @@ def split(text, n):
     return [text[i:i+n] for i in range(0, len(text), n)] or [""]
 
 def poll_in():
-    offset = 0
+    try: offset = int(TG_POLL_OFFSET.read_text())
+    except (FileNotFoundError, ValueError): offset = 0
     while True:
         try:
+            advanced = False
             for u in api("getUpdates", offset=offset, timeout=25) or []:
                 offset = u["update_id"] + 1
+                advanced = True
                 text = (u.get("message") or {}).get("text") or ""
                 if not text: continue
-                bus.append(str(TG_PUB), f"[ops {now()}] {text}\n")
+                bus.append(str(TG_PUB), f"[ops {now()} tg:{u['update_id']}] {text}\n")
+            if advanced:
+                TG_POLL_OFFSET.write_text(str(offset))
         except Exception as e:
             print(f"poll: {e}"); time.sleep(5)
 
