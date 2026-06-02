@@ -29,12 +29,8 @@ def start(self_id):
     agents_dir = os.environ.get("AGENTS_DIR", "agents")
     bus_dir = os.environ.get("BUS_DIR", "bus")
     agent = pathlib.Path(agents_dir) / self_id
-    token_file = agent / "telegram_token"
-    chat_file = agent / "telegram_chat"
-    if not (token_file.exists() and chat_file.exists()):
-        return
-    _token = token_file.read_text().strip()
-    _chat_id = chat_file.read_text().strip()
+    _token = (agent / "telegram_token").read_text().strip()
+    _chat_id = (agent / "telegram_chat").read_text().strip()
 
     bus_telegram = pathlib.Path(bus_dir) / "telegram" / f"{self_id}.log"
     bus_telegram.parent.mkdir(parents=True, exist_ok=True)

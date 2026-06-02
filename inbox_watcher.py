@@ -1,7 +1,7 @@
-"""Email inbox watcher per agent. Imported by agent.py.
+"""Mail inbox watcher per agent. Imported by agent.py.
 
-Watches agents/<self>/email_inbox/ via inotify. On file drop:
-  - Append to bus/email/<self>.log (agent's email stream)
+Watches agents/<self>/mail_inbox/ via inotify. On file drop:
+  - Append to bus/mail/<self>.log (agent's mail stream)
   - If telegram is configured, also notify the operator's chat
 """
 import bus
@@ -18,10 +18,10 @@ def start(self_id):
     agents_dir = os.environ.get("AGENTS_DIR", "agents")
     bus_dir = os.environ.get("BUS_DIR", "bus")
     agent = pathlib.Path(agents_dir) / self_id
-    inbox = agent / "email_inbox"
+    inbox = agent / "mail_inbox"
     inbox.mkdir(parents=True, exist_ok=True)
     (inbox / "processed").mkdir(exist_ok=True)
-    bus_email = pathlib.Path(bus_dir) / "email" / f"{self_id}.log"
+    bus_mail = pathlib.Path(bus_dir) / "mail" / f"{self_id}.log"
 
     token_file = agent / "telegram_token"
     chat_file = agent / "telegram_chat"
@@ -41,7 +41,7 @@ def start(self_id):
         except (KeyError, OSError): sender = "?"
         try: text = drop.read_bytes()[:PREVIEW * 4].decode("utf-8", errors="replace")[:PREVIEW]
         except OSError as e: text = f"[read failed: {e}]"
-        bus.append(bus_email, f"[{sender} {_now()}] {drop}\n{text}\n---\n")
+        bus.append(bus_mail, f"[{sender} {_now()}] {drop}\n{text}\n---\n")
         notify_tg(f"📬 mail from {sender}\n{text}")
 
     def watch():

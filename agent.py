@@ -42,8 +42,8 @@ SELF = None      # agent identity — hash of (SOUL + boot timestamp), set in ma
 SELF_DIR = None  # agents/<SELF>/
 LIFE_PATH = None # agents/<SELF>/LIFE.md
 MEMORY_PATH = None   # agents/<SELF>/MEMORY.md (per-agent working memory)
-INBOX_PATH = None    # bus/email_inbox/<SELF>.md
-INBOX_DROP_DIR = None  # agents/<SELF>/email_inbox/
+INBOX_PATH = None    # bus/mail_inbox/<SELF>.md
+INBOX_DROP_DIR = None  # agents/<SELF>/mail_inbox/
 
 def now():
     return time.strftime("%Y%m%dT%H%M%S")
@@ -157,13 +157,13 @@ def main():
     SELF_DIR = f"{AGENTS_DIR}/{SELF}"
     LIFE_PATH = f"{SELF_DIR}/LIFE.md"
     MEMORY_PATH = f"{SELF_DIR}/MEMORY.md"
-    INBOX_DROP_DIR = f"{SELF_DIR}/email_inbox"
+    INBOX_DROP_DIR = f"{SELF_DIR}/mail_inbox"
     os.makedirs(INBOX_DROP_DIR, exist_ok=True)
     os.makedirs(f"{INBOX_DROP_DIR}/processed", exist_ok=True)
     os.makedirs(f"{SELF_DIR}/cron", exist_ok=True)
     import pathlib as _p
     subs_root = _p.Path(SELF_DIR) / "subs"
-    for kind in ["email", "telegram", "cron"]:
+    for kind in ["mail", "telegram", "cron"]:
         bus_path = _p.Path(f"{BUS_DIR}/{kind}/{SELF}.log")
         bus_path.parent.mkdir(parents=True, exist_ok=True)
         bus_path.touch(exist_ok=True)
