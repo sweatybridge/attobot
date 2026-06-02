@@ -11,9 +11,9 @@ MODEL = os.environ.get("MODEL", "openai/deepseek-v4-pro")
 API_BASE = os.environ.get("API_BASE", "https://api.deepseek.com/v1")
 BLOB_DIR = os.environ.get("BLOB_DIR", "blobs")
 BUS_DIR = os.environ.get("BUS_DIR", "bus")
-CONTEXT_LIMIT = int(os.environ.get("CONTEXT_LIMIT", "160000"))
+CONTEXT_LIMIT = int(os.environ.get("CONTEXT_LIMIT", str(65536 * 4)))
 RESULT_STASH_LIMIT = int(os.environ.get("RESULT_STASH_LIMIT", "2000"))
-TOOL_TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "60"))
+TOOL_TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "300"))
 LIFE_TAIL = int(os.environ.get("LIFE_TAIL", "50"))
 AGENTS_DIR = os.environ.get("AGENTS_DIR", "agents")
 MEMORY_LIMIT = int(os.environ.get("MEMORY_LIMIT", "10000"))
@@ -125,23 +125,19 @@ def run_tool(name, args):
     return f"unknown tool: {name}"
 
 def tail_bus():
-    """Walk subs/ recursively. For each *.log (symlink to bus stream), read new content
-    since this consumer's cursor, strip own lines, return tagged content."""
+    """Walk subs/. For each *.log, read new content since cursor, return tagged blocks."""
     import pathlib as _p
     subs_dir = _p.Path(SELF_DIR) / "subs"
     if not subs_dir.is_dir():
         return ""
     blocks = []
-    own_prefix = f"[{SELF} "
     for log_path in sorted(subs_dir.rglob("*.log")):
         offset_path = log_path.with_suffix(".offset")
         content = bus.read_new(str(log_path), str(offset_path))
         if not content:
             continue
-        lines = [ln for ln in content.splitlines() if ln and not ln.startswith(own_prefix)]
-        if lines:
-            rel = log_path.relative_to(subs_dir).with_suffix("")
-            blocks.append(f"[{rel}]\n" + "\n".join(lines))
+        rel = log_path.relative_to(subs_dir).with_suffix("")
+        blocks.append(f"[{rel}]\n{content.rstrip()}")
     return "\n\n".join(blocks)
 
 def main():
@@ -167,7 +163,6 @@ def main():
     os.makedirs(f"{SELF_DIR}/cron", exist_ok=True)
     import pathlib as _p
     subs_root = _p.Path(SELF_DIR) / "subs"
-    pubs_root = _p.Path(SELF_DIR) / "pubs"
     for kind in ["email", "telegram", "cron"]:
         bus_path = _p.Path(f"{BUS_DIR}/{kind}/{SELF}.log")
         bus_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,14 +171,6 @@ def main():
         sub.parent.mkdir(parents=True, exist_ok=True)
         if not sub.is_symlink():
             sub.symlink_to(bus_path.resolve())
-    for kind in ["chat"]:
-        bus_path = _p.Path(f"{BUS_DIR}/{kind}/{SELF}.log")
-        bus_path.parent.mkdir(parents=True, exist_ok=True)
-        bus_path.touch(exist_ok=True)
-        pub = pubs_root / kind / f"{SELF}.log"
-        pub.parent.mkdir(parents=True, exist_ok=True)
-        if not pub.is_symlink():
-            pub.symlink_to(bus_path.resolve())
     if not os.path.exists(MEMORY_PATH):
         open(MEMORY_PATH, "w").write("# Memory\n\nLearned preferences, strategies, and notes. Edit with EDIT_FILE.\n")
     tg.start(SELF)
@@ -240,7 +227,7 @@ def main():
         context += f"\n{resp}\n"
         if not tool_calls:
             if content.strip():
-                bus.append(f"{SELF_DIR}/pubs/chat/{SELF}.log", f"[{SELF} {now()}] {content.strip()}\n")
+                tg.send(content.strip())
             tool_called = False
             last_turn_end = time.time()
             open(f"{SELF_DIR}/context.md", "w").write(context)
