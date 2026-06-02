@@ -161,10 +161,11 @@ def main():
     INBOX_DROP_DIR = f"{SELF_DIR}/email_inbox"
     os.makedirs(INBOX_DROP_DIR, exist_ok=True)
     os.makedirs(f"{INBOX_DROP_DIR}/processed", exist_ok=True)
+    os.makedirs(f"{SELF_DIR}/cron", exist_ok=True)
     import pathlib as _p
     subs_root = _p.Path(SELF_DIR) / "subs"
     pubs_root = _p.Path(SELF_DIR) / "pubs"
-    for kind in ["email", "telegram"]:
+    for kind in ["email", "telegram", "cron"]:
         bus_path = _p.Path(f"{BUS_DIR}/{kind}/{SELF}.log")
         bus_path.parent.mkdir(parents=True, exist_ok=True)
         bus_path.touch(exist_ok=True)
