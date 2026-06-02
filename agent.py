@@ -13,9 +13,9 @@ import bus
 import tg
 import cron
 import inbox_watcher
-import json, sys, time, hashlib, subprocess, pathlib, litellm
+import json, sys, time, hashlib, subprocess, pathlib, requests
 
-MODEL = "openai/deepseek-v4-pro"
+MODEL = "deepseek-v4-pro"
 API_BASE = "http://localhost:8181/deepseek/v1"
 BLOB_DIR = "blobs"
 AGENTS_DIR = "agents"
@@ -59,11 +59,13 @@ def stash(content):
     return h
 
 def llm(messages, tools=None):
-    kwargs = dict(model=MODEL, api_base=API_BASE, api_key=os.environ["DEEPSEEK_API_KEY"],
-                  messages=messages)
+    body = {"model": MODEL, "messages": messages}
     if tools:
-        kwargs["tools"] = tools
-    return litellm.completion(**kwargs).choices[0].message
+        body["tools"] = tools
+    r = requests.post(f"{API_BASE}/chat/completions",
+        headers={"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}"},
+        json=body, timeout=120)
+    return r.json()["choices"][0]["message"]
 
 def life_tail():
     return "\n".join(open(LIFE_PATH).read().splitlines()[-LIFE_TAIL:])
@@ -123,13 +125,11 @@ def compact(messages):
     return new
 
 def serialize_assistant(msg):
-    out = {"role": "assistant", "content": msg.content or ""}
-    if getattr(msg, "reasoning_content", None):
-        out["reasoning_content"] = msg.reasoning_content
-    if getattr(msg, "tool_calls", None):
-        tc = msg.tool_calls[0]
-        out["tool_calls"] = [{"id": tc.id, "type": "function",
-            "function": {"name": tc.function.name, "arguments": tc.function.arguments}}]
+    out = {"role": "assistant", "content": msg.get("content") or ""}
+    if msg.get("reasoning_content"):
+        out["reasoning_content"] = msg["reasoning_content"]
+    if msg.get("tool_calls"):
+        out["tool_calls"] = [msg["tool_calls"][0]]
     return out
 
 def main():
@@ -179,7 +179,7 @@ def main():
         life("resp")
 
         if not assistant.get("tool_calls"):
-            tg.send((msg.content or "").strip())
+            tg.send((msg.get("content") or "").strip())
             tool_called = False
             continue
 
