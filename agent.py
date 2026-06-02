@@ -124,6 +124,8 @@ def compact(messages):
 
 def serialize_assistant(msg):
     out = {"role": "assistant", "content": msg.content or ""}
+    if getattr(msg, "reasoning_content", None):
+        out["reasoning_content"] = msg.reasoning_content
     if getattr(msg, "tool_calls", None):
         tc = msg.tool_calls[0]
         out["tool_calls"] = [{"id": tc.id, "type": "function",
