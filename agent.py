@@ -13,14 +13,15 @@ import bus
 import tg
 import cron
 import inbox_watcher
+import bg
 import json, sys, time, hashlib, subprocess, pathlib, requests
+from ddgs import DDGS
 
 MODEL = "deepseek-v4-pro"
 API_BASE = "http://localhost:8181/deepseek/v1"
 BLOB_DIR = "blobs"
 AGENTS_DIR = "agents"
 MSG_LIMIT = 200
-TOOL_TIMEOUT = 300
 LIFE_TAIL = 50
 MEMORY_LIMIT = 10000
 
@@ -35,6 +36,10 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}},
     {"type": "function", "function": {"name": "STASH", "description": "Save text to a blob at blobs/<hash>, return [stash <hash>].",
         "parameters": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}}},
+    {"type": "function", "function": {"name": "SEARCH", "description": "Search the web via DuckDuckGo. Returns title, URL, and snippet for up to 10 results.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "n": {"type": "integer"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "WEB_FETCH", "description": "Fetch and extract text from a URL.",
+        "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
 ]
 
 for d in (BLOB_DIR, AGENTS_DIR): os.makedirs(d, exist_ok=True)
@@ -65,7 +70,10 @@ def llm(messages, tools=None):
     r = requests.post(f"{API_BASE}/chat/completions",
         headers={"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}"},
         json=body, timeout=120)
-    return r.json()["choices"][0]["message"]
+    data = r.json()
+    if "choices" not in data:
+        raise RuntimeError(f"llm {r.status_code}: {data}")
+    return data["choices"][0]["message"]
 
 def life_tail():
     return "\n".join(open(LIFE_PATH).read().splitlines()[-LIFE_TAIL:])
@@ -88,11 +96,32 @@ def run_tool(name, args):
             return f"error: OLD must appear exactly once in {path} (found {text.count(old)})"
         open(path, "w").write(text.replace(old, new))
         return f"edited {path}"
-    if name == "BASH":
-        p = subprocess.run(args["cmd"], shell=True, capture_output=True, text=True, timeout=TOOL_TIMEOUT)
-        return (p.stdout + p.stderr) or f"(exit {p.returncode}, no output)"
     if name == "STASH":
         return f"stashed: [stash {stash(args['content'])}]"
+    if name == "SEARCH":
+        n = min(args.get("n", 5), 10)
+        try:
+            results = list(DDGS().text(args["query"], max_results=n))
+            out = []
+            for i, r in enumerate(results):
+                out.append(f"{i+1}. {r['title']}\n   {r['href']}\n   {r['body']}")
+            return "\n\n".join(out) or "(no results)"
+        except Exception as e:
+            return f"search error: {e}"
+    if name == "WEB_FETCH":
+        try:
+            r = requests.get(args["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            r.raise_for_status()
+            text = r.text
+            # crude extract: remove script/style, get body text
+            import re
+            text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL|re.IGNORECASE)
+            text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL|re.IGNORECASE)
+            text = re.sub(r'<[^>]+>', ' ', text)
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text[:5000]
+        except Exception as e:
+            return f"fetch error: {e}"
     return f"unknown tool: {name}"
 
 def load_messages():
@@ -129,7 +158,7 @@ def serialize_assistant(msg):
     if msg.get("reasoning_content"):
         out["reasoning_content"] = msg["reasoning_content"]
     if msg.get("tool_calls"):
-        out["tool_calls"] = [msg["tool_calls"][0]]
+        out["tool_calls"] = msg["tool_calls"]
     return out
 
 def main():
@@ -184,18 +213,18 @@ def main():
             continue
 
         tool_called = True
-        tc = assistant["tool_calls"][0]
-        name = tc["function"]["name"]
-        tc_args = json.loads(tc["function"]["arguments"])
-        try:
-            result = run_tool(name, tc_args)
-        except Exception as e:
-            result = f"error: {e}"
-        tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result}
-        append_msg(tool_msg)
-        msg_size = os.path.getsize(MESSAGES_PATH)
-        messages.append(tool_msg)
-        life(name)
+        for tc in assistant["tool_calls"]:
+            name = tc["function"]["name"]
+            tc_args = json.loads(tc["function"]["arguments"])
+            try:
+                result = bg.run(name, tc_args, tc["id"], run_tool, SELF_DIR, MESSAGES_PATH)
+            except Exception as e:
+                result = f"error: {e}"
+            tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result}
+            append_msg(tool_msg)
+            msg_size = os.path.getsize(MESSAGES_PATH)
+            messages.append(tool_msg)
+            life(name)
 
         if len(messages) > MSG_LIMIT:
             messages = compact(messages)
