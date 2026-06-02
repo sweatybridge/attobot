@@ -15,38 +15,36 @@ import cron
 import inbox_watcher
 import json, sys, time, hashlib, subprocess, pathlib, litellm
 
-MODEL = os.environ.get("MODEL", "openai/deepseek-v4-pro")
-API_BASE = os.environ.get("API_BASE", "https://api.deepseek.com/v1")
+MODEL = "openai/deepseek-v4-pro"
+API_BASE = "http://localhost:8181/deepseek/v1"
 BLOB_DIR = "blobs"
-BUS_DIR = "bus"
-CONTEXT_LIMIT = int(os.environ.get("CONTEXT_LIMIT", str(65536 * 4)))
-RESULT_STASH_LIMIT = int(os.environ.get("RESULT_STASH_LIMIT", "2000"))
-TOOL_TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "300"))
-LIFE_TAIL = int(os.environ.get("LIFE_TAIL", "50"))
 AGENTS_DIR = "agents"
-MEMORY_LIMIT = int(os.environ.get("MEMORY_LIMIT", "10000"))
-HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))
-KINDS = ["mail", "telegram", "cron"]
+MSG_LIMIT = 200
+TOOL_TIMEOUT = 300
+LIFE_TAIL = 50
+MEMORY_LIMIT = 10000
 
 TOOLS = [
     {"type": "function", "function": {"name": "READ_FILE", "description": "Read a file.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
-    {"type": "function", "function": {"name": "WRITE_FILE", "description": "Overwrite a file with new content.",
+    {"type": "function", "function": {"name": "WRITE_FILE", "description": "Overwrite a file.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
     {"type": "function", "function": {"name": "EDIT_FILE", "description": "Replace OLD with NEW in a file. OLD must appear exactly once.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, "required": ["path", "old", "new"]}}},
-    {"type": "function", "function": {"name": "BASH", "description": "Run a shell command (60s timeout).",
+    {"type": "function", "function": {"name": "BASH", "description": "Run a shell command.",
         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}},
-    {"type": "function", "function": {"name": "STASH", "description": "Save text to a blob at blobs/<hash>, return [stash <hash>]. Recall later with READ_FILE blobs/<hash>.",
+    {"type": "function", "function": {"name": "STASH", "description": "Save text to a blob at blobs/<hash>, return [stash <hash>].",
         "parameters": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}}},
 ]
 
-for d in (BLOB_DIR, BUS_DIR, AGENTS_DIR): os.makedirs(d, exist_ok=True)
+for d in (BLOB_DIR, AGENTS_DIR): os.makedirs(d, exist_ok=True)
 
 SELF = None
 SELF_DIR = None
 LIFE_PATH = None
 MEMORY_PATH = None
+MESSAGES_PATH = None
+
 
 def now():
     return time.strftime("%Y%m%dT%H%M%S")
@@ -58,15 +56,14 @@ def life(event):
 def stash(content):
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
     open(f"{BLOB_DIR}/{h}", "w").write(content)
-    return h, f"[stash {h}]"
+    return h
 
-def llm(prompt, tools=None):
+def llm(messages, tools=None):
     kwargs = dict(model=MODEL, api_base=API_BASE, api_key=os.environ["DEEPSEEK_API_KEY"],
-                  messages=[{"role": "user", "content": prompt}])
+                  messages=messages)
     if tools:
         kwargs["tools"] = tools
-    msg = litellm.completion(**kwargs).choices[0].message
-    return msg.content or "", getattr(msg, "tool_calls", None)
+    return litellm.completion(**kwargs).choices[0].message
 
 def life_tail():
     return "\n".join(open(LIFE_PATH).read().splitlines()[-LIFE_TAIL:])
@@ -93,88 +90,116 @@ def run_tool(name, args):
         p = subprocess.run(args["cmd"], shell=True, capture_output=True, text=True, timeout=TOOL_TIMEOUT)
         return (p.stdout + p.stderr) or f"(exit {p.returncode}, no output)"
     if name == "STASH":
-        _, ref = stash(args["content"])
-        return f"stashed: {ref}"
+        return f"stashed: [stash {stash(args['content'])}]"
     return f"unknown tool: {name}"
 
-def tail_bus():
-    blocks = []
-    for kind in KINDS:
-        content = bus.read_new(f"{BUS_DIR}/{kind}/{SELF}.log", f"{SELF_DIR}/{kind}.offset")
-        if content:
-            blocks.append(f"[{kind}]\n{content.rstrip()}")
-    return "\n\n".join(blocks)
+def load_messages():
+    return [json.loads(l) for l in open(MESSAGES_PATH) if l.strip()]
+
+def append_msg(m):
+    bus.append(MESSAGES_PATH, json.dumps(m) + "\n")
+
+def build_system():
+    soul = open("SOUL.md").read().replace("<self>", SELF)
+    harness = open(__file__).read()
+    memory = open(MEMORY_PATH).read()
+    if len(memory) > MEMORY_LIMIT:
+        h = MEMORY_LIMIT // 2
+        memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md truncated. Shrink it.]"
+    return (f"<soul>\n{soul}\n</soul>\n\n"
+            f"<harness>\n{harness}\n</harness>\n\n"
+            f"<memory>\n{memory}\n</memory>\n\n"
+            f"<life>\n{life_tail()}\n</life>")
+
+def compact(messages):
+    half = len(messages) // 2
+    head = "\n".join(json.dumps(m) for m in messages[:half])
+    h = stash(head)
+    new = [{"role": "system", "content": f"<earlier history compacted: [stash {h}]>"}] + messages[half:]
+    with open(MESSAGES_PATH, "w") as f:
+        for m in new:
+            f.write(json.dumps(m) + "\n")
+    life(f"compacted -> {h}")
+    return new
+
+def serialize_assistant(msg):
+    out = {"role": "assistant", "content": msg.content or ""}
+    if getattr(msg, "tool_calls", None):
+        out["tool_calls"] = [
+            {"id": tc.id, "type": "function",
+             "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+            for tc in msg.tool_calls
+        ]
+    return out
 
 def main():
-    global SELF, SELF_DIR, LIFE_PATH, MEMORY_PATH
+    global SELF, SELF_DIR, LIFE_PATH, MEMORY_PATH, MESSAGES_PATH
     soul_text = open("SOUL.md").read()
     SELF = sys.argv[1] if len(sys.argv) > 1 else hashlib.sha256(f"soul:\n{soul_text}\nboot: {now()}".encode()).hexdigest()[:12]
     SELF_DIR = f"{AGENTS_DIR}/{SELF}"
     LIFE_PATH = f"{SELF_DIR}/LIFE.md"
     MEMORY_PATH = f"{SELF_DIR}/MEMORY.md"
+    MESSAGES_PATH = f"{SELF_DIR}/messages.jsonl"
     os.makedirs(SELF_DIR, exist_ok=True)
     pathlib.Path(MEMORY_PATH).touch(exist_ok=True)
+    pathlib.Path(MESSAGES_PATH).touch(exist_ok=True)
+    heartbeat = pathlib.Path(f"{SELF_DIR}/cron/heartbeat.json")
+    heartbeat.parent.mkdir(parents=True, exist_ok=True)
+    if not heartbeat.exists():
+        heartbeat.write_text(json.dumps({"next": time.time() + 60, "repeat_s": 60, "message": "tick"}))
     tg.start(SELF)
     cron.start(SELF)
     inbox_watcher.start(SELF)
-    soul = soul_text.replace("<self>", SELF)
-    harness = open(__file__).read()
-    ctx_path = f"{SELF_DIR}/context.md"
-    context = open(ctx_path).read() if os.path.exists(ctx_path) else f"[boot] you are agent {SELF}.\n"
-    context += f"\n[awake at {now()}]\n"
     life(f"awake self={SELF}")
-    last_turn_end = time.time()
+
+    messages = load_messages()
+    msg_size = os.path.getsize(MESSAGES_PATH)
     tool_called = False
     while True:
-        inbound = tail_bus()
-        if inbound:
-            context += f"\n{inbound}\n"
-            life(f"inbound: {inbound[:100]}")
-        elif not tool_called:
-            if time.time() - last_turn_end >= HEARTBEAT_INTERVAL:
-                context += "\n<heartbeat/>\n"
-                life("heartbeat")
-            else:
-                time.sleep(1)
-                continue
-        memory = open(MEMORY_PATH).read()
-        if len(memory) > MEMORY_LIMIT:
-            h = MEMORY_LIMIT // 2
-            memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md truncated. Shrink it.]"
-        prompt = (f"<soul>\n{soul}\n</soul>\n\n"
-                  f"<harness>\n{harness}\n</harness>\n\n"
-                  f"<memory>\n{memory}\n</memory>\n\n"
-                  f"<context>\n{context}\n</context>\n\n<life>\n{life_tail()}\n</life>")
-        content, tool_calls = llm(prompt, tools=TOOLS)
-        _, resp_ref = stash(content)
-        life(f"resp {resp_ref}")
-        context += f"\n{content}\n"
-        if not tool_calls:
-            tg.send(content.strip())
-            tool_called = False
-            last_turn_end = time.time()
-            open(f"{SELF_DIR}/context.md", "w").write(context)
+        cur_size = os.path.getsize(MESSAGES_PATH)
+        new_arrived = False
+        if cur_size > msg_size:
+            with open(MESSAGES_PATH, "r") as f:
+                f.seek(msg_size)
+                new = f.read()
+            msg_size = cur_size
+            for line in new.splitlines():
+                if line.strip():
+                    messages.append(json.loads(line))
+            new_arrived = True
+        if not (new_arrived or tool_called):
+            time.sleep(1)
             continue
+
+        msg = llm([{"role": "system", "content": build_system()}] + messages, tools=TOOLS)
+        assistant = serialize_assistant(msg)
+        append_msg(assistant)
+        msg_size = os.path.getsize(MESSAGES_PATH)
+        messages.append(assistant)
+        life("resp")
+
+        if not assistant.get("tool_calls"):
+            tg.send((msg.content or "").strip())
+            tool_called = False
+            continue
+
         tool_called = True
-        tc = tool_calls[0]
-        name = tc.function.name
-        tc_args = json.loads(tc.function.arguments)
+        tc = assistant["tool_calls"][0]
+        name = tc["function"]["name"]
+        tc_args = json.loads(tc["function"]["arguments"])
         try:
             result = run_tool(name, tc_args)
         except Exception as e:
             result = f"error: {e}"
-        _, result_ref = stash(result)
-        life(f"{name} result {result_ref}")
-        if len(result) <= RESULT_STASH_LIMIT:
-            context += f"\n[{name}] {result}\n"
-        else:
-            context += f"\n[{name}] {result_ref}\n"
-        if len(context) > CONTEXT_LIMIT:
-            h = CONTEXT_LIMIT // 2
-            _, ref = stash(context[:-h])
-            context = f"{ref}\n{context[-h:]}"
-            life(f"compacted -> {ref}")
-        open(f"{SELF_DIR}/context.md", "w").write(context)
+        tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result}
+        append_msg(tool_msg)
+        msg_size = os.path.getsize(MESSAGES_PATH)
+        messages.append(tool_msg)
+        life(name)
+
+        if len(messages) > MSG_LIMIT:
+            messages = compact(messages)
+            msg_size = os.path.getsize(MESSAGES_PATH)
 
 if __name__ == "__main__":
     main()

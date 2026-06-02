@@ -1,13 +1,12 @@
 """Telegram bridge. Imported by agent.py.
 
-Reads telegram_token and telegram_chat from CWD.
-Inbound: long-polls Telegram, writes to bus/telegram/<self>.log.
+Polls telegram. Inbound text → agents/<self>/messages.jsonl as role:user.
 Outbound: agent calls tg.send(text) directly.
 """
 import bus
-import os, pathlib, requests, threading, time
+import json, os, pathlib, requests, threading, time
 
-TG_MAX = int(os.environ.get("TG_MAX", "4000"))
+TG_MAX = 4000
 
 _token = None
 _chat_id = None
@@ -26,11 +25,14 @@ def send(text):
 def start(self_id):
     global _token, _chat_id
     _token = pathlib.Path("telegram_token").read_text().strip()
-    _chat_id = pathlib.Path("telegram_chat").read_text().strip()
-    bus_telegram = f"bus/telegram/{self_id}.log"
+    chat_file = pathlib.Path("telegram_chat")
+    _chat_id = chat_file.read_text().strip() if chat_file.exists() else None
+
+    messages_path = f"agents/{self_id}/messages.jsonl"
     poll_offset = pathlib.Path(f"agents/{self_id}/tg_poll.offset")
 
     def poll_in():
+        global _chat_id
         try: offset = int(poll_offset.read_text())
         except (FileNotFoundError, ValueError): offset = 0
         while True:
@@ -39,9 +41,15 @@ def start(self_id):
                 for u in _api("getUpdates", offset=offset, timeout=25) or []:
                     offset = u["update_id"] + 1
                     advanced = True
-                    text = (u.get("message") or {}).get("text") or ""
+                    msg = u.get("message") or {}
+                    cid = str((msg.get("chat") or {}).get("id") or "")
+                    if cid and cid != _chat_id:
+                        _chat_id = cid
+                        chat_file.write_text(cid)
+                    text = msg.get("text") or ""
                     if not text: continue
-                    bus.append(bus_telegram, f"[ops {time.strftime('%Y%m%dT%H%M%S')} tg:{u['update_id']}] {text}\n")
+                    obj = {"role": "user", "content": f"[telegram tg:{u['update_id']}] {text}"}
+                    bus.append(messages_path, json.dumps(obj) + "\n")
                 if advanced:
                     poll_offset.write_text(str(offset))
             except Exception as e:

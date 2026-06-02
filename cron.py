@@ -1,14 +1,17 @@
-"""Cron per agent. Job files: agents/<self>/cron/*.json with {"next": <unix>, "repeat_s"?, "message"}."""
-import bus
-import json, os, pathlib, threading, time
+"""Cron per agent. Job files: agents/<self>/cron/*.json with {"next", "repeat_s"?, "message"}.
 
-TICK = int(os.environ.get("CRON_TICK_S", "30"))
+Fires due jobs into agents/<self>/messages.jsonl as role:system.
+"""
+import bus
+import json, pathlib, threading, time
+
+TICK = 30
 
 
 def start(self_id):
     cron_dir = pathlib.Path(f"agents/{self_id}/cron")
     cron_dir.mkdir(parents=True, exist_ok=True)
-    bus_cron = f"bus/cron/{self_id}.log"
+    messages_path = f"agents/{self_id}/messages.jsonl"
 
     def loop():
         while True:
@@ -17,7 +20,8 @@ def start(self_id):
                 try: job = json.loads(f.read_text())
                 except Exception: continue
                 if job.get("next", float("inf")) > ts: continue
-                bus.append(bus_cron, f"[cron {time.strftime('%Y%m%dT%H%M%S')} {f.stem}] {job.get('message', '')}\n")
+                obj = {"role": "system", "content": f"[cron {f.stem}] {job.get('message', '')}"}
+                bus.append(messages_path, json.dumps(obj) + "\n")
                 if job.get("repeat_s"):
                     job["next"] = ts + job["repeat_s"]
                     f.write_text(json.dumps(job))

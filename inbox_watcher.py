@@ -1,33 +1,35 @@
 """Mail inbox watcher per agent. Imported by agent.py.
 
-Watches agents/<self>/mail_inbox/ via inotify. Drops → bus/mail/<self>.log + tg.send.
+Polls agents/<self>/mail_inbox/ for new files. Drops → messages.jsonl as role:system + tg.send.
 """
 import bus
 import tg
-import os, pathlib, pwd, threading, time
-from inotify_simple import INotify, flags as iflags
+import json, pathlib, pwd, threading, time
 
-PREVIEW = int(os.environ.get("INBOX_PREVIEW", "1000"))
+PREVIEW = 1000
+TICK = 2
 
 
 def start(self_id):
     inbox = pathlib.Path(f"agents/{self_id}/mail_inbox")
     inbox.mkdir(parents=True, exist_ok=True)
-    bus_mail = f"bus/mail/{self_id}.log"
+    messages_path = f"agents/{self_id}/messages.jsonl"
 
     def deliver(drop):
         sender = pwd.getpwuid(drop.stat().st_uid).pw_name
         text = drop.read_bytes()[:PREVIEW * 4].decode("utf-8", errors="replace")[:PREVIEW]
-        bus.append(bus_mail, f"[{sender} {time.strftime('%Y%m%dT%H%M%S')}] {drop}\n{text}\n---\n")
+        obj = {"role": "system", "content": f"[mail from {sender}] {drop.name}\n{text}"}
+        bus.append(messages_path, json.dumps(obj) + "\n")
         tg.send(f"📬 mail from {sender}\n{text}")
 
     def watch():
-        ino = INotify()
-        ino.add_watch(str(inbox), iflags.CREATE | iflags.MOVED_TO)
+        seen = set(inbox.iterdir())
         while True:
-            for ev in ino.read():
-                t = inbox / ev.name
-                if t.is_file() and not t.name.startswith("."):
-                    deliver(t)
+            current = set(inbox.iterdir())
+            for f in current - seen:
+                if f.is_file() and not f.name.startswith("."):
+                    deliver(f)
+            seen = current
+            time.sleep(TICK)
 
-    threading.Thread(target=watch, daemon=True, name="inbox-watch").start()
+    threading.Thread(target=watch, daemon=True, name="inbox-poll").start()

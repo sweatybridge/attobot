@@ -1,3 +1,2 @@
 litellm
-inotify_simple
 requests
