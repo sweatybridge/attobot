@@ -1,40 +1,56 @@
-#!/usr/bin/env python3
-"""File in agents/<self>/email_inbox/ → line in bus/email_inbox/<self>.md."""
-import config  # loads .env into os.environ
+"""Email inbox watcher per agent. Imported by agent.py.
+
+Watches agents/<self>/email_inbox/ via inotify. On file drop:
+  - Append to bus/email/<self>.log (agent's email stream)
+  - If telegram is configured, also notify the operator's chat
+"""
 import bus
-import os, pathlib, pwd, time
+import os, pathlib, pwd, requests, threading, time
 from inotify_simple import INotify, flags as iflags
 
-AGENTS = pathlib.Path(os.environ.get("AGENTS_DIR", "agents"))
-BUS_EMAIL = pathlib.Path(os.environ.get("BUS_DIR", "bus")) / "email"
 PREVIEW = int(os.environ.get("INBOX_PREVIEW", "1000"))
 
-def now(): return time.strftime("%Y%m%dT%H%M%S")
 
-def deliver(drop):
-    sender = pwd.getpwuid(drop.stat().st_uid).pw_name
-    text = drop.read_bytes()[:PREVIEW * 4].decode("utf-8", errors="replace")[:PREVIEW]
-    bus.append(BUS_EMAIL / f"{drop.parent.parent.name}.log", f"[{sender} {now()}] {drop}\n{text}\n---\n")
+def _now(): return time.strftime("%Y%m%dT%H%M%S")
 
-AGENTS.mkdir(parents=True, exist_ok=True)
-ino = INotify()
-wds = {}
 
-def watch(d):
-    inbox = d / "email_inbox"
+def start(self_id):
+    agents_dir = os.environ.get("AGENTS_DIR", "agents")
+    bus_dir = os.environ.get("BUS_DIR", "bus")
+    agent = pathlib.Path(agents_dir) / self_id
+    inbox = agent / "email_inbox"
     inbox.mkdir(parents=True, exist_ok=True)
-    wds[ino.add_watch(str(inbox), iflags.CREATE | iflags.MOVED_TO)] = inbox
+    (inbox / "processed").mkdir(exist_ok=True)
+    bus_email = pathlib.Path(bus_dir) / "email" / f"{self_id}.log"
 
-for d in AGENTS.iterdir():
-    if d.is_dir(): watch(d)
-wds[ino.add_watch(str(AGENTS), iflags.CREATE)] = AGENTS
+    token_file = agent / "telegram_token"
+    chat_file = agent / "telegram_chat"
+    tg_token = token_file.read_text().strip() if token_file.exists() else None
+    tg_chat = chat_file.read_text().strip() if chat_file.exists() else None
 
-while True:
-    for ev in ino.read():
-        parent = wds.get(ev.wd)
-        if parent is None: continue
-        t = parent / ev.name
-        if parent == AGENTS:
-            if t.is_dir(): watch(t)
-        elif t.is_file() and not t.name.startswith("."):
-            deliver(t)
+    def notify_tg(text):
+        if not (tg_token and tg_chat): return
+        try:
+            requests.post(f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                          data={"chat_id": tg_chat, "text": text}, timeout=10)
+        except Exception as e:
+            print(f"inbox tg notify: {e}")
+
+    def deliver(drop):
+        try: sender = pwd.getpwuid(drop.stat().st_uid).pw_name
+        except (KeyError, OSError): sender = "?"
+        try: text = drop.read_bytes()[:PREVIEW * 4].decode("utf-8", errors="replace")[:PREVIEW]
+        except OSError as e: text = f"[read failed: {e}]"
+        bus.append(bus_email, f"[{sender} {_now()}] {drop}\n{text}\n---\n")
+        notify_tg(f"📬 mail from {sender}\n{text}")
+
+    def watch():
+        ino = INotify()
+        ino.add_watch(str(inbox), iflags.CREATE | iflags.MOVED_TO)
+        while True:
+            for ev in ino.read():
+                t = inbox / ev.name
+                if t.is_file() and not t.name.startswith("."):
+                    deliver(t)
+
+    threading.Thread(target=watch, daemon=True, name="inbox-watch").start()

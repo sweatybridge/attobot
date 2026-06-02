@@ -3,6 +3,8 @@
 import config  # loads .env into os.environ
 import bus
 import tg
+import cron
+import inbox_watcher
 import json, os, re, sys, time, hashlib, signal, subprocess, litellm
 
 MODEL = os.environ.get("MODEL", "openai/deepseek-v4-pro")
@@ -185,6 +187,8 @@ def main():
     if not os.path.exists(MEMORY_PATH):
         open(MEMORY_PATH, "w").write("# Memory\n\nLearned preferences, strategies, and notes. Edit with EDIT_FILE.\n")
     tg.start(SELF)
+    cron.start(SELF)
+    inbox_watcher.start(SELF)
     soul = open("SOUL.md").read().replace("<self>", SELF)
     harness = open(__file__).read()
     if resumed:

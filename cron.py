@@ -1,27 +1,23 @@
-#!/usr/bin/env python3
-"""Cron: walks agents/*/cron/*.json, fires due jobs to bus/cron/<self>.log.
+"""Cron per agent. Imported by agent.py.
 
-Job file format (any name, must be .json):
+Reads agents/<self>/cron/*.json. Fires due jobs to bus/cron/<self>.log.
+
+Job file format:
   {"kind": "every", "every_s": 3600, "message": "..."}
   {"kind": "cron",  "expr": "0 9 * * *", "message": "..."}
   {"kind": "at",    "at_ms": 1717286400000, "message": "..."}
-
-State is in-memory only; on restart, schedules recompute from now.
 """
-import config  # loads .env into os.environ
 import bus
-import json, os, pathlib, time
+import json, os, pathlib, threading, time
 from croniter import croniter
 
-AGENTS = pathlib.Path(os.environ.get("AGENTS_DIR", "agents"))
-BUS = pathlib.Path(os.environ.get("BUS_DIR", "bus"))
 TICK = int(os.environ.get("CRON_TICK_S", "30"))
 
-state = {}  # (agent, jobname) -> next_run_unix_seconds
 
-def now(): return time.strftime("%Y%m%dT%H%M%S")
+def _now(): return time.strftime("%Y%m%dT%H%M%S")
 
-def compute_next(job, ts):
+
+def _compute_next(job, ts):
     kind = job.get("kind")
     if kind == "at":
         at_s = job.get("at_ms", 0) / 1000
@@ -34,26 +30,34 @@ def compute_next(job, ts):
         except Exception: return None
     return None
 
-def scan():
-    for agent_dir in AGENTS.iterdir():
-        if not agent_dir.is_dir(): continue
-        cron_dir = agent_dir / "cron"
-        if not cron_dir.is_dir(): continue
+
+def start(self_id):
+    agents_dir = os.environ.get("AGENTS_DIR", "agents")
+    bus_dir = os.environ.get("BUS_DIR", "bus")
+    agent = pathlib.Path(agents_dir) / self_id
+    cron_dir = agent / "cron"
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    bus_cron = pathlib.Path(bus_dir) / "cron" / f"{self_id}.log"
+    state = {}  # jobname -> next_run_unix_seconds
+
+    def scan():
         for f in cron_dir.glob("*.json"):
-            try: yield agent_dir.name, f.stem, json.loads(f.read_text())
+            try: yield f.stem, json.loads(f.read_text())
             except Exception: continue
 
-def fire(agent, name, job):
-    msg = job.get("message", "")
-    bus.append(BUS / "cron" / f"{agent}.log", f"[cron {now()} {name}] {msg}\n")
+    def fire(name, job):
+        msg = job.get("message", "")
+        bus.append(bus_cron, f"[cron {_now()} {name}] {msg}\n")
 
-while True:
-    ts = time.time()
-    for agent, name, job in scan():
-        key = (agent, name)
-        if key not in state:
-            state[key] = compute_next(job, ts)
-        if state[key] is not None and ts >= state[key]:
-            fire(agent, name, job)
-            state[key] = compute_next(job, ts) if job.get("kind") != "at" else None
-    time.sleep(TICK)
+    def loop():
+        while True:
+            ts = time.time()
+            for name, job in scan():
+                if name not in state:
+                    state[name] = _compute_next(job, ts)
+                if state[name] is not None and ts >= state[name]:
+                    fire(name, job)
+                    state[name] = _compute_next(job, ts) if job.get("kind") != "at" else None
+            time.sleep(TICK)
+
+    threading.Thread(target=loop, daemon=True, name="cron").start()
