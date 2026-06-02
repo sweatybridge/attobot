@@ -19,7 +19,6 @@ def _api(method, **params):
 
 
 def send(text):
-    if _token is None or not text: return
     for i in range(0, len(text), TG_MAX):
         _api("sendMessage", chat_id=_chat_id, text=text[i:i+TG_MAX])
 
@@ -29,8 +28,8 @@ def start(self_id):
     agents_dir = os.environ.get("AGENTS_DIR", "agents")
     bus_dir = os.environ.get("BUS_DIR", "bus")
     agent = pathlib.Path(agents_dir) / self_id
-    _token = (agent / "telegram_token").read_text().strip()
-    _chat_id = (agent / "telegram_chat").read_text().strip()
+    _token = pathlib.Path("telegram_token").read_text().strip()
+    _chat_id = pathlib.Path("telegram_chat").read_text().strip()
 
     bus_telegram = pathlib.Path(bus_dir) / "telegram" / f"{self_id}.log"
     bus_telegram.parent.mkdir(parents=True, exist_ok=True)

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Minimal blob-memory agent. See README.md for design."""
-import config  # loads .env into os.environ
+import config
 import bus
 import tg
 import cron
 import inbox_watcher
-import json, os, re, sys, time, hashlib, signal, subprocess, litellm
+import json, os, sys, time, hashlib, signal, subprocess, litellm
 
 MODEL = os.environ.get("MODEL", "openai/deepseek-v4-pro")
 API_BASE = os.environ.get("API_BASE", "https://api.deepseek.com/v1")
@@ -19,8 +19,8 @@ AGENTS_DIR = os.environ.get("AGENTS_DIR", "agents")
 MEMORY_LIMIT = int(os.environ.get("MEMORY_LIMIT", "10000"))
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))
 VERBOSE = "--verbose" in sys.argv
+KINDS = ["mail", "telegram", "cron"]
 
-# native tool calling — tool definitions as JSON schemas
 TOOLS = [
     {"type": "function", "function": {"name": "READ_FILE", "description": "Read a file. Optional offset/limit (line numbers) for large files.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
@@ -38,12 +38,10 @@ TOOLS = [
 
 for d in (BLOB_DIR, BUS_DIR, AGENTS_DIR): os.makedirs(d, exist_ok=True)
 
-SELF = None      # agent identity — hash of (SOUL + boot timestamp), set in main()
-SELF_DIR = None  # agents/<SELF>/
-LIFE_PATH = None # agents/<SELF>/LIFE.md
-MEMORY_PATH = None   # agents/<SELF>/MEMORY.md (per-agent working memory)
-INBOX_PATH = None    # bus/mail_inbox/<SELF>.md
-INBOX_DROP_DIR = None  # agents/<SELF>/mail_inbox/
+SELF = None
+SELF_DIR = None
+LIFE_PATH = None
+MEMORY_PATH = None
 
 def now():
     return time.strftime("%Y%m%dT%H%M%S")
@@ -60,8 +58,7 @@ def stash(content):
     open(f"{BLOB_DIR}/{h}", "w").write(content)
     return h, f"[stash {h}]"
 
-def llm(prompt, *, strip_reasoning, tools=None):
-    """Call LLM. Returns (content, reasoning, tool_calls)."""
+def llm(prompt, tools=None):
     kwargs = dict(model=MODEL, api_base=API_BASE, api_key=os.environ["DEEPSEEK_API_KEY"],
                   messages=[{"role": "user", "content": prompt}])
     if tools:
@@ -70,8 +67,6 @@ def llm(prompt, *, strip_reasoning, tools=None):
     reasoning = getattr(msg, "reasoning_content", None) or ""
     content = msg.content or ""
     tc = msg.tool_calls if hasattr(msg, "tool_calls") else None
-    if strip_reasoning:
-        return content, "", None
     return content, reasoning, tc
 
 def _read_lines(path, offset=0, limit=None):
@@ -90,13 +85,7 @@ def life_tail():
     except FileNotFoundError:
         return ""
 
-def last_turn_number():
-    try: matches = re.findall(r'turn (\d+)', open(LIFE_PATH).read())
-    except FileNotFoundError: return 0
-    return max(int(m) for m in matches) if matches else 0
-
 def run_tool(name, args):
-    """Execute a tool. args is a dict from parsed JSON."""
     if name == "READ_FILE":
         return _read_lines(args["path"], args.get("offset", 0), args.get("limit"))
     if name == "WRITE_FILE":
@@ -125,23 +114,15 @@ def run_tool(name, args):
     return f"unknown tool: {name}"
 
 def tail_bus():
-    """Walk subs/. For each *.log, read new content since cursor, return tagged blocks."""
-    import pathlib as _p
-    subs_dir = _p.Path(SELF_DIR) / "subs"
-    if not subs_dir.is_dir():
-        return ""
     blocks = []
-    for log_path in sorted(subs_dir.rglob("*.log")):
-        offset_path = log_path.with_suffix(".offset")
-        content = bus.read_new(str(log_path), str(offset_path))
-        if not content:
-            continue
-        rel = log_path.relative_to(subs_dir).with_suffix("")
-        blocks.append(f"[{rel}]\n{content.rstrip()}")
+    for kind in KINDS:
+        content = bus.read_new(f"{BUS_DIR}/{kind}/{SELF}.log", f"{SELF_DIR}/{kind}.offset")
+        if content:
+            blocks.append(f"[{kind}]\n{content.rstrip()}")
     return "\n\n".join(blocks)
 
 def main():
-    global SELF, SELF_DIR, LIFE_PATH, MEMORY_PATH, INBOX_PATH, INBOX_DROP_DIR
+    global SELF, SELF_DIR, LIFE_PATH, MEMORY_PATH
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     resume = args[0] if args else None
     if resume:
@@ -150,29 +131,14 @@ def main():
         SELF = resume
         resumed = True
     else:
-        soul_text = open("SOUL.md").read()
-        boot_ts = now()
-        SELF, self_ref = stash(f"soul:\n{soul_text}\nboot: {boot_ts}")
+        SELF, self_ref = stash(f"soul:\n{open('SOUL.md').read()}\nboot: {now()}")
         resumed = False
     SELF_DIR = f"{AGENTS_DIR}/{SELF}"
     LIFE_PATH = f"{SELF_DIR}/LIFE.md"
     MEMORY_PATH = f"{SELF_DIR}/MEMORY.md"
-    INBOX_DROP_DIR = f"{SELF_DIR}/mail_inbox"
-    os.makedirs(INBOX_DROP_DIR, exist_ok=True)
-    os.makedirs(f"{INBOX_DROP_DIR}/processed", exist_ok=True)
-    os.makedirs(f"{SELF_DIR}/cron", exist_ok=True)
-    import pathlib as _p
-    subs_root = _p.Path(SELF_DIR) / "subs"
-    for kind in ["mail", "telegram", "cron"]:
-        bus_path = _p.Path(f"{BUS_DIR}/{kind}/{SELF}.log")
-        bus_path.parent.mkdir(parents=True, exist_ok=True)
-        bus_path.touch(exist_ok=True)
-        sub = subs_root / kind / f"{SELF}.log"
-        sub.parent.mkdir(parents=True, exist_ok=True)
-        if not sub.is_symlink():
-            sub.symlink_to(bus_path.resolve())
+    os.makedirs(SELF_DIR, exist_ok=True)
     if not os.path.exists(MEMORY_PATH):
-        open(MEMORY_PATH, "w").write("# Memory\n\nLearned preferences, strategies, and notes. Edit with EDIT_FILE.\n")
+        open(MEMORY_PATH, "w").write("# Memory\n")
     tg.start(SELF)
     cron.start(SELF)
     inbox_watcher.start(SELF)
@@ -186,44 +152,34 @@ def main():
     else:
         context = f"[boot] you are agent {SELF} (identity: {self_ref}).\n"
         life(f"boot self={SELF}")
-    turn = last_turn_number()
     last_turn_end = time.time()
     tool_called = False
     while True:
-        # check for inbound every iteration
         inbound = tail_bus()
         if inbound:
             context += f"\n{inbound}\n"
-            inbound_short = inbound[:50] + "…" + inbound[-50:] if len(inbound) > 101 else inbound  # 50 + 1 (…) + 50
-            life(f"inbound: {inbound_short}")
+            life(f"inbound: {inbound[:50]}…{inbound[-50:]}" if len(inbound) > 101 else f"inbound: {inbound}")
         elif not tool_called:
-            # idle — wait for messages or heartbeat
             if time.time() - last_turn_end >= HEARTBEAT_INTERVAL:
                 context += "\n<heartbeat/>\n"
                 life("heartbeat")
             else:
                 time.sleep(1)
                 continue
-        # every LLM call is a turn
-        turn += 1
-        memory_raw = open(MEMORY_PATH).read()
-        if len(memory_raw) > MEMORY_LIMIT:
-            half = MEMORY_LIMIT // 2
-            memory = memory_raw[:half] + "\n…\n" + memory_raw[-half:] + "\n[WARNING: MEMORY.md is over the limit and has been truncated. Make it smaller.]"
-        else:
-            memory = memory_raw
-        lt = life_tail()
+        memory = open(MEMORY_PATH).read()
+        if len(memory) > MEMORY_LIMIT:
+            h = MEMORY_LIMIT // 2
+            memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md truncated. Shrink it.]"
         prompt = (f"<soul>\n{soul}\n</soul>\n\n"
                   f"<harness>\n{harness}\n</harness>\n\n"
                   f"<memory>\n{memory}\n</memory>\n\n"
-                  f"<context>\n{context}\n</context>\n\n<life>\n{lt}\n</life>")
-        content, reasoning, tool_calls = llm(prompt, strip_reasoning=False, tools=TOOLS)
-        # build resp text for context (reasoning + content, no tool markers)
+                  f"<context>\n{context}\n</context>\n\n<life>\n{life_tail()}\n</life>")
+        content, reasoning, tool_calls = llm(prompt, tools=TOOLS)
         resp = ""
         if reasoning: resp += f"<reasoning>\n{reasoning}\n</reasoning>\n"
         if content: resp += content
         _, resp_ref = stash(resp)
-        life(f"turn {turn} resp {resp_ref}")
+        life(f"resp {resp_ref}")
         context += f"\n{resp}\n"
         if not tool_calls:
             if content.strip():
@@ -246,21 +202,17 @@ def main():
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, prev)
-        # all tools get their result into context
         _, result_ref = stash(result)
-        life(f"turn {turn} {name} result {result_ref}")
+        life(f"{name} result {result_ref}")
         if len(result) <= RESULT_STASH_LIMIT:
             context += f"\n[{name}] {result}\n"
         else:
             context += f"\n[{name}] {result_ref}\n"
-        while len(context) > CONTEXT_LIMIT:
-            lines = context.splitlines()
-            if len(lines) < 2: break
-            half = len(lines) // 2
-            head, rest = "\n".join(lines[:half]), "\n".join(lines[half:])
-            _, ref = stash(head)
-            context = f"{ref}\n{rest}"
-            life(f"stashed older half -> {ref} (+{len(rest)}ch tail)")
+        if len(context) > CONTEXT_LIMIT:
+            h = CONTEXT_LIMIT // 2
+            _, ref = stash(context[:-h])
+            context = f"{ref}\n{context[-h:]}"
+            life(f"compacted -> {ref}")
         open(f"{SELF_DIR}/context.md", "w").write(context)
 
 if __name__ == "__main__":
