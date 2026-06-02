@@ -1,8 +1,8 @@
 """Telegram bridge. Imported by agent.py.
 
-Reads agents/<self>/telegram_token and agents/<self>/telegram_chat.
+Reads telegram_token and telegram_chat from CWD.
 Inbound: long-polls Telegram, writes to bus/telegram/<self>.log.
-Outbound: agent calls tg.send(text) directly. No bus, no cursor.
+Outbound: agent calls tg.send(text) directly.
 """
 import bus
 import os, pathlib, requests, threading, time
@@ -25,18 +25,10 @@ def send(text):
 
 def start(self_id):
     global _token, _chat_id
-    agents_dir = os.environ.get("AGENTS_DIR", "agents")
-    bus_dir = os.environ.get("BUS_DIR", "bus")
-    agent = pathlib.Path(agents_dir) / self_id
     _token = pathlib.Path("telegram_token").read_text().strip()
     _chat_id = pathlib.Path("telegram_chat").read_text().strip()
-
-    bus_telegram = pathlib.Path(bus_dir) / "telegram" / f"{self_id}.log"
-    bus_telegram.parent.mkdir(parents=True, exist_ok=True)
-    bus_telegram.touch(exist_ok=True)
-    poll_offset = agent / "tg_poll.offset"
-
-    def now(): return time.strftime("%Y%m%dT%H%M%S")
+    bus_telegram = f"bus/telegram/{self_id}.log"
+    poll_offset = pathlib.Path(f"agents/{self_id}/tg_poll.offset")
 
     def poll_in():
         try: offset = int(poll_offset.read_text())
@@ -49,7 +41,7 @@ def start(self_id):
                     advanced = True
                     text = (u.get("message") or {}).get("text") or ""
                     if not text: continue
-                    bus.append(str(bus_telegram), f"[ops {now()} tg:{u['update_id']}] {text}\n")
+                    bus.append(bus_telegram, f"[ops {time.strftime('%Y%m%dT%H%M%S')} tg:{u['update_id']}] {text}\n")
                 if advanced:
                     poll_offset.write_text(str(offset))
             except Exception as e:

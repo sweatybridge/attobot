@@ -13,31 +13,28 @@ import bus
 import tg
 import cron
 import inbox_watcher
-import json, sys, time, hashlib, signal, subprocess, litellm
+import json, sys, time, hashlib, subprocess, pathlib, litellm
 
 MODEL = os.environ.get("MODEL", "openai/deepseek-v4-pro")
 API_BASE = os.environ.get("API_BASE", "https://api.deepseek.com/v1")
-BLOB_DIR = os.environ.get("BLOB_DIR", "blobs")
-BUS_DIR = os.environ.get("BUS_DIR", "bus")
+BLOB_DIR = "blobs"
+BUS_DIR = "bus"
 CONTEXT_LIMIT = int(os.environ.get("CONTEXT_LIMIT", str(65536 * 4)))
 RESULT_STASH_LIMIT = int(os.environ.get("RESULT_STASH_LIMIT", "2000"))
 TOOL_TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "300"))
 LIFE_TAIL = int(os.environ.get("LIFE_TAIL", "50"))
-AGENTS_DIR = os.environ.get("AGENTS_DIR", "agents")
+AGENTS_DIR = "agents"
 MEMORY_LIMIT = int(os.environ.get("MEMORY_LIMIT", "10000"))
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "60"))
-VERBOSE = "--verbose" in sys.argv
 KINDS = ["mail", "telegram", "cron"]
 
 TOOLS = [
-    {"type": "function", "function": {"name": "READ_FILE", "description": "Read a file. Optional offset/limit (line numbers) for large files.",
-        "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "READ_FILE", "description": "Read a file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
     {"type": "function", "function": {"name": "WRITE_FILE", "description": "Overwrite a file with new content.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
     {"type": "function", "function": {"name": "EDIT_FILE", "description": "Replace OLD with NEW in a file. OLD must appear exactly once.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old": {"type": "string"}, "new": {"type": "string"}}, "required": ["path", "old", "new"]}}},
-    {"type": "function", "function": {"name": "LIST", "description": "List a directory (empty string = cwd).",
-        "parameters": {"type": "object", "properties": {"dir": {"type": "string", "default": ""}}, "required": []}}},
     {"type": "function", "function": {"name": "BASH", "description": "Run a shell command (60s timeout).",
         "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}},
     {"type": "function", "function": {"name": "STASH", "description": "Save text to a blob at blobs/<hash>, return [stash <hash>]. Recall later with READ_FILE blobs/<hash>.",
@@ -55,11 +52,8 @@ def now():
     return time.strftime("%Y%m%dT%H%M%S")
 
 def life(event):
-    line = f"[{now()}] {event}"
     with open(LIFE_PATH, "a") as f:
-        f.write(line + "\n")
-    if VERBOSE:
-        print(line, flush=True)
+        f.write(f"[{now()}] {event}\n")
 
 def stash(content):
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
@@ -72,30 +66,14 @@ def llm(prompt, tools=None):
     if tools:
         kwargs["tools"] = tools
     msg = litellm.completion(**kwargs).choices[0].message
-    reasoning = getattr(msg, "reasoning_content", None) or ""
-    content = msg.content or ""
-    tc = msg.tool_calls if hasattr(msg, "tool_calls") else None
-    return content, reasoning, tc
-
-def _read_lines(path, offset=0, limit=None):
-    content = open(path).read()
-    lines = content.splitlines()
-    if limit is None: limit = len(lines)
-    selected = lines[offset:offset + limit]
-    if len(selected) < len(lines):
-        selected.append(f"... ({len(lines)} lines total, showing {offset}:{offset + limit})")
-    return "\n".join(selected)
+    return msg.content or "", getattr(msg, "tool_calls", None)
 
 def life_tail():
-    try:
-        lines = open(LIFE_PATH).read().splitlines()
-        return "\n".join(lines[-LIFE_TAIL:])
-    except FileNotFoundError:
-        return ""
+    return "\n".join(open(LIFE_PATH).read().splitlines()[-LIFE_TAIL:])
 
 def run_tool(name, args):
     if name == "READ_FILE":
-        return _read_lines(args["path"], args.get("offset", 0), args.get("limit"))
+        return open(args["path"]).read()
     if name == "WRITE_FILE":
         path = args["path"]
         if path == "SOUL.md":
@@ -111,8 +89,6 @@ def run_tool(name, args):
             return f"error: OLD must appear exactly once in {path} (found {text.count(old)})"
         open(path, "w").write(text.replace(old, new))
         return f"edited {path}"
-    if name == "LIST":
-        return "\n".join(sorted(os.listdir(args.get("dir", "") or ".")))
     if name == "BASH":
         p = subprocess.run(args["cmd"], shell=True, capture_output=True, text=True, timeout=TOOL_TIMEOUT)
         return (p.stdout + p.stderr) or f"(exit {p.returncode}, no output)"
@@ -131,42 +107,29 @@ def tail_bus():
 
 def main():
     global SELF, SELF_DIR, LIFE_PATH, MEMORY_PATH
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    resume = args[0] if args else None
-    if resume:
-        if not os.path.isdir(f"{AGENTS_DIR}/{resume}"):
-            raise SystemExit(f"agent dir not found: {AGENTS_DIR}/{resume}")
-        SELF = resume
-        resumed = True
-    else:
-        SELF, self_ref = stash(f"soul:\n{open('SOUL.md').read()}\nboot: {now()}")
-        resumed = False
+    soul_text = open("SOUL.md").read()
+    SELF = sys.argv[1] if len(sys.argv) > 1 else hashlib.sha256(f"soul:\n{soul_text}\nboot: {now()}".encode()).hexdigest()[:12]
     SELF_DIR = f"{AGENTS_DIR}/{SELF}"
     LIFE_PATH = f"{SELF_DIR}/LIFE.md"
     MEMORY_PATH = f"{SELF_DIR}/MEMORY.md"
     os.makedirs(SELF_DIR, exist_ok=True)
-    if not os.path.exists(MEMORY_PATH):
-        open(MEMORY_PATH, "w").write("# Memory\n")
+    pathlib.Path(MEMORY_PATH).touch(exist_ok=True)
     tg.start(SELF)
     cron.start(SELF)
     inbox_watcher.start(SELF)
-    soul = open("SOUL.md").read().replace("<self>", SELF)
+    soul = soul_text.replace("<self>", SELF)
     harness = open(__file__).read()
-    if resumed:
-        ctx_path = f"{SELF_DIR}/context.md"
-        context = open(ctx_path).read() if os.path.exists(ctx_path) else ""
-        life(f"resumed self={SELF}")
-        context += f"\n[resumed at {now()}]\n"
-    else:
-        context = f"[boot] you are agent {SELF} (identity: {self_ref}).\n"
-        life(f"boot self={SELF}")
+    ctx_path = f"{SELF_DIR}/context.md"
+    context = open(ctx_path).read() if os.path.exists(ctx_path) else f"[boot] you are agent {SELF}.\n"
+    context += f"\n[awake at {now()}]\n"
+    life(f"awake self={SELF}")
     last_turn_end = time.time()
     tool_called = False
     while True:
         inbound = tail_bus()
         if inbound:
             context += f"\n{inbound}\n"
-            life(f"inbound: {inbound[:50]}…{inbound[-50:]}" if len(inbound) > 101 else f"inbound: {inbound}")
+            life(f"inbound: {inbound[:100]}")
         elif not tool_called:
             if time.time() - last_turn_end >= HEARTBEAT_INTERVAL:
                 context += "\n<heartbeat/>\n"
@@ -182,16 +145,12 @@ def main():
                   f"<harness>\n{harness}\n</harness>\n\n"
                   f"<memory>\n{memory}\n</memory>\n\n"
                   f"<context>\n{context}\n</context>\n\n<life>\n{life_tail()}\n</life>")
-        content, reasoning, tool_calls = llm(prompt, tools=TOOLS)
-        resp = ""
-        if reasoning: resp += f"<reasoning>\n{reasoning}\n</reasoning>\n"
-        if content: resp += content
-        _, resp_ref = stash(resp)
+        content, tool_calls = llm(prompt, tools=TOOLS)
+        _, resp_ref = stash(content)
         life(f"resp {resp_ref}")
-        context += f"\n{resp}\n"
+        context += f"\n{content}\n"
         if not tool_calls:
-            if content.strip():
-                tg.send(content.strip())
+            tg.send(content.strip())
             tool_called = False
             last_turn_end = time.time()
             open(f"{SELF_DIR}/context.md", "w").write(context)
@@ -200,16 +159,10 @@ def main():
         tc = tool_calls[0]
         name = tc.function.name
         tc_args = json.loads(tc.function.arguments)
-        def _timeout_handler(*_): raise TimeoutError("tool timed out")
         try:
-            prev = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.alarm(TOOL_TIMEOUT)
             result = run_tool(name, tc_args)
         except Exception as e:
             result = f"error: {e}"
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, prev)
         _, result_ref = stash(result)
         life(f"{name} result {result_ref}")
         if len(result) <= RESULT_STASH_LIMIT:
