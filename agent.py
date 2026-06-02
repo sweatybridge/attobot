@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """Minimal blob-memory agent. See README.md for design."""
-import config
+import os
+try:
+    for line in open(".env"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+except FileNotFoundError:
+    pass
 import bus
 import tg
 import cron
 import inbox_watcher
-import json, os, sys, time, hashlib, signal, subprocess, litellm
+import json, sys, time, hashlib, signal, subprocess, litellm
 
 MODEL = os.environ.get("MODEL", "openai/deepseek-v4-pro")
 API_BASE = os.environ.get("API_BASE", "https://api.deepseek.com/v1")
