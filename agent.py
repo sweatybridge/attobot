@@ -2,6 +2,7 @@
 """Minimal blob-memory agent. See README.md for design."""
 import config  # loads .env into os.environ
 import bus
+import tg
 import json, os, re, sys, time, hashlib, signal, subprocess, litellm
 
 MODEL = os.environ.get("MODEL", "openai/deepseek-v4-pro")
@@ -183,6 +184,7 @@ def main():
             pub.symlink_to(bus_path.resolve())
     if not os.path.exists(MEMORY_PATH):
         open(MEMORY_PATH, "w").write("# Memory\n\nLearned preferences, strategies, and notes. Edit with EDIT_FILE.\n")
+    tg.start(SELF)
     soul = open("SOUL.md").read().replace("<self>", SELF)
     harness = open(__file__).read()
     if resumed:
