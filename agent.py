@@ -58,7 +58,7 @@ def life(event):
     with open(LIFE_PATH, "a") as f:
         f.write(f"[{now()}] {event}\n")
 
-def stash(content):
+def blob(content):
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
     open(f"{BLOB_DIR}/{h}", "w").write(content)
     return h
@@ -97,7 +97,7 @@ def run_tool(name, args):
         open(path, "w").write(text.replace(old, new))
         return f"edited {path}"
     if name == "STASH":
-        return f"stashed: [stash {stash(args['content'])}]"
+        return f"stashed: [stash {blob(args['content'])}]"
     if name == "SEARCH":
         n = min(args.get("n", 5), 10)
         try:
@@ -142,15 +142,15 @@ def build_system():
             f"<memory>\n{memory}\n</memory>\n\n"
             f"<life>\n{life_tail()}\n</life>")
 
-def compact(messages):
+def stash(messages):
     half = len(messages) // 2
     head = "\n".join(json.dumps(m) for m in messages[:half])
-    h = stash(head)
-    new = [{"role": "system", "content": f"<earlier history compacted: [stash {h}]>"}] + messages[half:]
+    h = blob(head)
+    new = [{"role": "system", "content": f"<earlier history stashed: [stash {h}]>"}] + messages[half:]
     with open(MESSAGES_PATH, "w") as f:
         for m in new:
             f.write(json.dumps(m) + "\n")
-    life(f"compacted -> {h}")
+    life(f"stashed -> {h}")
     return new
 
 def serialize_assistant(msg):
@@ -227,7 +227,7 @@ def main():
             life(name)
 
         if len(messages) > MSG_LIMIT:
-            messages = compact(messages)
+            messages = stash(messages)
             msg_size = os.path.getsize(MESSAGES_PATH)
 
 if __name__ == "__main__":
