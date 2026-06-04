@@ -16,7 +16,7 @@ bg.run(name, args, tool_call_id, run_tool_fn, self_dir, messages_path):
 """
 import fcntl, hashlib, json, os, pathlib, signal, subprocess, threading, time
 
-TIMEOUT = 10
+TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "10"))
 
 
 def run(name, args, tool_call_id, run_tool_fn, self_dir, messages_path):

@@ -2,9 +2,9 @@
 
 Fires due jobs into agents/<self>/messages.jsonl as role:system.
 """
-import fcntl, json, pathlib, threading, time
+import fcntl, json, os, pathlib, threading, time
 
-TICK = 30
+TICK = int(os.environ.get("CRON_TICK", "30"))
 
 
 def start(self_id):
