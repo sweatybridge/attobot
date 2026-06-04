@@ -1,25 +1,25 @@
 """Generic background tool wrapper.
 
-bg.run(name, args, tool_call_id, run_tool_fn, self_dir, messages_path):
-    Runs the tool in a thread with TIMEOUT seconds. If it finishes in time,
-    returns the result inline. Otherwise registers agents/<self>/bg/<id>.json,
-    spawns an emitter thread that appends a system message to messages.jsonl
-    when the tool eventually completes, and returns a "[backgrounded …]"
-    placeholder.
+bg.run(name, args, tool_call_id, tool_fn, self_dir, messages_path):
+    Runs tool_fn(args, on_pid=...) in a thread with TIMEOUT seconds. If it
+    finishes in time, returns the result inline. Otherwise registers
+    agents/<self>/bg/<id>.json, spawns an emitter thread that appends a
+    system message to messages.jsonl when the tool completes, and returns
+    a "[backgrounded …]" placeholder.
 
-    BASH is special-cased: spawned via Popen so we know the subprocess pid
-    (recorded in the bg json). Other tools run their normal sync path.
+    Tools that spawn subprocesses (e.g. BASH) call on_pid(pid) so we can
+    SIGTERM them on kill.
 
     To kill a backgrounded call: rm agents/<self>/bg/<id>.json. The emitter
     notices the file is gone, SIGTERMs the pid (if any), and emits a "killed"
     system message.
 """
-import fcntl, hashlib, json, os, pathlib, signal, subprocess, threading, time
+import fcntl, hashlib, json, os, pathlib, signal, threading, time
 
 TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "10"))
 
 
-def run(name, args, tool_call_id, run_tool_fn, self_dir, messages_path):
+def run(name, args, tool_call_id, tool_fn, self_dir, messages_path):
     bg_id = hashlib.sha256(f"{tool_call_id}{time.time()}".encode()).hexdigest()[:8]
     bg_dir = pathlib.Path(self_dir) / "bg"
     bg_dir.mkdir(parents=True, exist_ok=True)
@@ -27,19 +27,7 @@ def run(name, args, tool_call_id, run_tool_fn, self_dir, messages_path):
 
     def work():
         try:
-            if name == "BASH":
-                stdout_path = bg_dir / f"{bg_id}.stdout"
-                f = open(stdout_path, "w")
-                p = subprocess.Popen(args["cmd"], shell=True, stdout=f, stderr=subprocess.STDOUT, text=True)
-                f.close()
-                holder["pid"] = p.pid
-                p.wait()
-                try: holder["result"] = open(stdout_path).read() or f"(exit {p.returncode}, no output)"
-                except Exception: holder["result"] = f"(exit {p.returncode})"
-                try: stdout_path.unlink()
-                except Exception: pass
-            else:
-                holder["result"] = run_tool_fn(name, args)
+            holder["result"] = tool_fn(args, on_pid=lambda pid: holder.update(pid=pid))
         except Exception as e:
             holder["result"] = f"error: {e}"
         finally:
