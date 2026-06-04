@@ -4,5 +4,3 @@ __pycache__/
 .env
 agents/
 blobs/
-telegram_token
-telegram_chat

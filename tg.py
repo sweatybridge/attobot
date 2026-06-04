@@ -23,12 +23,13 @@ def send(text):
 
 def start(self_id):
     global _token, _chat_id
-    _token = pathlib.Path("telegram_token").read_text().strip()
-    chat_file = pathlib.Path("telegram_chat")
+    agent_dir = pathlib.Path(f"agents/{self_id}")
+    _token = (agent_dir / "telegram_token").read_text().strip()
+    chat_file = agent_dir / "telegram_chat"
     _chat_id = chat_file.read_text().strip() if chat_file.exists() else None
 
-    messages_path = f"agents/{self_id}/messages.jsonl"
-    poll_offset = pathlib.Path(f"agents/{self_id}/tg_poll.offset")
+    messages_path = str(agent_dir / "messages.jsonl")
+    poll_offset = agent_dir / "tg_poll.offset"
 
     def poll_in():
         global _chat_id
