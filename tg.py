@@ -3,7 +3,7 @@
 Polls telegram. Inbound text → agents/<self>/messages.jsonl as role:user.
 Outbound: agent calls tg.send(text) directly.
 """
-import fcntl, json, os, pathlib, requests, threading, time
+import fcntl, json, pathlib, requests, threading, time
 
 TG_MAX = 4000
 

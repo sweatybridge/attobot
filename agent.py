@@ -13,7 +13,7 @@ import tg
 import cron
 import inbox_watcher
 import bg
-import fcntl, json, sys, time, hashlib, subprocess, pathlib, requests
+import fcntl, hashlib, json, pathlib, re, requests, sys, time
 from ddgs import DDGS
 
 MODEL = "deepseek-v4-pro"
@@ -112,8 +112,6 @@ def run_tool(name, args):
             r = requests.get(args["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
             r.raise_for_status()
             text = r.text
-            # crude extract: remove script/style, get body text
-            import re
             text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL|re.IGNORECASE)
             text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL|re.IGNORECASE)
             text = re.sub(r'<[^>]+>', ' ', text)
