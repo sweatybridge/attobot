@@ -14,8 +14,7 @@ bg.run(name, args, tool_call_id, run_tool_fn, self_dir, messages_path):
     notices the file is gone, SIGTERMs the pid (if any), and emits a "killed"
     system message.
 """
-import bus
-import hashlib, json, os, pathlib, signal, subprocess, threading, time
+import fcntl, hashlib, json, os, pathlib, signal, subprocess, threading, time
 
 TIMEOUT = 10
 
@@ -58,22 +57,27 @@ def run(name, args, tool_call_id, run_tool_fn, self_dir, messages_path):
         "pid": holder.get("pid"), "started": time.time(),
     }))
 
+    def append_line(line):
+        with open(messages_path, "a") as fp:
+            fcntl.flock(fp, fcntl.LOCK_EX)
+            fp.write(line + "\n")
+
     def emit():
         while not holder["done"]:
             if not json_path.exists():
                 if holder.get("pid"):
                     try: os.kill(holder["pid"], signal.SIGTERM)
                     except Exception: pass
-                bus.append(messages_path, json.dumps({
+                append_line(json.dumps({
                     "role": "system",
                     "content": f"[bg {bg_id} killed, tc:{tool_call_id}]"
-                }) + "\n")
+                }))
                 return
             time.sleep(1)
-        bus.append(messages_path, json.dumps({
+        append_line(json.dumps({
             "role": "system",
             "content": f"[bg {bg_id} done, tc:{tool_call_id}] {holder['result']}"
-        }) + "\n")
+        }))
         try: json_path.unlink()
         except Exception: pass
 

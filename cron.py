@@ -2,8 +2,7 @@
 
 Fires due jobs into agents/<self>/messages.jsonl as role:system.
 """
-import bus
-import json, pathlib, threading, time
+import fcntl, json, pathlib, threading, time
 
 TICK = 30
 
@@ -21,7 +20,9 @@ def start(self_id):
                 except Exception: continue
                 if job.get("next", float("inf")) > ts: continue
                 obj = {"role": "system", "content": f"[cron {f.stem}] {job.get('message', '')}"}
-                bus.append(messages_path, json.dumps(obj) + "\n")
+                with open(messages_path, "a") as fp:
+                    fcntl.flock(fp, fcntl.LOCK_EX)
+                    fp.write(json.dumps(obj) + "\n")
                 if job.get("repeat_s"):
                     job["next"] = ts + job["repeat_s"]
                     f.write_text(json.dumps(job))

@@ -9,12 +9,11 @@ try:
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 except FileNotFoundError:
     pass
-import bus
 import tg
 import cron
 import inbox_watcher
 import bg
-import json, sys, time, hashlib, subprocess, pathlib, requests
+import fcntl, json, sys, time, hashlib, subprocess, pathlib, requests
 from ddgs import DDGS
 
 MODEL = "deepseek-v4-pro"
@@ -128,7 +127,9 @@ def load_messages():
     return [json.loads(l) for l in open(MESSAGES_PATH) if l.strip()]
 
 def append_msg(m):
-    bus.append(MESSAGES_PATH, json.dumps(m) + "\n")
+    with open(MESSAGES_PATH, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(m) + "\n")
 
 def build_system():
     soul = open("SOUL.md").read().replace("<self>", SELF)

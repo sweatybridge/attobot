@@ -3,6 +3,5 @@ __pycache__/
 .venv/
 agents/
 blobs/
-bus/
 telegram_token
 telegram_chat

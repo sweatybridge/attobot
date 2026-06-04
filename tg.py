@@ -3,8 +3,7 @@
 Polls telegram. Inbound text → agents/<self>/messages.jsonl as role:user.
 Outbound: agent calls tg.send(text) directly.
 """
-import bus
-import json, os, pathlib, requests, threading, time
+import fcntl, json, os, pathlib, requests, threading, time
 
 TG_MAX = 4000
 
@@ -49,7 +48,9 @@ def start(self_id):
                     text = msg.get("text") or ""
                     if not text: continue
                     obj = {"role": "user", "content": f"[telegram tg:{u['update_id']}] {text}"}
-                    bus.append(messages_path, json.dumps(obj) + "\n")
+                    with open(messages_path, "a") as fp:
+                        fcntl.flock(fp, fcntl.LOCK_EX)
+                        fp.write(json.dumps(obj) + "\n")
                 if advanced:
                     poll_offset.write_text(str(offset))
             except Exception as e:

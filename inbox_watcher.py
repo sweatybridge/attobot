@@ -2,9 +2,8 @@
 
 Polls agents/<self>/mail_inbox/ for new files. Drops → messages.jsonl as role:system + tg.send.
 """
-import bus
 import tg
-import json, pathlib, pwd, threading, time
+import fcntl, json, pathlib, pwd, threading, time
 
 PREVIEW = 1000
 TICK = 2
@@ -19,7 +18,9 @@ def start(self_id):
         sender = pwd.getpwuid(drop.stat().st_uid).pw_name
         text = drop.read_bytes()[:PREVIEW * 4].decode("utf-8", errors="replace")[:PREVIEW]
         obj = {"role": "system", "content": f"[mail from {sender}] {drop.name}\n{text}"}
-        bus.append(messages_path, json.dumps(obj) + "\n")
+        with open(messages_path, "a") as fp:
+            fcntl.flock(fp, fcntl.LOCK_EX)
+            fp.write(json.dumps(obj) + "\n")
         tg.send(f"📬 mail from {sender}\n{text}")
 
     def watch():
