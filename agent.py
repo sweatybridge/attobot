@@ -141,12 +141,16 @@ def build_system():
             f"<memory>\n{memory}\n</memory>\n\n"
             f"<life>\n{life_tail()}\n</life>")
 
-def stash(messages):
-    half = len(messages) // 2
-    head = "\n".join(json.dumps(m) for m in messages[:half])
-    h = blob(head)
-    new = [{"role": "system", "content": f"<earlier history stashed: [stash {h}]>"}] + messages[half:]
-    with open(MESSAGES_PATH, "w") as f:
+def stash():
+    with open(MESSAGES_PATH, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        all_msgs = [json.loads(l) for l in f.read().splitlines() if l.strip()]
+        half = len(all_msgs) // 2
+        head = "\n".join(json.dumps(m) for m in all_msgs[:half])
+        h = blob(head)
+        new = [{"role": "system", "content": f"<earlier history stashed: [stash {h}]>"}] + all_msgs[half:]
+        f.seek(0)
+        f.truncate()
         for m in new:
             f.write(json.dumps(m) + "\n")
     life(f"stashed -> {h}")
@@ -226,7 +230,7 @@ def main():
             life(name)
 
         if len(messages) > MSG_LIMIT:
-            messages = stash(messages)
+            messages = stash()
             msg_size = os.path.getsize(MESSAGES_PATH)
 
 if __name__ == "__main__":
