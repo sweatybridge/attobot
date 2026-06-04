@@ -9,20 +9,20 @@ try:
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 except FileNotFoundError:
     pass
-import tg
+import chat
 import cron
 import inbox_watcher
 import bg
 import fcntl, hashlib, json, pathlib, re, requests, sys, time
 from ddgs import DDGS
 
-MODEL = "deepseek-v4-pro"
-API_BASE = "http://localhost:8181/deepseek/v1"
-BLOB_DIR = "blobs"
-AGENTS_DIR = "agents"
-MSG_LIMIT = 200
-LIFE_TAIL = 50
-MEMORY_LIMIT = 10000
+MODEL = os.environ.get("MODEL", "deepseek-v4-pro")
+API_BASE = os.environ.get("API_BASE", "http://localhost:8181/deepseek/v1")
+BLOB_DIR = os.environ.get("BLOB_DIR", "blobs")
+AGENTS_DIR = os.environ.get("AGENTS_DIR", "agents")
+MSG_LIMIT = int(os.environ.get("MSG_LIMIT", "200"))
+LIFE_TAIL = int(os.environ.get("LIFE_TAIL", "50"))
+MEMORY_LIMIT = int(os.environ.get("MEMORY_LIMIT", "10000"))
 
 TOOLS = [
     {"type": "function", "function": {"name": "READ_FILE", "description": "Read a file.",
@@ -179,7 +179,7 @@ def main():
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     if not heartbeat.exists():
         heartbeat.write_text(json.dumps({"next": time.time() + 60, "repeat_s": 60, "message": "tick"}))
-    tg.start(SELF)
+    chat.start(SELF)
     cron.start(SELF)
     inbox_watcher.start(SELF)
     life(f"awake self={SELF}")
@@ -211,7 +211,7 @@ def main():
         life("resp")
 
         if not assistant.get("tool_calls"):
-            tg.send((msg.get("content") or "").strip())
+            chat.send((msg.get("content") or "").strip())
             tool_called = False
             continue
 

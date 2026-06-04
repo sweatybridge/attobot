@@ -1,12 +1,12 @@
 """Mail inbox watcher per agent. Imported by agent.py.
 
-Polls agents/<self>/mail_inbox/ for new files. Drops → messages.jsonl as role:system + tg.send.
+Polls agents/<self>/mail_inbox/ for new files. Drops → messages.jsonl as role:system + chat.send.
 """
-import tg
-import fcntl, json, pathlib, pwd, threading, time
+import chat
+import fcntl, json, os, pathlib, pwd, threading, time
 
-PREVIEW = 1000
-TICK = 2
+PREVIEW = int(os.environ.get("INBOX_PREVIEW", "1000"))
+TICK = int(os.environ.get("INBOX_TICK", "2"))
 
 
 def start(self_id):
@@ -21,7 +21,7 @@ def start(self_id):
         with open(messages_path, "a") as fp:
             fcntl.flock(fp, fcntl.LOCK_EX)
             fp.write(json.dumps(obj) + "\n")
-        tg.send(f"📬 mail from {sender}\n{text}")
+        chat.send(f"📬 mail from {sender}\n{text}")
 
     def watch():
         seen = set(inbox.iterdir())

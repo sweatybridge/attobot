@@ -1,11 +1,11 @@
-"""Telegram bridge. Imported by agent.py.
+"""Chat bridge (currently Telegram). Imported by agent.py.
 
 Polls telegram. Inbound text → agents/<self>/messages.jsonl as role:user.
-Outbound: agent calls tg.send(text) directly.
+Outbound: agent calls chat.send(text) directly.
 """
-import fcntl, json, pathlib, requests, threading, time
+import fcntl, json, os, pathlib, requests, threading, time
 
-TG_MAX = 4000
+TG_MAX = int(os.environ.get("TG_MAX", "4000"))
 
 _token = None
 _chat_id = None
@@ -48,13 +48,13 @@ def start(self_id):
                         chat_file.write_text(cid)
                     text = msg.get("text") or ""
                     if not text: continue
-                    obj = {"role": "user", "content": f"[telegram tg:{u['update_id']}] {text}"}
+                    obj = {"role": "user", "content": f"[telegram {u['update_id']}] {text}"}
                     with open(messages_path, "a") as fp:
                         fcntl.flock(fp, fcntl.LOCK_EX)
                         fp.write(json.dumps(obj) + "\n")
                 if advanced:
                     poll_offset.write_text(str(offset))
             except Exception as e:
-                print(f"tg poll: {e}"); time.sleep(5)
+                print(f"chat poll: {e}"); time.sleep(5)
 
-    threading.Thread(target=poll_in, daemon=True, name="tg-poll").start()
+    threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
