@@ -10,7 +10,7 @@ SCHEMA = {
 }
 
 
-def run(args, on_pid=None):
+def run(args):
     try:
         r = requests.get(args["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         r.raise_for_status()

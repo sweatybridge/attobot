@@ -8,7 +8,7 @@ SCHEMA = {
 }
 
 
-def run(args, on_pid=None):
+def run(args):
     path = args["path"]
     if path == "SOUL.md":
         return f"error: {path} is immutable"

@@ -8,5 +8,5 @@ SCHEMA = {
 }
 
 
-def run(args, on_pid=None):
+def run(args):
     return open(args["path"]).read()

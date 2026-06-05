@@ -10,7 +10,7 @@ SCHEMA = {
 }
 
 
-def run(args, on_pid=None):
+def run(args):
     n = min(args.get("n", 5), 10)
     try:
         results = list(DDGS().text(args["query"], max_results=n))

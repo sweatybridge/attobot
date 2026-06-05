@@ -10,7 +10,7 @@ SCHEMA = {
 }
 
 
-def run(args, on_pid=None):
+def run(args):
     content = args["content"]
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
     blob_dir = os.environ.get("BLOB_DIR", "blobs")

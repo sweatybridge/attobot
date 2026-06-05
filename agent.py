@@ -28,7 +28,7 @@ SCHEMAS = []
 for mod_info in pkgutil.iter_modules(["tools"]):
     mod = importlib.import_module(f"tools.{mod_info.name}")
     if not hasattr(mod, "SCHEMA") or not callable(getattr(mod, "run", None)):
-        raise RuntimeError(f"tools/{mod_info.name}.py must export SCHEMA and run(args, on_pid=None)")
+        raise RuntimeError(f"tools/{mod_info.name}.py must export SCHEMA and run(args)")
     TOOL_RUN[mod.SCHEMA["function"]["name"]] = mod.run
     SCHEMAS.append(mod.SCHEMA)
 
@@ -52,13 +52,21 @@ def llm(messages, tools=None):
     body = {"model": MODEL, "messages": messages}
     if tools:
         body["tools"] = tools
-    r = requests.post(f"{API_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}"},
-        json=body, timeout=120)
-    data = r.json()
-    if "choices" not in data:
-        raise RuntimeError(f"llm {r.status_code}: {data}")
-    return data["choices"][0]["message"]
+    delay = 1
+    while True:
+        try:
+            r = requests.post(f"{API_BASE}/chat/completions",
+                headers={"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}"},
+                json=body, timeout=120)
+            data = r.json()
+            if "choices" in data:
+                return data["choices"][0]["message"]
+            err = f"{r.status_code}: {data}"
+        except Exception as e:
+            err = str(e)
+        life(f"llm retry in {delay}s: {err}")
+        time.sleep(delay)
+        delay = min(delay * 2, 60)
 
 def life_tail():
     return "\n".join(open(LIFE_PATH).read().splitlines()[-LIFE_TAIL:])
@@ -83,22 +91,6 @@ def build_system():
             f"<memory>\n{memory}\n</memory>\n\n"
             f"<life>\n{life_tail()}\n</life>")
 
-def stash():
-    with open(MESSAGES_PATH, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        all_msgs = [json.loads(l) for l in f.read().splitlines() if l.strip()]
-        half = len(all_msgs) // 2
-        head = "\n".join(json.dumps(m) for m in all_msgs[:half])
-        h = hashlib.sha256(head.encode()).hexdigest()[:12]
-        open(f"{BLOB_DIR}/{h}", "w").write(head)
-        new = [{"role": "system", "content": f"<earlier history stashed: [stash {h}]>"}] + all_msgs[half:]
-        f.seek(0)
-        f.truncate()
-        for m in new:
-            f.write(json.dumps(m) + "\n")
-    life(f"stashed -> {h}")
-    return new
-
 def serialize_assistant(msg):
     out = {"role": "assistant", "content": msg.get("content") or ""}
     if msg.get("reasoning_content"):
@@ -122,59 +114,54 @@ def main():
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     if not heartbeat.exists():
         heartbeat.write_text(json.dumps({"next": time.time() + 60, "repeat_s": 60, "message": "tick"}))
+    os.environ["SELF_DIR"] = SELF_DIR
     chat.start(SELF)
     cron.start(SELF)
     inbox_watcher.start(SELF)
     life(f"awake self={SELF}")
 
+    def file_hash():
+        return hashlib.sha256(open(MESSAGES_PATH, "rb").read()).hexdigest()
+
+    last_hash = file_hash()
     messages = load_messages()
-    msg_size = os.path.getsize(MESSAGES_PATH)
     tool_called = False
     while True:
-        cur_size = os.path.getsize(MESSAGES_PATH)
-        new_arrived = False
-        if cur_size > msg_size:
-            with open(MESSAGES_PATH, "r") as f:
-                f.seek(msg_size)
-                new = f.read()
-            msg_size = cur_size
-            for line in new.splitlines():
-                if line.strip():
-                    messages.append(json.loads(line))
-            new_arrived = True
-        if not (new_arrived or tool_called):
+        cur_hash = file_hash()
+        if cur_hash == last_hash and not tool_called:
             time.sleep(1)
             continue
+        messages = load_messages()
+        last_hash = cur_hash
+
+        if len(messages) > MSG_LIMIT:
+            life(f"stash_messages: {TOOL_RUN['STASH_MESSAGES']({})}")
+            messages = load_messages()
+            last_hash = file_hash()
 
         msg = llm([{"role": "system", "content": build_system()}] + messages, tools=SCHEMAS)
         assistant = serialize_assistant(msg)
         append_msg(assistant)
-        msg_size = os.path.getsize(MESSAGES_PATH)
-        messages.append(assistant)
+        last_hash = file_hash()
         life("resp")
 
         if not assistant.get("tool_calls"):
-            chat.send((msg.get("content") or "").strip())
+            TOOL_RUN["SEND_CHAT"]({"text": (msg.get("content") or "").strip()})
             tool_called = False
             continue
 
         tool_called = True
         for tc in assistant["tool_calls"]:
             name = tc["function"]["name"]
-            tc_args = json.loads(tc["function"]["arguments"])
             try:
-                result = bg.run(name, tc_args, tc["id"], TOOL_RUN[name], SELF_DIR, MESSAGES_PATH)
+                tc_args = json.loads(tc["function"]["arguments"])
+                result = bg.run(name, tc_args, tc["id"], TOOL_RUN[name])
             except Exception as e:
                 result = f"error: {e}"
             tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result}
             append_msg(tool_msg)
-            msg_size = os.path.getsize(MESSAGES_PATH)
-            messages.append(tool_msg)
+            last_hash = file_hash()
             life(name)
-
-        if len(messages) > MSG_LIMIT:
-            messages = stash()
-            msg_size = os.path.getsize(MESSAGES_PATH)
 
 if __name__ == "__main__":
     main()

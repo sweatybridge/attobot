@@ -1,25 +1,26 @@
 """Generic background tool wrapper.
 
-bg.run(name, args, tool_call_id, tool_fn, self_dir, messages_path):
-    Runs tool_fn(args, on_pid=...) in a thread with TIMEOUT seconds. If it
-    finishes in time, returns the result inline. Otherwise registers
-    agents/<self>/bg/<id>.json, spawns an emitter thread that appends a
-    system message to messages.jsonl when the tool completes, and returns
-    a "[backgrounded …]" placeholder.
+bg.run(name, args, tool_call_id, tool_fn):
+    Runs tool_fn(args) in a thread with TIMEOUT seconds. If it finishes in
+    time, returns the result inline. Otherwise registers agents/<self>/bg/<id>.json,
+    spawns an emitter thread that appends a system message to messages.jsonl
+    when the tool completes, and returns a "[backgrounded …]" placeholder.
 
-    Tools that spawn subprocesses (e.g. BASH) call on_pid(pid) so we can
-    SIGTERM them on kill.
+    A tool may return a subprocess.Popen-like object (anything with .pid and
+    .communicate()); bg records its pid for kill-by-rm and awaits its output.
 
     To kill a backgrounded call: rm agents/<self>/bg/<id>.json. The emitter
     notices the file is gone, SIGTERMs the pid (if any), and emits a "killed"
     system message.
 """
-import fcntl, hashlib, json, os, pathlib, signal, threading, time
+import hashlib, json, os, pathlib, signal, threading, time
+from tools.append_message import run as append_message
 
-TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "10"))
+TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "30"))
 
 
-def run(name, args, tool_call_id, tool_fn, self_dir, messages_path):
+def run(name, args, tool_call_id, tool_fn):
+    self_dir = os.environ["SELF_DIR"]
     bg_id = hashlib.sha256(f"{tool_call_id}{time.time()}".encode()).hexdigest()[:8]
     bg_dir = pathlib.Path(self_dir) / "bg"
     bg_dir.mkdir(parents=True, exist_ok=True)
@@ -27,7 +28,13 @@ def run(name, args, tool_call_id, tool_fn, self_dir, messages_path):
 
     def work():
         try:
-            holder["result"] = tool_fn(args, on_pid=lambda pid: holder.update(pid=pid))
+            r = tool_fn(args)
+            if hasattr(r, "pid") and hasattr(r, "communicate"):
+                holder["pid"] = r.pid
+                out, _ = r.communicate()
+                holder["result"] = out or f"(exit {r.returncode})"
+            else:
+                holder["result"] = r
         except Exception as e:
             holder["result"] = f"error: {e}"
         finally:
@@ -45,27 +52,16 @@ def run(name, args, tool_call_id, tool_fn, self_dir, messages_path):
         "pid": holder.get("pid"), "started": time.time(),
     }))
 
-    def append_line(line):
-        with open(messages_path, "a") as fp:
-            fcntl.flock(fp, fcntl.LOCK_EX)
-            fp.write(line + "\n")
-
     def emit():
         while not holder["done"]:
             if not json_path.exists():
                 if holder.get("pid"):
                     try: os.kill(holder["pid"], signal.SIGTERM)
                     except Exception: pass
-                append_line(json.dumps({
-                    "role": "system",
-                    "content": f"[bg {bg_id} killed, tc:{tool_call_id}]"
-                }))
+                append_message({"role": "system", "content": f"[bg {bg_id} killed, tc:{tool_call_id}]"})
                 return
             time.sleep(1)
-        append_line(json.dumps({
-            "role": "system",
-            "content": f"[bg {bg_id} done, tc:{tool_call_id}] {holder['result']}"
-        }))
+        append_message({"role": "system", "content": f"[bg {bg_id} done, tc:{tool_call_id}] {holder['result']}"})
         try: json_path.unlink()
         except Exception: pass
 

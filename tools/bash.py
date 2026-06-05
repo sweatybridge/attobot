@@ -10,8 +10,5 @@ SCHEMA = {
 }
 
 
-def run(args, on_pid=None):
-    p = subprocess.Popen(args["cmd"], shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if on_pid: on_pid(p.pid)
-    out, _ = p.communicate()
-    return out or f"(exit {p.returncode})"
+def run(args):
+    return subprocess.Popen(args["cmd"], shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
