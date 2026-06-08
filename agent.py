@@ -37,6 +37,7 @@ if PROVIDER and f"providers/{PROVIDER}" not in OPT:
 for d in (BLOB_DIR, AGENTS_DIR): os.makedirs(d, exist_ok=True)
 
 SELF = None
+CFG = {}
 
 def life(event):
     with open(f"{AGENTS_DIR}/{SELF}/LIFE.md", "a") as f:
@@ -110,12 +111,10 @@ _TG_MEDIA = {
 }
 
 def send_chat(args):
-    agent_dir = pathlib.Path(f"{AGENTS_DIR}/{SELF}")
-    token = (agent_dir / "telegram_token").read_text().strip()
-    chat_file = agent_dir / "telegram_chat"
-    if not chat_file.exists():
-        return "no chat_id yet"
-    chat_id = chat_file.read_text().strip()
+    token = CFG["telegram_token"]
+    base = {"chat_id": CFG["telegram_chat_id"]}
+    if CFG.get("telegram_thread_id"):
+        base["message_thread_id"] = CFG["telegram_thread_id"]
     text = args.get("text", "")
     path = args.get("path")
     if path:
@@ -123,12 +122,12 @@ def send_chat(args):
         endpoint, field = _TG_MEDIA.get(ext, ("sendDocument", "document"))
         with open(path, "rb") as f:
             requests.post(f"https://api.telegram.org/bot{token}/{endpoint}",
-                          data={"chat_id": chat_id, "caption": text[:1024]},
+                          data={**base, "caption": text[:1024]},
                           files={field: f}, timeout=60)
         return f"sent {field} {path}"
     for i in range(0, len(text), CHAT_MSG_MAX):
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={"chat_id": chat_id, "text": text[i:i+CHAT_MSG_MAX]}, timeout=45)
+                      data={**base, "text": text[i:i+CHAT_MSG_MAX]}, timeout=45)
     return "sent"
 
 def stash(content):
@@ -342,15 +341,14 @@ def bg_run(name, args, tool_call_id, tool_fn):
 # ---------- channels ----------
 
 def start_chat():
-    agent_dir = pathlib.Path(f"{AGENTS_DIR}/{SELF}")
-    token = (agent_dir / "telegram_token").read_text().strip()
-    chat_file = agent_dir / "telegram_chat"
-    poll_offset = agent_dir / "tg_poll.offset"
+    token = CFG["telegram_token"]
+    locked_cid = CFG["telegram_chat_id"]
+    locked_tid = CFG.get("telegram_thread_id")
+    poll_offset = pathlib.Path(f"{AGENTS_DIR}/{SELF}/tg_poll.offset")
 
     def poll_in():
         try: offset = int(poll_offset.read_text())
         except (FileNotFoundError, ValueError): offset = 0
-        cached_chat_id = chat_file.read_text().strip() if chat_file.exists() else None
         while True:
             try:
                 advanced = False
@@ -360,10 +358,14 @@ def start_chat():
                     offset = u["update_id"] + 1
                     advanced = True
                     msg = u.get("message") or {}
-                    cid = str((msg.get("chat") or {}).get("id") or "")
-                    if cid and cid != cached_chat_id:
-                        cached_chat_id = cid
-                        chat_file.write_text(cid)
+                    msg_cid = str((msg.get("chat") or {}).get("id") or "")
+                    tid_raw = msg.get("message_thread_id")
+                    msg_tid = str(tid_raw) if tid_raw is not None else None
+                    if not msg_cid:
+                        continue
+                    if msg_cid != locked_cid or msg_tid != locked_tid:
+                        append_msg({"role": "system", "content": f"[chat reject {msg_cid}/{msg_tid or '-'}]"})
+                        continue
                     text = msg.get("text") or ""
                     caption = msg.get("caption") or ""
                     file_id = None
@@ -377,6 +379,7 @@ def start_chat():
                         file_id = msg["video"]["file_id"]
                     elif msg.get("audio"):
                         file_id = msg["audio"]["file_id"]
+                    appended = False
                     if file_id:
                         meta = requests.get(f"https://api.telegram.org/bot{token}/getFile",
                                             params={"file_id": file_id}, timeout=30).json()
@@ -388,8 +391,13 @@ def start_chat():
                         save.write_bytes(blob)
                         body = f"(file: {save})" + (f" {caption}" if caption else "")
                         append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {body}"})
+                        appended = True
                     elif text:
                         append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {text}"})
+                        appended = True
+                    if appended and (mid := msg.get("message_id")):
+                        _pending_reactions.append(mid)
+                        _react(mid, "👀")
                 if advanced:
                     poll_offset.write_text(str(offset))
             except Exception as e:
@@ -462,6 +470,15 @@ def build_system():
             f"<memory>\n{memory}\n</memory>\n\n"
             f"<life>\n[{max(0, len(tail)-LIFE_TAIL)} earlier]\n{''.join(tail[-LIFE_TAIL:])}</life>")
 
+_pending_reactions = []
+
+def _react(mid, emoji):
+    try:
+        requests.post(f"https://api.telegram.org/bot{CFG['telegram_token']}/setMessageReaction",
+            json={"chat_id": CFG["telegram_chat_id"], "message_id": mid,
+                  "reaction": [{"type":"emoji","emoji":emoji}] if emoji else []}, timeout=10)
+    except Exception: pass
+
 def _adjust_heartbeat(active):
     """active=True → reset to 60s; active=False → double, cap at 3600s (60 min)."""
     path = pathlib.Path(f"{AGENTS_DIR}/{SELF}/cron/heartbeat.json")
@@ -485,11 +502,18 @@ def serialize_assistant(msg):
     return out
 
 def main():
-    global SELF
+    global SELF, CFG
     soul_template = sys.argv[2] if len(sys.argv) > 2 else "SOUL.md"
     soul_text = open(soul_template).read()
     SELF = sys.argv[1] if len(sys.argv) > 1 else hashlib.sha256(soul_text.encode()).hexdigest()[:12]
     self_dir = f"{AGENTS_DIR}/{SELF}"
+    config_path = pathlib.Path(f"{self_dir}/config.json")
+    if not config_path.exists():
+        sys.exit(f"missing {config_path}. Run: python setup.py {SELF}")
+    CFG = json.loads(config_path.read_text())
+    for key in ("telegram_token", "telegram_chat_id"):
+        if not CFG.get(key):
+            sys.exit(f"{config_path} missing required field: {key}")
     os.makedirs(self_dir, exist_ok=True)
     if not pathlib.Path(f"{self_dir}/SOUL.md").exists():
         shutil.copy(soul_template, f"{self_dir}/SOUL.md")
@@ -543,6 +567,8 @@ def main():
             append_msg(assistant)
             last_hash = file_hash()
             send_chat({"text": (msg.get("content") or "").strip()})
+            while _pending_reactions:
+                _react(_pending_reactions.pop(), "")
             _adjust_heartbeat(active=False)
             tool_called = False
             continue
