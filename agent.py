@@ -72,7 +72,7 @@ def llm(messages, tools=None):
         except Exception as e:
             life(f"llm retry in {delay}s: {e}")
             time.sleep(delay)
-            delay = min(delay * 2, 60)
+            delay = min(delay * 2, 900)
 
 # ---------- tools ----------
 
@@ -166,19 +166,24 @@ def stash_messages(args):
     with open(messages_path, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         all_msgs = [json.loads(l) for l in f.read().splitlines() if l.strip()]
-        cut = len(all_msgs) // 2
-        while cut < len(all_msgs) and all_msgs[cut].get("role") == "tool":
-            cut += 1
-        if cut >= len(all_msgs):
+        n = len(all_msgs)
+        start = n // 4
+        end = (3 * n) // 4
+        # advance past tool messages so we don't orphan an assistant's tool_calls
+        while start < n and all_msgs[start].get("role") == "tool":
+            start += 1
+        while end < n and all_msgs[end].get("role") == "tool":
+            end += 1
+        if start >= end:
             return "nothing safe to stash"
-        head = "\n".join(json.dumps(m) for m in all_msgs[:cut])
-        marker = stash(head)
-        new = [{"role": "system", "content": f"<earlier history stashed: {marker}>"}] + all_msgs[cut:]
+        middle = all_msgs[start:end]
+        marker = stash("\n".join(json.dumps(m) for m in middle))
+        new = all_msgs[:start] + [{"role": "system", "content": f"<middle history stashed: {marker}>"}] + all_msgs[end:]
         f.seek(0)
         f.truncate()
         for m in new:
             f.write(json.dumps(m) + "\n")
-    return f"stashed {cut} messages to {marker}"
+    return f"stashed middle {end-start} messages to {marker}"
 
 TOOLS = [
     ("APPEND_MESSAGE", append_message, "Append a message to the log.",
@@ -303,7 +308,8 @@ def start_chat():
                 if advanced:
                     poll_offset.write_text(str(offset))
             except Exception as e:
-                print(f"chat poll: {e}"); time.sleep(5)
+                append_msg({"role": "system", "content": f"[chat error] {e}"})
+                time.sleep(5)
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
 
@@ -313,17 +319,20 @@ def start_cron():
 
     def loop():
         while True:
-            ts = time.time()
-            for f in cron_dir.glob("*.json"):
-                try: job = json.loads(f.read_text())
-                except Exception: continue
-                if job.get("next", float("inf")) > ts: continue
-                append_msg({"role": "system", "content": f"[cron {f.stem}] {job.get('message', '')}"})
-                if job.get("repeat_s"):
-                    job["next"] = ts + job["repeat_s"]
-                    f.write_text(json.dumps(job))
-                else:
-                    f.unlink()
+            try:
+                ts = time.time()
+                for f in cron_dir.glob("*.json"):
+                    try: job = json.loads(f.read_text())
+                    except Exception: continue
+                    if job.get("next", float("inf")) > ts: continue
+                    append_msg({"role": "system", "content": f"[cron {f.stem}] {job.get('message', '')}"})
+                    if job.get("repeat_s"):
+                        job["next"] = ts + job["repeat_s"]
+                        f.write_text(json.dumps(job))
+                    else:
+                        f.unlink()
+            except Exception as e:
+                append_msg({"role": "system", "content": f"[cron error] {e}"})
             time.sleep(CRON_TICK)
 
     threading.Thread(target=loop, daemon=True, name="cron").start()
@@ -341,11 +350,14 @@ def start_inbox():
     def watch():
         seen = set(inbox.iterdir())
         while True:
-            current = set(inbox.iterdir())
-            for f in current - seen:
-                if f.is_file() and not f.name.startswith("."):
-                    deliver(f)
-            seen = current
+            try:
+                current = set(inbox.iterdir())
+                for f in current - seen:
+                    if f.is_file() and not f.name.startswith("."):
+                        deliver(f)
+                seen = current
+            except Exception as e:
+                append_msg({"role": "system", "content": f"[inbox error] {e}"})
             time.sleep(INBOX_TICK)
 
     threading.Thread(target=watch, daemon=True, name="inbox-poll").start()
