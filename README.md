@@ -130,14 +130,14 @@ echo $TELEGRAM_TOKEN > agents/myagent/telegram_token   # create the dir + drop t
 API_KEY=… python agent.py myagent
 ```
 
-Default: `kimi-k2.5` via `https://api.moonshot.ai/v1`. Override `MODEL` / `API_BASE` to point at any OpenAI-compatible endpoint, or set `PROVIDER=anthropic` to switch the request shape.
+Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `MODEL` / `API_BASE` to point at any OpenAI-compatible endpoint, or set `PROVIDER=anthropic` to switch the request shape.
 
 `python agent.py <self> [soul_path]` — second arg overrides the SOUL template (defaults to `./SOUL.md`). No `<self>` argument → derived from `sha256(soul_text)`; useful for ephemeral agents.
 
 Config (env vars, all optional):
 
 ```
-MODEL=kimi-k2.5              API_BASE=https://api.moonshot.ai/v1
+MODEL=kimi-k2.6              API_BASE=https://api.moonshot.ai/v1
 TEMPERATURE=1.0              CONTEXT_TOKENS=100000
 MEMORY_LIMIT=10000           LIFE_TAIL=50
 TOOL_TIMEOUT=30              TOOL_OUTPUT_LIMIT=5000
@@ -154,4 +154,4 @@ Reads `.env` from cwd on startup.
 
 1. **The agent is a loop.** One process, one file watch, one LLM call per change.
 2. **The bus is the filesystem.** Channels in, channels out, scheduled jobs, background work, memory — all files. No daemon, no queue, no IPC.
-3. **Opinionated cuts code.** Telegram is the chat. One operator, one chat. Default is Kimi K2.5 via Moonshot, but anything OpenAI-shape works out of the box and other shapes live in `opt/providers/`. No abstractions for things that aren't pluralized.
+3. **Opinionated cuts code.** Telegram is the chat. One operator, one chat. Default is Kimi K2.6 via Moonshot, but anything OpenAI-shape works out of the box and other shapes live in `opt/providers/`. No abstractions for things that aren't pluralized.

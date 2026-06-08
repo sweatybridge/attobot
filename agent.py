@@ -12,7 +12,7 @@ except FileNotFoundError:
 import base64, fcntl, hashlib, importlib.util, json, mimetypes, pathlib, pwd, requests, shutil, signal, subprocess, sys, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
-MODEL = os.environ.get("MODEL", "kimi-k2.5")
+MODEL = os.environ.get("MODEL", "kimi-k2.6")
 API_BASE = os.environ.get("API_BASE", "https://api.moonshot.ai/v1")
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
 BLOB_DIR = os.environ.get("BLOB_DIR", "blobs")
