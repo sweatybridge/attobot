@@ -80,6 +80,14 @@ def append_message(args):
     append_msg({"role": args["role"], "content": args["content"]})
     return "appended"
 
+_TG_MEDIA = {
+    "jpg": ("sendPhoto", "photo"), "jpeg": ("sendPhoto", "photo"),
+    "png": ("sendPhoto", "photo"), "gif": ("sendPhoto", "photo"), "webp": ("sendPhoto", "photo"),
+    "mp4": ("sendVideo", "video"), "mov": ("sendVideo", "video"), "webm": ("sendVideo", "video"),
+    "ogg": ("sendVoice", "voice"),
+    "mp3": ("sendAudio", "audio"), "m4a": ("sendAudio", "audio"), "wav": ("sendAudio", "audio"),
+}
+
 def send_chat(args):
     agent_dir = pathlib.Path(f"{AGENTS_DIR}/{SELF}")
     token = (agent_dir / "telegram_token").read_text().strip()
@@ -87,7 +95,16 @@ def send_chat(args):
     if not chat_file.exists():
         return "no chat_id yet"
     chat_id = chat_file.read_text().strip()
-    text = args["text"]
+    text = args.get("text", "")
+    path = args.get("path")
+    if path:
+        ext = pathlib.Path(path).suffix.lower().lstrip(".")
+        endpoint, field = _TG_MEDIA.get(ext, ("sendDocument", "document"))
+        with open(path, "rb") as f:
+            requests.post(f"https://api.telegram.org/bot{token}/{endpoint}",
+                          data={"chat_id": chat_id, "caption": text[:1024]},
+                          files={field: f}, timeout=60)
+        return f"sent {field} {path}"
     for i in range(0, len(text), CHAT_MSG_MAX):
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                       data={"chat_id": chat_id, "text": text[i:i+CHAT_MSG_MAX]}, timeout=45)
@@ -188,8 +205,8 @@ def stash_messages(args):
 TOOLS = [
     ("APPEND_MESSAGE", append_message, "Append a message to the log.",
         {"type": "object", "properties": {"role": {"type": "string"}, "content": {"type": "string"}}, "required": ["role", "content"]}),
-    ("SEND_CHAT", send_chat, "Send a text message to the chat.",
-        {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}),
+    ("SEND_CHAT", send_chat, "Send a message to the chat. With just `text`, sends a normal text message. With `path`, sends that file as an attachment (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise); `text` becomes the caption (capped at 1024 chars by telegram).",
+        {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["text"]}),
     ("READ_FILE", read_file, "Read a file.",
         {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
     ("WRITE_FILE", write_file, "Overwrite a file.",
@@ -303,8 +320,31 @@ def start_chat():
                         cached_chat_id = cid
                         chat_file.write_text(cid)
                     text = msg.get("text") or ""
-                    if not text: continue
-                    append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {text}"})
+                    caption = msg.get("caption") or ""
+                    file_id = None
+                    if msg.get("photo"):
+                        file_id = max(msg["photo"], key=lambda p: p.get("file_size", 0))["file_id"]
+                    elif msg.get("document"):
+                        file_id = msg["document"]["file_id"]
+                    elif msg.get("voice"):
+                        file_id = msg["voice"]["file_id"]
+                    elif msg.get("video"):
+                        file_id = msg["video"]["file_id"]
+                    elif msg.get("audio"):
+                        file_id = msg["audio"]["file_id"]
+                    if file_id:
+                        meta = requests.get(f"https://api.telegram.org/bot{token}/getFile",
+                                            params={"file_id": file_id}, timeout=30).json()
+                        rel = meta["result"]["file_path"]
+                        blob = requests.get(f"https://api.telegram.org/file/bot{token}/{rel}", timeout=60).content
+                        inbound = pathlib.Path(f"{AGENTS_DIR}/{SELF}/inbound")
+                        inbound.mkdir(parents=True, exist_ok=True)
+                        save = inbound / f"{u['update_id']}_{rel.rsplit('/', 1)[-1]}"
+                        save.write_bytes(blob)
+                        body = f"(file: {save})" + (f" {caption}" if caption else "")
+                        append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {body}"})
+                    elif text:
+                        append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {text}"})
                 if advanced:
                     poll_offset.write_text(str(offset))
             except Exception as e:
