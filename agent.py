@@ -9,7 +9,7 @@ try:
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 except FileNotFoundError:
     pass
-import base64, fcntl, hashlib, importlib.util, json, mimetypes, pathlib, pwd, re, requests, shutil, signal, subprocess, sys, threading, time
+import base64, fcntl, hashlib, importlib.util, json, mimetypes, pathlib, pwd, requests, shutil, signal, subprocess, sys, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
 MODEL = os.environ.get("MODEL", "kimi-k2.5")
@@ -188,14 +188,14 @@ def search(args):
         return f"search error: {e}"
 
 def web_fetch(args):
+    from markdownify import markdownify
+    url = args["url"]
+    if url.startswith("http://"):
+        url = "https://" + url[7:]
     try:
-        r = requests.get(args["url"], headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
         r.raise_for_status()
-        text = r.text
-        text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL|re.IGNORECASE)
-        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL|re.IGNORECASE)
-        text = re.sub(r'<[^>]+>', ' ', text)
-        return re.sub(r'\s+', ' ', text).strip()
+        return markdownify(r.text, heading_style="ATX", strip=["script", "style"]).strip()
     except Exception as e:
         return f"fetch error: {e}"
 
@@ -216,12 +216,36 @@ def stash_messages(args):
             return "nothing safe to stash"
         middle = all_msgs[start:end]
         marker = stash("\n".join(json.dumps(m) for m in middle))
-        new = all_msgs[:start] + [{"role": "system", "content": f"<middle history stashed: {marker}>"}] + all_msgs[end:]
+
+        parts = []
+        for m in middle:
+            role = m.get("role", "?")
+            c = m.get("content", "")
+            if not isinstance(c, str):
+                c = json.dumps(c)
+            if role == "assistant" and m.get("tool_calls"):
+                calls = ", ".join(tc["function"]["name"] for tc in m["tool_calls"])
+                parts.append(f"[assistant {calls}] {c}")
+            elif role == "tool":
+                parts.append(f"[tool {m.get('tool_call_id','?')}] {c}")
+            else:
+                parts.append(f"[{role}] {c}")
+        transcript = "\n".join(parts)[:50000]
+        try:
+            response = _chat_fn(
+                [{"role": "user", "content": f"Summarize this conversation segment in 2-4 sentences. Be terse, factual, focus on what happened (decisions, tool calls, key info exchanged). Skip heartbeats and noise.\n\n{transcript}"}],
+                None,
+            )
+            summary = (response.get("content") or "").strip()
+        except Exception as e:
+            summary = f"(summary failed: {e})"
+
+        new = all_msgs[:start] + [{"role": "system", "content": f"<{end-start} middle messages stashed: {marker}>\nsummary: {summary}"}] + all_msgs[end:]
         f.seek(0)
         f.truncate()
         for m in new:
             f.write(json.dumps(m) + "\n")
-    return f"stashed middle {end-start} messages to {marker}"
+    return f"stashed middle {end-start} messages to {marker} (summary: {_preview(summary)})"
 
 TOOLS = [
     ("APPEND_MESSAGE", append_message, "Append a message to the log.",
