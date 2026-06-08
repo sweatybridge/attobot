@@ -14,7 +14,8 @@ sys.modules.setdefault("agent", sys.modules[__name__])
 
 MODEL = os.environ.get("MODEL", "kimi-k2.6")
 API_BASE = os.environ.get("API_BASE", "https://api.moonshot.ai/v1")
-TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.6"))
+REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "medium")
 BLOB_DIR = os.environ.get("BLOB_DIR", "blobs")
 AGENTS_DIR = os.environ.get("AGENTS_DIR", "agents")
 CONTEXT_TOKENS = int(os.environ.get("CONTEXT_TOKENS", "100000"))
@@ -74,6 +75,8 @@ def append_msg(m):
 
 def _default_chat(messages, tools):
     body = {"model": MODEL, "messages": messages, "temperature": TEMPERATURE}
+    if REASONING_EFFORT:
+        body["reasoning_effort"] = REASONING_EFFORT
     if tools:
         body["tools"] = tools
     r = requests.post(f"{API_BASE}/chat/completions",
