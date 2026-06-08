@@ -438,6 +438,20 @@ def build_system():
             f"<memory>\n{memory}\n</memory>\n\n"
             f"<life>\n[{max(0, len(tail)-LIFE_TAIL)} earlier]\n{''.join(tail[-LIFE_TAIL:])}</life>")
 
+def _adjust_heartbeat(active):
+    """active=True → reset to 60s; active=False → double, cap at 3600s (60 min)."""
+    path = pathlib.Path(f"{AGENTS_DIR}/{SELF}/cron/heartbeat.json")
+    try:
+        job = json.loads(path.read_text())
+    except Exception:
+        return
+    current = job.get("repeat_s", 60)
+    new = 60 if active else min(current * 2, 3600)
+    if new != current:
+        job["repeat_s"] = new
+        job["next"] = time.time() + new
+        path.write_text(json.dumps(job))
+
 def serialize_assistant(msg):
     out = {"role": "assistant", "content": msg.get("content") or ""}
     if msg.get("reasoning_content"):
@@ -505,6 +519,7 @@ def main():
             append_msg(assistant)
             last_hash = file_hash()
             send_chat({"text": (msg.get("content") or "").strip()})
+            _adjust_heartbeat(active=False)
             tool_called = False
             continue
 
@@ -526,6 +541,7 @@ def main():
             for tm in tool_results:
                 append_msg(tm)
         last_hash = file_hash()
+        _adjust_heartbeat(active=True)
         tool_called = True
 
 if __name__ == "__main__":
