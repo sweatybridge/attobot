@@ -45,10 +45,13 @@ def life(event):
 def load_messages():
     return [json.loads(l) for l in open(f"{AGENTS_DIR}/{SELF}/messages.jsonl") if l.strip()]
 
+_append_lock = threading.RLock()
+
 def append_msg(m):
-    with open(f"{AGENTS_DIR}/{SELF}/messages.jsonl", "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        f.write(json.dumps(m) + "\n")
+    with _append_lock:
+        with open(f"{AGENTS_DIR}/{SELF}/messages.jsonl", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.write(json.dumps(m) + "\n")
 
 def _default_chat(messages, tools):
     body = {"model": MODEL, "messages": messages, "temperature": TEMPERATURE}
@@ -480,16 +483,18 @@ def main():
 
         msg = llm([{"role": "system", "content": system}] + messages, tools=TOOL_SCHEMAS)
         assistant = serialize_assistant(msg)
-        append_msg(assistant)
-        last_hash = file_hash()
-        life("resp")
 
         if not assistant.get("tool_calls"):
+            append_msg(assistant)
+            last_hash = file_hash()
+            life("resp")
             send_chat({"text": (msg.get("content") or "").strip()})
             tool_called = False
             continue
 
-        tool_called = True
+        # Run all tools first; collect results without writing anything yet so
+        # daemon appends during bg_run can't interleave between assistant and tool results.
+        tool_results = []
         for tc in assistant["tool_calls"]:
             name = tc["function"]["name"]
             try:
@@ -497,10 +502,18 @@ def main():
                 result = bg_run(name, tc_args, tc["id"], TOOL_FNS[name])
             except Exception as e:
                 result = f"error: {e}"
-            tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result}
-            append_msg(tool_msg)
-            last_hash = file_hash()
-            life(name)
+            tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+        # Atomic flush: lock blocks daemons + bg emit threads from interleaving.
+        with _append_lock:
+            append_msg(assistant)
+            for tm in tool_results:
+                append_msg(tm)
+        last_hash = file_hash()
+        life("resp")
+        for tc in assistant["tool_calls"]:
+            life(tc["function"]["name"])
+        tool_called = True
 
 if __name__ == "__main__":
     main()
