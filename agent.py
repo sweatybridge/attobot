@@ -42,16 +42,34 @@ def life(event):
     with open(f"{AGENTS_DIR}/{SELF}/LIFE.md", "a") as f:
         f.write(f"[{time.strftime('%Y%m%dT%H%M%S')}] {event}\n")
 
+def _preview(s, n=100):
+    if not isinstance(s, str):
+        s = repr(s)
+    if len(s) <= n:
+        return s
+    h = n // 2
+    return f"{s[:h]}…{s[-h:]}"
+
 def load_messages():
     return [json.loads(l) for l in open(f"{AGENTS_DIR}/{SELF}/messages.jsonl") if l.strip()]
 
 _append_lock = threading.RLock()
+
+def _msg_summary(m):
+    role = m.get("role", "?")
+    if role == "assistant" and m.get("tool_calls"):
+        calls = ", ".join(tc["function"]["name"] for tc in m["tool_calls"])
+        return f"assistant [{calls}] {_preview(m.get('content') or '')}".rstrip()
+    if role == "tool":
+        return f"tool {m.get('tool_call_id', '?')}: {_preview(m.get('content', ''))}"
+    return f"{role}: {_preview(m.get('content', ''))}"
 
 def append_msg(m):
     with _append_lock:
         with open(f"{AGENTS_DIR}/{SELF}/messages.jsonl", "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             f.write(json.dumps(m) + "\n")
+    life(_msg_summary(m))
 
 def _default_chat(messages, tools):
     body = {"model": MODEL, "messages": messages, "temperature": TEMPERATURE}
@@ -73,7 +91,7 @@ def llm(messages, tools=None):
         try:
             return _chat_fn(messages, tools)
         except Exception as e:
-            life(f"llm retry in {delay}s: {e}")
+            append_msg({"role": "system", "content": f"[llm retry in {delay}s] {e}"})
             time.sleep(delay)
             delay = min(delay * 2, 900)
 
@@ -448,7 +466,6 @@ def main():
         _load_provider()
     pathlib.Path(f"{self_dir}/MEMORY.md").touch(exist_ok=True)
     pathlib.Path(f"{self_dir}/messages.jsonl").touch(exist_ok=True)
-    life("start")
     heartbeat = pathlib.Path(f"{self_dir}/cron/heartbeat.json")
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     if not heartbeat.exists():
@@ -456,8 +473,7 @@ def main():
     start_chat()
     start_cron()
     start_inbox()
-    append_msg({"role": "system", "content": f"[boot] MULTIMODAL_SUPPORT={MULTIMODAL_SUPPORT} PROVIDER={PROVIDER or 'openai_compat'}"})
-    life(f"awake self={SELF}")
+    append_msg({"role": "system", "content": f"[start] self={SELF} MULTIMODAL_SUPPORT={MULTIMODAL_SUPPORT} PROVIDER={PROVIDER or 'openai_compat'}"})
 
     def file_hash():
         return hashlib.sha256(open(f"{self_dir}/messages.jsonl", "rb").read()).hexdigest()
@@ -476,7 +492,8 @@ def main():
         system = build_system()
         total_chars = len(system) + sum(len(json.dumps(m)) for m in messages)
         if total_chars > CONTEXT_TOKENS * 4 * 0.8:
-            life(f"stash_messages: {stash_messages({})}")
+            result = stash_messages({})
+            append_msg({"role": "system", "content": f"[stash_messages] {result}"})
             messages = load_messages()
             last_hash = file_hash()
             system = build_system()
@@ -487,7 +504,6 @@ def main():
         if not assistant.get("tool_calls"):
             append_msg(assistant)
             last_hash = file_hash()
-            life("resp")
             send_chat({"text": (msg.get("content") or "").strip()})
             tool_called = False
             continue
@@ -510,9 +526,6 @@ def main():
             for tm in tool_results:
                 append_msg(tm)
         last_hash = file_hash()
-        life("resp")
-        for tc in assistant["tool_calls"]:
-            life(tc["function"]["name"])
         tool_called = True
 
 if __name__ == "__main__":
