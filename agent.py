@@ -478,14 +478,15 @@ def _react(mid, emoji):
     except Exception: pass
 
 def _adjust_heartbeat(active):
-    """active=True → reset to 60s; active=False → double, cap at 3600s (60 min)."""
+    """active=True → reset to 225s (3.75 min); active=False → double, cap at 3600s (60 min).
+    Idle backoff sequence: 3.75 → 7.5 → 15 → 30 → 60 min."""
     path = pathlib.Path(f"{AGENTS_DIR}/{SELF}/cron/heartbeat.json")
     try:
         job = json.loads(path.read_text())
     except Exception:
         return
-    current = job.get("repeat_s", 60)
-    new = 60 if active else min(current * 2, 3600)
+    current = job.get("repeat_s", 225)
+    new = 225 if active else min(current * 2, 3600)
     if new != current:
         job["repeat_s"] = new
         job["next"] = time.time() + new
@@ -533,7 +534,7 @@ def main():
     heartbeat = pathlib.Path(f"{self_dir}/cron/heartbeat.json")
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     if not heartbeat.exists():
-        heartbeat.write_text(json.dumps({"next": time.time() + 60, "repeat_s": 60, "message": "tick"}))
+        heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "message": "tick"}))
     start_chat()
     start_cron()
     start_inbox()
