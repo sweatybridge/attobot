@@ -126,9 +126,41 @@ Each entry copies `opt/<path>.py` → `agents/<self>/<path>.py` at first boot. F
 
 ```
 pip install -r requirements.txt
-echo $TELEGRAM_TOKEN > agents/myagent/telegram_token   # create the dir + drop the token
+python setup.py myagent                            # prompts for token, auto-discovers chat_id
 API_KEY=… python agent.py myagent
 ```
+
+`setup.py` accepts CLI args for non-interactive use (e.g. an HR-style agent spawning new agents):
+
+```
+python setup.py newhire --token 123:abc --chat -1001234567 [--thread 42] [--systemd]
+```
+
+Required telegram config (`agents/<self>/config.json`) is created by `setup.py`. It validates `GET /getMe` and refuses to proceed if the bot's privacy mode is on or `can_join_groups` is off.
+
+## Deploy
+
+On macOS or for quick testing, just run `python agent.py myagent` (use `tmux` to keep it alive across logout).
+
+On Linux, run `setup.py --systemd` to emit a systemd template unit + install instructions:
+
+```bash
+python setup.py myagent --systemd
+# wrote agents/myagent/config.json
+# wrote attobot@.service
+#
+# Install once (user service, no sudo):
+#   mkdir -p ~/.config/systemd/user
+#   cp attobot@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   loginctl enable-linger $USER          # so it survives logout
+#
+# Then for each agent:
+#   systemctl --user enable --now attobot@myagent
+#   journalctl --user -u attobot@myagent -f
+```
+
+Same template handles N agents — `attobot@newhire`, etc. Per the project's "new unix user per agent" convention, run `setup.py --systemd` as the dedicated user so user-mode systemd lives in their `$HOME`.
 
 Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `MODEL` / `API_BASE` to point at any OpenAI-compatible endpoint, or set `PROVIDER=anthropic` to switch the request shape.
 

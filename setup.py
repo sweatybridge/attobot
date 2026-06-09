@@ -63,6 +63,7 @@ p.add_argument("self_name")
 p.add_argument("--token")
 p.add_argument("--chat")
 p.add_argument("--thread", help='Telegram thread_id (forum topic).')
+p.add_argument("--systemd", action="store_true", help="also emit attobot@.service template + install instructions")
 args = p.parse_args()
 
 self_dir = pathlib.Path(f"agents/{args.self_name}")
@@ -97,3 +98,34 @@ for key in ("telegram_token", "telegram_chat_id"):
 
 config_path.write_text(json.dumps(cfg, indent=2))
 print(f"wrote {config_path}")
+
+if args.systemd:
+    workdir = str(pathlib.Path.cwd().absolute())
+    unit = pathlib.Path("attobot@.service")
+    unit.write_text(f"""[Unit]
+Description=attobot %i
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={workdir}
+ExecStart={sys.executable} agent.py %i
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths={workdir}
+
+[Install]
+WantedBy=default.target
+""")
+    print(f"wrote {unit}")
+    print(f"\nInstall once (user service, no sudo):")
+    print(f"  mkdir -p ~/.config/systemd/user")
+    print(f"  cp {unit} ~/.config/systemd/user/")
+    print(f"  systemctl --user daemon-reload")
+    print(f"  loginctl enable-linger $USER          # so it survives logout")
+    print(f"\nThen for each agent:")
+    print(f"  systemctl --user enable --now attobot@{args.self_name}")
+    print(f"  journalctl --user -u attobot@{args.self_name} -f")
+
