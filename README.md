@@ -107,36 +107,35 @@ The 4-chars-per-token heuristic over-counts base64 image content — safe direct
 
 ## Optional add-ons
 
-Anything under `opt/` is opt-in via the `OPT` env var (comma-separated paths relative to `opt/`, no `.py` suffix):
+Anything under `opt/` is opt-in via the `opt` field in `config.json` (a list of paths relative to `opt/`, no `.py` suffix):
 
-```
-OPT=tools/ocr_image,tools/stash_messages,providers/anthropic
+```json
+"opt": ["tools/ocr_image", "providers/anthropic"]
 ```
 
 Each entry copies `opt/<path>.py` → `agents/<self>/<path>.py` at first boot. From then on, the agent owns its copy.
 
 **Tools** in `agents/<self>/tools/` auto-register at startup. Built-in:
-- `ocr_image` — RapidOCR + spatial ASCII layout, for text-only LLMs. Auto-included when `MULTIMODAL_SUPPORT=false`. Requires `rapidocr-onnxruntime` + `opencv-python`.
-- `stash_messages` — surgical version with explicit `path` / `start` / `end` parameters; complements the harness's internal auto-stash.
+- `ocr_image` — RapidOCR + spatial ASCII layout, for text-only LLMs. Auto-included when `multimodal_support=false`. Requires `rapidocr-onnxruntime` + `opencv-python`.
 
-**Providers** swap `_chat_fn`. Set `PROVIDER=anthropic` (auto-includes `providers/anthropic`) to use it. Built-in:
-- `anthropic` — native `/v1/messages` translation. Set `ANTHROPIC_API_KEY` and `MODEL=claude-...`.
+**Providers** swap `_chat_fn`. Set `provider: "anthropic"` (auto-includes `providers/anthropic`) to use it. Built-in:
+- `anthropic` — native `/v1/messages` translation. Reads `api_key` and `model` from `config.json` like the default provider.
 
 ## Run
 
 ```
 pip install -r requirements.txt
-python setup.py myagent                            # prompts for token, auto-discovers chat_id
-API_KEY=… python agent.py myagent
+python setup.py myagent                            # prompts for token, auto-discovers chat_id, prompts for api_key
+python agent.py myagent
 ```
 
 `setup.py` accepts CLI args for non-interactive use (e.g. an HR-style agent spawning new agents):
 
 ```
-python setup.py newhire --token 123:abc --chat -1001234567 [--thread 42] [--systemd]
+python setup.py newhire --token 123:abc --chat -1001234567 --api-key sk-... [--thread 42] [--systemd]
 ```
 
-Required telegram config (`agents/<self>/config.json`) is created by `setup.py`. It validates `GET /getMe` and refuses to proceed if the bot's privacy mode is on or `can_join_groups` is off.
+Required config (`agents/<self>/config.json`) is created by `setup.py`. It validates `GET /getMe` and refuses to proceed if the bot's privacy mode is on or `can_join_groups` is off.
 
 ## Deploy
 
@@ -162,26 +161,30 @@ python setup.py myagent --systemd
 
 Same template handles N agents — `attobot@newhire`, etc. Per the project's "new unix user per agent" convention, run `setup.py --systemd` as the dedicated user so user-mode systemd lives in their `$HOME`.
 
-Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `MODEL` / `API_BASE` to point at any OpenAI-compatible endpoint, or set `PROVIDER=anthropic` to switch the request shape.
+Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `model` / `api_base` in `config.json` to point at any OpenAI-compatible endpoint, or set `provider: "anthropic"` to switch the request shape.
 
 `python agent.py <self> [soul_path]` — second arg overrides the SOUL template (defaults to `./SOUL.md`). No `<self>` argument → derived from `sha256(soul_text)`; useful for ephemeral agents.
 
-Config (env vars, all optional):
+`agents/<self>/config.json` fields (only `telegram_token`, `telegram_chat_id`, `api_key` are required — the rest fall back to sensible defaults baked into `agent.py`):
 
-```
-MODEL=kimi-k2.6              API_BASE=https://api.moonshot.ai/v1
-TEMPERATURE=1.0              REASONING_EFFORT=medium
-CONTEXT_TOKENS=100000
-MEMORY_LIMIT=10000           LIFE_TAIL=50
-TOOL_TIMEOUT=30              TOOL_OUTPUT_LIMIT=5000
-CRON_TICK=30                 INBOX_TICK=2
-INBOX_PREVIEW=1000           CHAT_MSG_MAX=4000
-BLOB_DIR=blobs               AGENTS_DIR=agents
-MULTIMODAL_SUPPORT=true      PROVIDER=
-OPT=
+```jsonc
+{
+  "telegram_token": "...",         // required
+  "telegram_chat_id": "...",       // required
+  "telegram_thread_id": "...",     // optional, forum supergroup topic
+  "api_key": "...",                // required, LLM provider key
+  "model": "kimi-k2.6",
+  "api_base": "https://api.moonshot.ai/v1",
+  "temperature": 1.0,
+  "reasoning_effort": "medium",
+  "context_tokens": 100000,
+  "multimodal_support": true,
+  "provider": "",                  // "" = openai-compat default; "anthropic" loads opt/providers/anthropic
+  "opt": []                        // additional opt/ entries to copy in
+}
 ```
 
-Reads `.env` from cwd on startup.
+Constants tuned in-source (rarely worth changing): `LIFE_TAIL`, `MEMORY_LIMIT`, `TOOL_TIMEOUT`, `CRON_TICK`, `INBOX_TICK`, `INBOX_PREVIEW`, `CHAT_MSG_MAX`, `TOOL_OUTPUT_LIMIT`, `AGENTS_DIR`, `BLOB_DIR`.
 
 ## Principles
 

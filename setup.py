@@ -63,6 +63,7 @@ p.add_argument("self_name")
 p.add_argument("--token")
 p.add_argument("--chat")
 p.add_argument("--thread", help='Telegram thread_id (forum topic).')
+p.add_argument("--api-key", dest="api_key", help='LLM provider API key (Moonshot, OpenAI, etc.)')
 p.add_argument("--systemd", action="store_true", help="also emit attobot@.service template + install instructions")
 args = p.parse_args()
 
@@ -79,6 +80,8 @@ if args.chat is not None:
     cfg["telegram_chat_id"] = args.chat
 if args.thread:
     cfg["telegram_thread_id"] = args.thread
+if args.api_key is not None:
+    cfg["api_key"] = args.api_key
 
 interactive = sys.stdin.isatty()
 
@@ -91,8 +94,10 @@ if interactive and not cfg.get("telegram_chat_id") and cfg.get("telegram_token")
     cfg["telegram_chat_id"] = cid
     if tid is not None and "telegram_thread_id" not in cfg:
         cfg["telegram_thread_id"] = tid
+if interactive and not cfg.get("api_key"):
+    cfg["api_key"] = input("LLM provider API key (Moonshot by default): ").strip()
 
-for key in ("telegram_token", "telegram_chat_id"):
+for key in ("telegram_token", "telegram_chat_id", "api_key"):
     if not cfg.get(key):
         sys.exit(f"missing required field: {key}")
 

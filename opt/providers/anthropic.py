@@ -1,15 +1,16 @@
 """Anthropic provider — translates OpenAI-shape messages/tools to Anthropic's /v1/messages API and back.
 
-Env vars:
-  ANTHROPIC_API_KEY   required
-  MODEL               passed through (e.g. claude-opus-4-5)
-  ANTHROPIC_VERSION   defaults to "2023-06-01"
-  MAX_TOKENS          defaults to 4096
+Reads from agent.CFG:
+  api_key             required (used as x-api-key)
+  model               required (e.g. claude-opus-4-5)
+  anthropic_version   defaults to "2023-06-01"
+  max_tokens          defaults to 4096
 """
 import json
-import os
 
 import requests
+
+import agent
 
 API_URL = "https://api.anthropic.com/v1/messages"
 
@@ -21,8 +22,8 @@ def chat(messages, tools):
     """
     system, anthropic_messages = _split_system_and_convert(messages)
     body = {
-        "model": os.environ["MODEL"],
-        "max_tokens": int(os.environ.get("MAX_TOKENS", "4096")),
+        "model": agent.CFG["model"],
+        "max_tokens": int(agent.CFG.get("max_tokens", 4096)),
         "messages": anthropic_messages,
     }
     if system:
@@ -33,8 +34,8 @@ def chat(messages, tools):
     r = requests.post(
         API_URL,
         headers={
-            "x-api-key": os.environ["ANTHROPIC_API_KEY"],
-            "anthropic-version": os.environ.get("ANTHROPIC_VERSION", "2023-06-01"),
+            "x-api-key": agent.CFG["api_key"],
+            "anthropic-version": agent.CFG.get("anthropic_version", "2023-06-01"),
             "content-type": "application/json",
         },
         json=body,

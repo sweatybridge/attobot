@@ -1,51 +1,34 @@
 #!/usr/bin/env python3
 """Minimal agent."""
 import os, sys
-def _loadenv(path, override):
-    try:
-        for line in open(path):
-            line = line.strip()
-            if line and not line.startswith("#"):
-                k, _, v = line.partition("=")
-                k, v = k.strip(), v.strip().strip('"').strip("'")
-                if override or k not in os.environ:
-                    os.environ[k] = v
-    except FileNotFoundError:
-        pass
-_loadenv(".env", override=False)
-_self_arg = sys.argv[1] if len(sys.argv) > 1 else None
-if _self_arg:
-    _loadenv(f"{os.environ.get('AGENTS_DIR', 'agents')}/{_self_arg}/.env", override=True)
 import base64, fcntl, hashlib, importlib.util, json, mimetypes, pathlib, pwd, requests, shutil, signal, subprocess, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
-MODEL = os.environ.get("MODEL", "kimi-k2.6")
-API_BASE = os.environ.get("API_BASE", "https://api.moonshot.ai/v1")
-TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
-REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "medium")
-BLOB_DIR = os.environ.get("BLOB_DIR", "blobs")
-AGENTS_DIR = os.environ.get("AGENTS_DIR", "agents")
-CONTEXT_TOKENS = int(os.environ.get("CONTEXT_TOKENS", "100000"))
-LIFE_TAIL = int(os.environ.get("LIFE_TAIL", "50"))
-MEMORY_LIMIT = int(os.environ.get("MEMORY_LIMIT", "10000"))
-TOOL_TIMEOUT = int(os.environ.get("TOOL_TIMEOUT", "30"))
-CRON_TICK = int(os.environ.get("CRON_TICK", "30"))
-INBOX_TICK = int(os.environ.get("INBOX_TICK", "2"))
-INBOX_PREVIEW = int(os.environ.get("INBOX_PREVIEW", "1000"))
-CHAT_MSG_MAX = int(os.environ.get("CHAT_MSG_MAX", "4000"))
-TOOL_OUTPUT_LIMIT = int(os.environ.get("TOOL_OUTPUT_LIMIT", "5000"))
-MULTIMODAL_SUPPORT = os.environ.get("MULTIMODAL_SUPPORT", "true").lower() in ("1", "true", "yes", "on")
-PROVIDER = os.environ.get("PROVIDER", "").strip()
-OPT = [t.strip() for t in os.environ.get("OPT", "").split(",") if t.strip()]
-if not MULTIMODAL_SUPPORT and "tools/ocr_image" not in OPT:
-    OPT.append("tools/ocr_image")
-if PROVIDER and f"providers/{PROVIDER}" not in OPT:
-    OPT.append(f"providers/{PROVIDER}")
+AGENTS_DIR = "agents"
+BLOB_DIR = "blobs"
+
+CFG = {
+    "model": "kimi-k2.6",
+    "api_base": "https://api.moonshot.ai/v1",
+    "temperature": 1.0,
+    "reasoning_effort": "medium",
+    "context_tokens": 100000,
+    "multimodal_support": True,
+    "provider": "",
+    "opt": [],
+    "life_tail": 50,
+    "memory_limit": 10000,
+    "tool_timeout": 30,
+    "cron_tick": 30,
+    "inbox_tick": 2,
+    "inbox_preview": 1000,
+    "chat_msg_max": 4000,
+    "tool_output_limit": 5000,
+}
 
 for d in (BLOB_DIR, AGENTS_DIR): os.makedirs(d, exist_ok=True)
 
 SELF = None
-CFG = {}
 
 def life(event):
     with open(f"{AGENTS_DIR}/{SELF}/LIFE.md", "a") as f:
@@ -67,8 +50,12 @@ _append_lock = threading.RLock()
 def _msg_summary(m):
     role = m.get("role", "?")
     if role == "assistant" and m.get("tool_calls"):
-        calls = ", ".join(tc["function"]["name"] for tc in m["tool_calls"])
-        return f"assistant [{calls}] {_preview(m.get('content') or '')}".rstrip()
+        calls = ", ".join(
+            f"{tc['function']['name']}({tc['function'].get('arguments', '')})"
+            for tc in m["tool_calls"]
+        )
+        content = m.get("content") or ""
+        return _preview(f"assistant {calls}" + (f" {content}" if content else ""))
     if role == "tool":
         return f"tool {m.get('tool_call_id', '?')}: {_preview(m.get('content', ''))}"
     return f"{role}: {_preview(m.get('content', ''))}"
@@ -81,15 +68,16 @@ def append_msg(m):
     life(_msg_summary(m))
 
 def _default_chat(messages, tools):
-    body = {"model": MODEL, "messages": messages}
-    if TEMPERATURE != 1.0:
-        body["temperature"] = TEMPERATURE
-    if REASONING_EFFORT:
-        body["reasoning_effort"] = REASONING_EFFORT
+    body = {
+        "model": CFG["model"],
+        "messages": messages,
+        "temperature": CFG["temperature"],
+        "reasoning_effort": CFG["reasoning_effort"],
+    }
     if tools:
         body["tools"] = tools
-    r = requests.post(f"{API_BASE}/chat/completions",
-        headers={"Authorization": f"Bearer {os.environ['API_KEY']}"},
+    r = requests.post(f"{CFG['api_base']}/chat/completions",
+        headers={"Authorization": f"Bearer {CFG['api_key']}"},
         json=body, timeout=120)
     data = r.json()
     if "choices" not in data:
@@ -132,10 +120,14 @@ def send_chat(args):
             requests.post(f"https://api.telegram.org/bot{token}/{endpoint}",
                           data={**base, "caption": text[:1024]},
                           files={field: f}, timeout=60)
+        while _pending_reactions:
+            _react(_pending_reactions.pop(), "")
         return f"sent {field} {path}"
-    for i in range(0, len(text), CHAT_MSG_MAX):
+    for i in range(0, len(text), CFG["chat_msg_max"]):
         requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={**base, "text": text[i:i+CHAT_MSG_MAX]}, timeout=45)
+                      data={**base, "text": text[i:i+CFG['chat_msg_max']]}, timeout=45)
+    while _pending_reactions:
+        _react(_pending_reactions.pop(), "")
     return "sent"
 
 def stash(content):
@@ -144,16 +136,16 @@ def stash(content):
     return f"[stash {h}]"
 
 def clip(s):
-    if not isinstance(s, str) or len(s) <= TOOL_OUTPUT_LIMIT:
+    if not isinstance(s, str) or len(s) <= CFG["tool_output_limit"]:
         return s
-    h = TOOL_OUTPUT_LIMIT // 2
+    h = CFG["tool_output_limit"] // 2
     return f"{s[:h]}\n... {len(s) - 2*h} chars truncated, {stash(s)} ...\n{s[-h:]}"
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 def read_file(args):
     path = args["path"]
-    if pathlib.Path(path).suffix.lower() in IMAGE_EXTS and MULTIMODAL_SUPPORT:
+    if pathlib.Path(path).suffix.lower() in IMAGE_EXTS and CFG["multimodal_support"]:
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
         b64 = base64.b64encode(open(path, "rb").read()).decode()
         return [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]
@@ -287,8 +279,8 @@ def load_agent_tools():
 
 def _load_provider():
     global _chat_fn
-    path = pathlib.Path(f"{AGENTS_DIR}/{SELF}/providers/{PROVIDER}.py")
-    spec = importlib.util.spec_from_file_location(f"provider_{PROVIDER}", path)
+    path = pathlib.Path(f"{AGENTS_DIR}/{SELF}/providers/{CFG['provider']}.py")
+    spec = importlib.util.spec_from_file_location(f"provider_{CFG['provider']}", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     _chat_fn = mod.chat
@@ -317,7 +309,7 @@ def bg_run(name, args, tool_call_id, tool_fn):
 
     t = threading.Thread(target=work, daemon=True)
     t.start()
-    t.join(TOOL_TIMEOUT)
+    t.join(CFG["tool_timeout"])
     if holder["done"]:
         return holder["result"]
 
@@ -432,7 +424,7 @@ def start_cron():
                         f.unlink()
             except Exception as e:
                 append_msg({"role": "system", "content": f"[cron error] {e}"})
-            time.sleep(CRON_TICK)
+            time.sleep(CFG["cron_tick"])
 
     threading.Thread(target=loop, daemon=True, name="cron").start()
 
@@ -442,7 +434,7 @@ def start_inbox():
 
     def deliver(drop):
         sender = pwd.getpwuid(drop.stat().st_uid).pw_name
-        text = drop.read_bytes()[:INBOX_PREVIEW * 4].decode("utf-8", errors="replace")[:INBOX_PREVIEW]
+        text = drop.read_bytes()[:CFG["inbox_preview"] * 4].decode("utf-8", errors="replace")[:CFG["inbox_preview"]]
         append_msg({"role": "system", "content": f"[mail from {sender}] {drop.name}\n{text}"})
         send_chat({"text": f"mail from {sender}\n{text}"})
 
@@ -457,7 +449,7 @@ def start_inbox():
                 seen = current
             except Exception as e:
                 append_msg({"role": "system", "content": f"[inbox error] {e}"})
-            time.sleep(INBOX_TICK)
+            time.sleep(CFG["inbox_tick"])
 
     threading.Thread(target=watch, daemon=True, name="inbox-poll").start()
 
@@ -467,14 +459,14 @@ def build_system():
     soul = open(f"{AGENTS_DIR}/{SELF}/SOUL.md").read().replace("<self>", SELF)
     harness = open(__file__).read()
     memory = open(f"{AGENTS_DIR}/{SELF}/MEMORY.md").read()
-    if len(memory) > MEMORY_LIMIT:
-        h = MEMORY_LIMIT // 2
+    if len(memory) > CFG["memory_limit"]:
+        h = CFG["memory_limit"] // 2
         memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md truncated. Shrink it.]"
     tail = open(f"{AGENTS_DIR}/{SELF}/LIFE.md").readlines()
     return (f"<soul>\n{soul}\n</soul>\n\n"
             f"<harness>\n{harness}\n</harness>\n\n"
             f"<memory>\n{memory}\n</memory>\n\n"
-            f"<life>\n[{max(0, len(tail)-LIFE_TAIL)} earlier]\n{''.join(tail[-LIFE_TAIL:])}</life>")
+            f"<life>\n[{max(0, len(tail)-CFG['life_tail'])} earlier]\n{''.join(tail[-CFG['life_tail']:])}</life>")
 
 _pending_reactions = []
 
@@ -508,7 +500,7 @@ def serialize_assistant(msg):
     return out
 
 def main():
-    global SELF, CFG
+    global SELF
     soul_template = sys.argv[2] if len(sys.argv) > 2 else "SOUL.md"
     soul_text = open(soul_template).read()
     SELF = sys.argv[1] if len(sys.argv) > 1 else hashlib.sha256(soul_text.encode()).hexdigest()[:12]
@@ -516,21 +508,25 @@ def main():
     config_path = pathlib.Path(f"{self_dir}/config.json")
     if not config_path.exists():
         sys.exit(f"missing {config_path}. Run: python setup.py {SELF}")
-    CFG = json.loads(config_path.read_text())
-    for key in ("telegram_token", "telegram_chat_id"):
+    CFG.update(json.loads(config_path.read_text()))
+    for key in ("telegram_token", "telegram_chat_id", "api_key"):
         if not CFG.get(key):
             sys.exit(f"{config_path} missing required field: {key}")
+    if not CFG["multimodal_support"] and "tools/ocr_image" not in CFG["opt"]:
+        CFG["opt"].append("tools/ocr_image")
+    if CFG["provider"] and f"providers/{CFG['provider']}" not in CFG["opt"]:
+        CFG["opt"].append(f"providers/{CFG['provider']}")
     os.makedirs(self_dir, exist_ok=True)
     if not pathlib.Path(f"{self_dir}/SOUL.md").exists():
         shutil.copy(soul_template, f"{self_dir}/SOUL.md")
-    for entry in OPT:
+    for entry in CFG["opt"]:
         src = pathlib.Path(f"opt/{entry}.py")
         dst = pathlib.Path(f"{self_dir}/{entry}.py")
         if src.exists() and not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(src, dst)
     load_agent_tools()
-    if PROVIDER:
+    if CFG["provider"]:
         _load_provider()
     pathlib.Path(f"{self_dir}/MEMORY.md").touch(exist_ok=True)
     pathlib.Path(f"{self_dir}/messages.jsonl").touch(exist_ok=True)
@@ -541,7 +537,7 @@ def main():
     start_chat()
     start_cron()
     start_inbox()
-    append_msg({"role": "system", "content": f"[start] self={SELF} MULTIMODAL_SUPPORT={MULTIMODAL_SUPPORT} PROVIDER={PROVIDER or 'openai_compat'}"})
+    append_msg({"role": "system", "content": f"[start] self={SELF} multimodal_support={CFG['multimodal_support']} provider={CFG['provider'] or 'openai_compat'}"})
 
     def file_hash():
         return hashlib.sha256(open(f"{self_dir}/messages.jsonl", "rb").read()).hexdigest()
@@ -559,7 +555,7 @@ def main():
 
         system = build_system()
         total_chars = len(system) + sum(len(json.dumps(m)) for m in messages)
-        if total_chars > CONTEXT_TOKENS * 4 * 0.8:
+        if total_chars > CFG["context_tokens"] * 4 * 0.8:
             result = stash_messages({})
             append_msg({"role": "system", "content": f"[stash_messages] {result}"})
             messages = load_messages()
@@ -573,8 +569,6 @@ def main():
             append_msg(assistant)
             last_hash = file_hash()
             send_chat({"text": (msg.get("content") or "").strip()})
-            while _pending_reactions:
-                _react(_pending_reactions.pop(), "")
             _adjust_heartbeat(active=False)
             tool_called = False
             continue
