@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 """Minimal agent."""
-import os
-try:
-    for line in open(".env"):
-        line = line.strip()
-        if line and not line.startswith("#"):
-            k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-except FileNotFoundError:
-    pass
-import base64, fcntl, hashlib, importlib.util, json, mimetypes, pathlib, pwd, requests, shutil, signal, subprocess, sys, threading, time
+import os, sys
+def _loadenv(path, override):
+    try:
+        for line in open(path):
+            line = line.strip()
+            if line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if override or k not in os.environ:
+                    os.environ[k] = v
+    except FileNotFoundError:
+        pass
+_loadenv(".env", override=False)
+_self_arg = sys.argv[1] if len(sys.argv) > 1 else None
+if _self_arg:
+    _loadenv(f"{os.environ.get('AGENTS_DIR', 'agents')}/{_self_arg}/.env", override=True)
+import base64, fcntl, hashlib, importlib.util, json, mimetypes, pathlib, pwd, requests, shutil, signal, subprocess, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
 MODEL = os.environ.get("MODEL", "kimi-k2.6")
