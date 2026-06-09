@@ -224,7 +224,7 @@ def stash_messages(args):
     target = "\n".join(lines[s:e])
     try:
         response = _chat_fn(
-            [{"role": "user", "content": "Summarize this conversation segment in 2-4 sentences. Be terse, factual.\n\n" + target[:50000]}],
+            [{"role": "user", "content": "Summarize this conversation segment in 2-4 sentences. Be terse, factual.\n\n" + target}],
             None,
         )
         summary = (response.get("content") or "").strip()
