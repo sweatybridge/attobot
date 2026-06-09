@@ -237,7 +237,7 @@ def stash_messages(args):
         fcntl.flock(f, fcntl.LOCK_EX)
         content = f.read()
         if target not in content:
-            return "error: target range no longer in file (modified meanwhile)"
+            return "error: target range no longer in file (file was modified)"
         new_content = content.replace(target, placeholder, 1)
         f.seek(0)
         f.truncate()
