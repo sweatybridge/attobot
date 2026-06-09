@@ -7,7 +7,7 @@ sys.modules.setdefault("agent", sys.modules[__name__])
 AGENTS_DIR = "agents"
 BLOB_DIR = "blobs"
 
-CFG = {
+CFG = { # defaults
     "model": "kimi-k2.6",
     "api_base": "https://api.moonshot.ai/v1",
     "temperature": 1.0,
@@ -461,7 +461,7 @@ def build_system():
     memory = open(f"{AGENTS_DIR}/{SELF}/MEMORY.md").read()
     if len(memory) > CFG["memory_limit"]:
         h = CFG["memory_limit"] // 2
-        memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md truncated. Shrink it.]"
+        memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md is too large and partially omitted, rewrite it.]"
     tail = open(f"{AGENTS_DIR}/{SELF}/LIFE.md").readlines()
     return (f"<soul>\n{soul}\n</soul>\n\n"
             f"<harness>\n{harness}\n</harness>\n\n"
