@@ -170,7 +170,7 @@ Config (env vars, all optional):
 
 ```
 MODEL=kimi-k2.6              API_BASE=https://api.moonshot.ai/v1
-TEMPERATURE=0.6              REASONING_EFFORT=medium
+TEMPERATURE=1.0              REASONING_EFFORT=medium
 CONTEXT_TOKENS=100000
 MEMORY_LIMIT=10000           LIFE_TAIL=50
 TOOL_TIMEOUT=30              TOOL_OUTPUT_LIMIT=5000

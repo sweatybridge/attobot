@@ -14,7 +14,7 @@ sys.modules.setdefault("agent", sys.modules[__name__])
 
 MODEL = os.environ.get("MODEL", "kimi-k2.6")
 API_BASE = os.environ.get("API_BASE", "https://api.moonshot.ai/v1")
-TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.6"))
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
 REASONING_EFFORT = os.environ.get("REASONING_EFFORT", "medium")
 BLOB_DIR = os.environ.get("BLOB_DIR", "blobs")
 AGENTS_DIR = os.environ.get("AGENTS_DIR", "agents")
