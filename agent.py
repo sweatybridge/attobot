@@ -81,7 +81,9 @@ def append_msg(m):
     life(_msg_summary(m))
 
 def _default_chat(messages, tools):
-    body = {"model": MODEL, "messages": messages, "temperature": TEMPERATURE}
+    body = {"model": MODEL, "messages": messages}
+    if TEMPERATURE != 1.0:
+        body["temperature"] = TEMPERATURE
     if REASONING_EFFORT:
         body["reasoning_effort"] = REASONING_EFFORT
     if tools:
@@ -107,10 +109,6 @@ def llm(messages, tools=None):
             delay = min(delay * 2, 900)
 
 # ---------- tools ----------
-
-def append_message(args):
-    append_msg({"role": args["role"], "content": args["content"]})
-    return "appended"
 
 _TG_MEDIA = {
     "jpg": ("sendPhoto", "photo"), "jpeg": ("sendPhoto", "photo"),
@@ -209,56 +207,52 @@ def web_fetch(args):
         return f"fetch error: {e}"
 
 def stash_messages(args):
-    messages_path = f"{AGENTS_DIR}/{SELF}/messages.jsonl"
-    with open(messages_path, "r+") as f:
+    path = args.get("path") or f"{AGENTS_DIR}/{SELF}/messages.jsonl"
+
+    with open(path) as f:
+        fcntl.flock(f, fcntl.LOCK_SH)
+        lines = f.read().splitlines()
+    n = len(lines)
+
+    if "start" in args and "end" in args:
+        s, e = int(args["start"]) - 1, int(args["end"])
+        if s < 0 or e > n or s >= e:
+            return f"error: invalid range start={args['start']} end={args['end']} (file has {n} lines)"
+    else:
+        s, e = n // 4, (3 * n) // 4
+
+    while s < n and json.loads(lines[s]).get("role") not in ("user", "system"):
+        s += 1
+    while e < n and json.loads(lines[e]).get("role") not in ("user", "system"):
+        e += 1
+    if s >= e:
+        return "nothing safe to stash"
+    start, end = s + 1, e
+
+    target = "\n".join(lines[s:e])
+    try:
+        response = _chat_fn(
+            [{"role": "user", "content": "Summarize this conversation segment in 2-4 sentences. Be terse, factual.\n\n" + target[:50000]}],
+            None,
+        )
+        summary = (response.get("content") or "").strip()
+    except Exception as exc:
+        summary = f"(summary failed: {exc})"
+    marker = stash(target)
+    placeholder = json.dumps({"role": "system", "content": f"<lines {start}-{end} stashed: {marker}>\nsummary: {summary}"})
+
+    with open(path, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        all_msgs = [json.loads(l) for l in f.read().splitlines() if l.strip()]
-        n = len(all_msgs)
-        start = n // 4
-        end = (3 * n) // 4
-        # advance past tool messages so we don't orphan an assistant's tool_calls
-        while start < n and all_msgs[start].get("role") == "tool":
-            start += 1
-        while end < n and all_msgs[end].get("role") == "tool":
-            end += 1
-        if start >= end:
-            return "nothing safe to stash"
-        middle = all_msgs[start:end]
-        marker = stash("\n".join(json.dumps(m) for m in middle))
-
-        parts = []
-        for m in middle:
-            role = m.get("role", "?")
-            c = m.get("content", "")
-            if not isinstance(c, str):
-                c = json.dumps(c)
-            if role == "assistant" and m.get("tool_calls"):
-                calls = ", ".join(tc["function"]["name"] for tc in m["tool_calls"])
-                parts.append(f"[assistant {calls}] {c}")
-            elif role == "tool":
-                parts.append(f"[tool {m.get('tool_call_id','?')}] {c}")
-            else:
-                parts.append(f"[{role}] {c}")
-        transcript = "\n".join(parts)[:50000]
-        try:
-            response = _chat_fn(
-                [{"role": "user", "content": f"Summarize this conversation segment in 2-4 sentences. Be terse, factual, focus on what happened (decisions, tool calls, key info exchanged). Skip heartbeats and noise.\n\n{transcript}"}],
-                None,
-            )
-            summary = (response.get("content") or "").strip()
-        except Exception as e:
-            summary = f"(summary failed: {e})"
-
-        new = all_msgs[:start] + [{"role": "system", "content": f"<{end-start} middle messages stashed: {marker}>\nsummary: {summary}"}] + all_msgs[end:]
+        content = f.read()
+        if target not in content:
+            return "error: target range no longer in file (modified meanwhile)"
+        new_content = content.replace(target, placeholder, 1)
         f.seek(0)
         f.truncate()
-        for m in new:
-            f.write(json.dumps(m) + "\n")
-    return f"stashed middle {end-start} messages to {marker} (summary: {_preview(summary)})"
+        f.write(new_content)
+    return f"stashed lines {start}-{end} ({end-start+1} → 1). summary: {_preview(summary)}"
 
 TOOLS = [
-    ("APPEND_MESSAGE", append_message, "Append a message to the log.",
-        {"type": "object", "properties": {"role": {"type": "string"}, "content": {"type": "string"}}, "required": ["role", "content"]}),
     ("SEND_CHAT", send_chat, "Send a message to the chat. With just `text`, sends a normal text message. With `path`, sends that file as an attachment (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise); `text` becomes the caption (capped at 1024 chars by telegram).",
         {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["text"]}),
     ("READ_FILE", read_file, "Read a file.",
@@ -275,6 +269,8 @@ TOOLS = [
         {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}),
     ("STASH", lambda args: stash(args["content"]), "Save text to a blob, return [stash <hash>].",
         {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}),
+    ("STASH_MESSAGES", stash_messages, "Stash a contiguous range of lines from a messages.jsonl into a blob with an LLM summary. Lines are 1-indexed, end inclusive. Defaults to your own log. If start/end omitted, auto-picks the middle quarter. Whatever range you pass gets snapped forward to the nearest turn boundaries so you don't have to worry about splitting a turn. Line numbers shift after this (stashed range collapses to 1 line) — re-read before the next call, or stash in descending start-line order.",
+        {"type": "object", "properties": {"path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}}}),
 ]
 TOOL_FNS = {n: f for n, f, _, _ in TOOLS}
 TOOL_SCHEMAS = [{"type": "function", "function": {"name": n, "description": d, "parameters": p}} for n, _, d, p in TOOLS]
