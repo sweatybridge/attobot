@@ -27,7 +27,7 @@ def chat(messages, tools):
         "messages": anthropic_messages,
     }
     if system:
-        body["system"] = system
+        body["system"] = _system_blocks(system)
     if tools:
         body["tools"] = [_convert_tool(t) for t in tools]
 
@@ -45,6 +45,20 @@ def chat(messages, tools):
     if "content" not in data:
         raise agent.classify_llm_error(r.status_code, data)
     return _convert_response(data)
+
+
+def _system_blocks(system):
+    """Split the system prompt for prompt caching. Caching is a prefix match:
+    soul + harness are stable across turns, but <memory> and the <life> tail
+    change almost every turn, so the cache breakpoint must sit before them.
+    Caches tools + soul + harness (tools render before system)."""
+    i = system.find("\n\n<memory>")
+    if i == -1:
+        return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+    return [
+        {"type": "text", "text": system[:i], "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": system[i:]},
+    ]
 
 
 def _convert_blocks(content):
