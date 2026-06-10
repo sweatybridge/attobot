@@ -125,6 +125,8 @@ def _tg_check(r):
     return None
 
 def send_chat(args):
+    if not CFG.get("telegram_token"):
+        return "no chat configured"
     token = CFG["telegram_token"]
     base = {"chat_id": CFG["telegram_chat_id"]}
     if CFG.get("telegram_thread_id"):
@@ -424,10 +426,17 @@ def start_cron():
                 for f in cron_dir.glob("*.json"):
                     try: job = json.loads(f.read_text())
                     except Exception: continue
-                    if job.get("next", float("inf")) > ts: continue
+                    if job.get("next", 0 if "watch" in job else float("inf")) > ts: continue
+                    if w := job.get("watch"):  # fire on file change instead of clock; repeat_s = cooldown
+                        try: h = hashlib.sha256(open(w, "rb").read()).hexdigest()
+                        except OSError: continue
+                        if h == job.get("seen"): continue
+                        job["seen"] = h
                     append_msg({"role": "system", "content": f"[cron {f.stem}] {job.get('message', '')}"})
                     if job.get("repeat_s"):
                         job["next"] = ts + job["repeat_s"]
+                        f.write_text(json.dumps(job))
+                    elif job.get("watch"):
                         f.write_text(json.dumps(job))
                     else:
                         f.unlink()
@@ -524,9 +533,10 @@ def main():
     if not pathlib.Path(f"{AGENT_DIR}/SOUL.md").exists():
         sys.exit(f"missing {AGENT_DIR}/SOUL.md — copy a soul template in")
     CFG.update(json.loads(config_path.read_text()))
-    for key in ("telegram_token", "telegram_chat_id", "api_key"):
-        if not CFG.get(key):
-            sys.exit(f"{config_path} missing required field: {key}")
+    if not CFG.get("api_key"):
+        sys.exit(f"{config_path} missing required field: api_key")
+    if CFG.get("telegram_token") and not CFG.get("telegram_chat_id"):
+        sys.exit(f"{config_path} has telegram_token but no telegram_chat_id")
     if not CFG["multimodal_support"] and "tools/ocr_image" not in CFG["opt"]:
         CFG["opt"].append("tools/ocr_image")
     if CFG["provider"] and f"providers/{CFG['provider']}" not in CFG["opt"]:
@@ -546,7 +556,8 @@ def main():
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     if not heartbeat.exists():
         heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "message": "tick"}))
-    start_chat()
+    if CFG.get("telegram_token"):  # no token → no chat channel; agent wakes on cron/mail only
+        start_chat()
     start_cron()
     start_inbox()
     append_msg({"role": "system", "content": f"[start] multimodal_support={CFG['multimodal_support']} provider={CFG['provider'] or 'openai_compat'}"})
@@ -609,4 +620,6 @@ def main():
         tool_called = True
 
 if __name__ == "__main__":
+    for extra in sys.argv[2:]:  # extra agent dirs each get their own process
+        subprocess.Popen([sys.executable, __file__, extra])
     main()

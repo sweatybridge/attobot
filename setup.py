@@ -65,6 +65,7 @@ p.add_argument("--token")
 p.add_argument("--chat")
 p.add_argument("--thread", help='Telegram thread_id (forum topic).')
 p.add_argument("--api-key", dest="api_key", help='LLM provider API key (Moonshot, OpenAI, etc.)')
+p.add_argument("--subconscious", action="store_true", help="also install opt/subconscious as a sibling agent dir")
 p.add_argument("--systemd", action="store_true", help="also emit attobot.service + install instructions")
 args = p.parse_args()
 
@@ -110,6 +111,14 @@ if not soul.exists():
     shutil.copy(pathlib.Path(__file__).parent / "SOUL.md", soul)
     print(f"wrote {soul}")
 
+if args.subconscious:
+    sub = pathlib.Path("subconscious")
+    if sub.exists():
+        sys.exit(f"{sub} already exists. Delete it to reconfigure.")
+    shutil.copytree(pathlib.Path(__file__).parent / "opt" / "subconscious", sub)
+    (sub / "config.json").write_text(json.dumps({"api_key": cfg["api_key"]}, indent=2))
+    print(f"wrote {sub}/ (run both: python agent.py {args.dir} subconscious)")
+
 if args.systemd:
     workdir = str(pathlib.Path.cwd().absolute())
     unit = pathlib.Path("attobot.service")
@@ -120,7 +129,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory={workdir}
-ExecStart={sys.executable} agent.py
+ExecStart={sys.executable} agent.py{f' {args.dir} subconscious' if args.subconscious else ''}
 Restart=always
 RestartSec=10
 NoNewPrivileges=yes

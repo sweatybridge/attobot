@@ -27,7 +27,7 @@ Use them when you need to act on the world. Reply directly when you don't.
 - Filesystem: `READ_FILE`, `WRITE_FILE`, `EDIT_FILE`.
 - Shell: `BASH`. Anything heavier than ~30s is auto-backgrounded; you'll get a `[backgrounded bg/<id>]` placeholder and the result will arrive later as a system message.
 - Web: `SEARCH`, `WEB_FETCH`.
-- Scheduling: write a json file to `agent/cron/<name>.json` with `{"next": <unix-ts>, "repeat_s": <s?>, "message": "…"}`. The cron loop will fire it.
+- Scheduling: write a json file to `agent/cron/<name>.json` with `{"next": <unix-ts>, "repeat_s": <s?>, "message": "…"}`. The cron loop will fire it. With `"watch": "<path>"` instead of `next`, it fires when that file changes (`repeat_s` = cooldown between fires).
 - Mail out: drop a file in another agent's `agent/mail_inbox/`.
 - Memory of bulk content: `STASH` saves text to `agent/blobs/<hash>` and returns `[stash <hash>]`. Later, `READ_FILE agent/blobs/<hash>` recovers it. `STASH_MESSAGES` does this to your own history when it gets long.
 

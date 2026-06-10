@@ -24,8 +24,8 @@ That's `agent.py`. Channels, tools, and the backgrounding wrapper all live inlin
 
 Three daemon threads append to `messages.jsonl`:
 
-- **telegram** — `start_chat()` long-polls `getUpdates`. Inbound text → `{role:user, content:"[telegram <id>] …"}`. Only the `chat_id`/`thread_id` locked in `config.json` is accepted.
-- **cron** — `start_cron()` scans `agent/cron/*.json` every 30s. Job format: `{"next": <ts>, "repeat_s": <s?>, "message": "…"}`. Due jobs append `{role:system, content:"[cron <name>] …"}`. Repeating jobs reschedule; one-shots delete.
+- **telegram** — `start_chat()` long-polls `getUpdates`. Inbound text → `{role:user, content:"[telegram <id>] …"}`. Only the `chat_id`/`thread_id` locked in `config.json` is accepted. Optional: no `telegram_token` in config → no chat channel, `SEND_CHAT` returns "no chat configured"; the agent wakes on cron/mail only.
+- **cron** — `start_cron()` scans `agent/cron/*.json` every 30s. Job format: `{"next": <ts>, "repeat_s": <s?>, "message": "…"}`. Due jobs append `{role:system, content:"[cron <name>] …"}`. Repeating jobs reschedule; one-shots delete. A job with `"watch": "<path>"` fires on file change instead of the clock (`repeat_s` = cooldown between fires) — any file becomes a wake source.
 - **mail** — `start_inbox()` polls `agent/mail_inbox/`. New files append `{role:system, content:"[mail from <unix-user>] <name>\n<preview>"}` and notify the operator via chat.
 
 ## Channel out
@@ -68,6 +68,7 @@ agent.py                      # the harness, included verbatim in the system pro
 opt/
   tools/<name>.py             # optional capability tools (see Optional add-ons)
   providers/<name>.py         # alternative LLM providers
+  subconscious/               # reviewer agent skeleton (soul + seeded cron), copied out beside agent/
 agent/
   SOUL.md                     # this agent's soul (copy of the template)
   MEMORY.md                   # memory index: one pointer line per memory
@@ -121,6 +122,19 @@ Each entry copies `opt/<path>.py` → `agent/<path>.py` at first boot. From then
 **Providers** swap `_chat_fn`. Set `provider: "anthropic"` (auto-includes `providers/anthropic`) to use it. Built-in:
 - `anthropic` — native `/v1/messages` translation. Reads `api_key` and `model` from `config.json` like the default provider.
 
+## Subconscious
+
+A second attobot that reviews the first. Same harness, different soul (`opt/subconscious/` — an agent-dir skeleton: soul + a pre-seeded watch job), no chat. It runs in the same unix user as the primary — it needs direct read/write into `agent/` — unlike peer agents, which get a user each.
+
+```bash
+python setup.py --subconscious ...   # copies opt/subconscious/ out beside agent/, reuses the api_key
+python agent.py agent subconscious   # one command, one process per dir
+```
+
+For an existing install: `cp -r opt/subconscious . && echo '{"api_key": "sk-..."}' > subconscious/config.json`.
+
+It wakes when the primary's stream changes (a pre-seeded watch job on `agent/messages.jsonl`, 600s cooldown) or on its own heartbeat, reads `agent/messages.jsonl` / `agent/LIFE.md` since its last review marker, and acts through two hands only: lesson files added to `agent/memory/` (+ a pointer line in `agent/MEMORY.md`), and mail dropped in `agent/mail_inbox/` — which the mail channel already surfaces to the operator's chat. It never writes the primary's `messages.jsonl`.
+
 ## Run
 
 ```
@@ -161,14 +175,14 @@ python setup.py --systemd
 
 Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `model` / `api_base` in `config.json` to point at any OpenAI-compatible endpoint, or set `provider: "anthropic"` to switch the request shape.
 
-`python agent.py [agent_dir]` — the arg is the agent state folder (default `./agent`); same optional arg on `setup.py`. It must hold `config.json` and `SOUL.md` (`setup.py` creates both).
+`python agent.py [agent_dir ...]` — the arg is the agent state folder (default `./agent`); same optional arg on `setup.py`. It must hold `config.json` and `SOUL.md` (`setup.py` creates both). Extra dirs each get their own process (`python agent.py agent subconscious` runs the pair; ctrl-C kills both).
 
-`agent/config.json` fields (only `telegram_token`, `telegram_chat_id`, `api_key` are required — the rest fall back to sensible defaults baked into `agent.py`):
+`agent/config.json` fields (only `api_key` is required — omit `telegram_token` for a chat-less agent; the rest fall back to sensible defaults baked into `agent.py`):
 
 ```jsonc
 {
-  "telegram_token": "...",         // required
-  "telegram_chat_id": "...",       // required
+  "telegram_token": "...",         // optional — omit for no chat channel
+  "telegram_chat_id": "...",       // required if telegram_token is set
   "telegram_thread_id": "...",     // optional, forum supergroup topic
   "api_key": "...",                // required, LLM provider key
   "model": "kimi-k2.6",
