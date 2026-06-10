@@ -498,19 +498,16 @@ def _react(mid, emoji):
     except Exception: pass
 
 def _adjust_heartbeat(active):
-    """active=True → reset to 225s (3.75 min); active=False → double, cap at 3600s (60 min).
-    Idle backoff sequence: 3.75 → 7.5 → 15 → 30 → 60 min."""
+    """Heartbeat fires 225s after the last turn; each idle turn doubles it (cap 3600s)."""
     path = pathlib.Path(f"{AGENT_DIR}/cron/heartbeat.json")
     try:
         job = json.loads(path.read_text())
     except Exception:
         return
-    current = job.get("repeat_s", 225)
-    new = 225 if active else min(current * 2, 3600)
-    if new != current:
-        job["repeat_s"] = new
-        job["next"] = time.time() + new
-        path.write_text(json.dumps(job))
+    new = 225 if active else min(job.get("repeat_s", 225) * 2, 3600)
+    job["repeat_s"] = new
+    job["next"] = time.time() + new
+    path.write_text(json.dumps(job))
 
 def serialize_assistant(msg):
     out = {"role": "assistant", "content": msg.get("content") or ""}
@@ -583,7 +580,9 @@ def main():
         if not assistant.get("tool_calls"):
             append_msg(assistant)
             last_hash = file_hash()
-            send_chat({"text": (msg.get("content") or "").strip()})
+            text = (msg.get("content") or "").strip()
+            if not text.startswith("[IDLE]"):  # idle sentinel, see SOUL.md
+                send_chat({"text": text})
             _adjust_heartbeat(active=False)
             tool_called = False
             continue
