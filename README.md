@@ -70,7 +70,8 @@ opt/
   providers/<name>.py         # alternative LLM providers
 agent/
   SOUL.md                     # this agent's soul (copy of the template)
-  MEMORY.md                   # long-term memory, edited by the agent
+  MEMORY.md                   # memory index: one pointer line per memory
+  memory/<name>.md            # memory bodies, read on demand via the index
   LIFE.md                     # append-only event log; tail goes into system prompt
   messages.jsonl              # canonical conversation, one JSON message per line
   config.json                 # telegram token/chat, api key, overrides
@@ -99,7 +100,7 @@ The agent sees its own harness. Modify `agent.py` and the agent's self-model upd
 
 ## Memory pressure
 
-- `MEMORY.md > MEMORY_LIMIT` (10000) → middle is elided with a warning telling the agent to shrink it.
+- Memory is two-tier: `MEMORY.md` is an always-in-context index (one pointer line per memory), bodies live in `agent/memory/` and are read on demand. `MEMORY.md > MEMORY_LIMIT` (10000) → middle is elided with a warning telling the agent to move detail into `agent/memory/` files.
 - System prompt + serialized messages, divided by 4 chars/token, > `context_tokens * 0.8` → `stash_messages` runs automatically; the middle half of `messages.jsonl` goes to a blob, replaced by a single system message holding `[stash <hash>]` plus an LLM summary. The agent can `READ_FILE agent/blobs/<hash>` to recover.
 
 The 4-chars-per-token heuristic over-counts base64 image content — safe direction.

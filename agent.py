@@ -27,6 +27,7 @@ CFG = { # defaults
 }
 
 os.makedirs(BLOB_DIR, exist_ok=True)
+os.makedirs(f"{AGENT_DIR}/memory", exist_ok=True)
 
 def life(event):
     with open(f"{AGENT_DIR}/LIFE.md", "a") as f:
@@ -481,7 +482,7 @@ def build_system():
     memory = open(f"{AGENT_DIR}/MEMORY.md").read()
     if len(memory) > CFG["memory_limit"]:
         h = CFG["memory_limit"] // 2
-        memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md is too large and partially omitted, rewrite it.]"
+        memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md is too large and partially omitted. Move detail into agent/memory/<name>.md files and keep one-line pointers here.]"
     earlier, tail = _life_tail()
     return (f"<soul>\n{soul}\n</soul>\n\n"
             f"<harness>\n{harness}\n</harness>\n\n"
