@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Minimal agent."""
 import os, sys
-import base64, fcntl, hashlib, importlib.util, json, mimetypes, pathlib, pwd, requests, shutil, signal, subprocess, threading, time
+import base64, fcntl, hashlib, importlib.util, json, mimetypes, pathlib, pwd, requests, shutil, subprocess, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
-AGENTS_DIR = "agents"
-BLOB_DIR = "blobs"
+AGENT_DIR = sys.argv[1] if len(sys.argv) > 1 else "agent"
+BLOB_DIR = f"{AGENT_DIR}/blobs"
 
 CFG = { # defaults
     "model": "kimi-k2.6",
@@ -26,12 +26,10 @@ CFG = { # defaults
     "tool_output_limit": 5000,
 }
 
-for d in (BLOB_DIR, AGENTS_DIR): os.makedirs(d, exist_ok=True)
-
-SELF = None
+os.makedirs(BLOB_DIR, exist_ok=True)
 
 def life(event):
-    with open(f"{AGENTS_DIR}/{SELF}/LIFE.md", "a") as f:
+    with open(f"{AGENT_DIR}/LIFE.md", "a") as f:
         f.write(f"[{time.strftime('%Y%m%dT%H%M%S')}] {event}\n")
 
 def _preview(s, n=100):
@@ -43,7 +41,7 @@ def _preview(s, n=100):
     return f"{s[:h]}…{s[-h:]}"
 
 def load_messages():
-    return [json.loads(l) for l in open(f"{AGENTS_DIR}/{SELF}/messages.jsonl") if l.strip()]
+    return [json.loads(l) for l in open(f"{AGENT_DIR}/messages.jsonl") if l.strip()]
 
 _append_lock = threading.RLock()
 
@@ -62,7 +60,7 @@ def _msg_summary(m):
 
 def append_msg(m):
     with _append_lock:
-        with open(f"{AGENTS_DIR}/{SELF}/messages.jsonl", "a") as f:
+        with open(f"{AGENT_DIR}/messages.jsonl", "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             f.write(json.dumps(m) + "\n")
     life(_msg_summary(m))
@@ -72,8 +70,9 @@ def _default_chat(messages, tools):
         "model": CFG["model"],
         "messages": messages,
         "temperature": CFG["temperature"],
-        "reasoning_effort": CFG["reasoning_effort"],
     }
+    if CFG["reasoning_effort"]:
+        body["reasoning_effort"] = CFG["reasoning_effort"]
     if tools:
         body["tools"] = tools
     r = requests.post(f"{CFG['api_base']}/chat/completions",
@@ -81,16 +80,27 @@ def _default_chat(messages, tools):
         json=body, timeout=120)
     data = r.json()
     if "choices" not in data:
-        raise RuntimeError(f"{r.status_code}: {data}")
+        raise classify_llm_error(r.status_code, data)
     return data["choices"][0]["message"]
 
 _chat_fn = _default_chat
+
+class LLMFatal(Exception):
+    pass
+
+def classify_llm_error(status, data):
+    """4xx except 429 is not retryable."""
+    if 400 <= status < 500 and status != 429:
+        return LLMFatal(f"{status}: {data}")
+    return RuntimeError(f"{status}: {data}")
 
 def llm(messages, tools=None):
     delay = 1
     while True:
         try:
             return _chat_fn(messages, tools)
+        except LLMFatal:
+            raise
         except Exception as e:
             append_msg({"role": "system", "content": f"[llm retry in {delay}s] {e}"})
             time.sleep(delay)
@@ -106,6 +116,13 @@ _TG_MEDIA = {
     "mp3": ("sendAudio", "audio"), "m4a": ("sendAudio", "audio"), "wav": ("sendAudio", "audio"),
 }
 
+def _tg_check(r):
+    data = r.json()
+    if not data.get("ok"):
+        life(f"[send_chat error] {data}")
+        return f"telegram error: {data.get('description', data)}"
+    return None
+
 def send_chat(args):
     token = CFG["telegram_token"]
     base = {"chat_id": CFG["telegram_chat_id"]}
@@ -117,18 +134,21 @@ def send_chat(args):
         ext = pathlib.Path(path).suffix.lower().lstrip(".")
         endpoint, field = _TG_MEDIA.get(ext, ("sendDocument", "document"))
         with open(path, "rb") as f:
-            requests.post(f"https://api.telegram.org/bot{token}/{endpoint}",
-                          data={**base, "caption": text[:1024]},
-                          files={field: f}, timeout=60)
+            r = requests.post(f"https://api.telegram.org/bot{token}/{endpoint}",
+                              data={**base, "caption": text[:1024]},
+                              files={field: f}, timeout=60)
         while _pending_reactions:
             _react(_pending_reactions.pop(), "")
-        return f"sent {field} {path}"
+        return _tg_check(r) or f"sent {field} {path}"
+    errors = []
     for i in range(0, len(text), CFG["chat_msg_max"]):
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      data={**base, "text": text[i:i+CFG['chat_msg_max']]}, timeout=45)
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          data={**base, "text": text[i:i+CFG['chat_msg_max']]}, timeout=45)
+        if err := _tg_check(r):
+            errors.append(err)
     while _pending_reactions:
         _react(_pending_reactions.pop(), "")
-    return "sent"
+    return errors[0] if errors else "sent"
 
 def stash(content):
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
@@ -153,15 +173,11 @@ def read_file(args):
 
 def write_file(args):
     path = args["path"]
-    if path == "SOUL.md":
-        return f"error: {path} is immutable"
     open(path, "w").write(args["content"])
     return f"wrote {path} ({len(args['content'])} chars)"
 
 def edit_file(args):
     path, old, new = args["path"], args["old"], args["new"]
-    if path == "SOUL.md":
-        return f"error: {path} is immutable"
     text = open(path).read()
     count = text.count(old)
     if args.get("replace_all"):
@@ -199,7 +215,7 @@ def web_fetch(args):
         return f"fetch error: {e}"
 
 def stash_messages(args):
-    path = args.get("path") or f"{AGENTS_DIR}/{SELF}/messages.jsonl"
+    path = args.get("path") or f"{AGENT_DIR}/messages.jsonl"
 
     with open(path) as f:
         fcntl.flock(f, fcntl.LOCK_SH)
@@ -268,7 +284,7 @@ TOOL_FNS = {n: f for n, f, _, _ in TOOLS}
 TOOL_SCHEMAS = [{"type": "function", "function": {"name": n, "description": d, "parameters": p}} for n, _, d, p in TOOLS]
 
 def load_agent_tools():
-    tools_dir = pathlib.Path(f"{AGENTS_DIR}/{SELF}/tools")
+    tools_dir = pathlib.Path(f"{AGENT_DIR}/tools")
     for path in sorted(tools_dir.glob("*.py")):
         spec = importlib.util.spec_from_file_location(path.stem, path)
         mod = importlib.util.module_from_spec(spec)
@@ -279,7 +295,7 @@ def load_agent_tools():
 
 def _load_provider():
     global _chat_fn
-    path = pathlib.Path(f"{AGENTS_DIR}/{SELF}/providers/{CFG['provider']}.py")
+    path = pathlib.Path(f"{AGENT_DIR}/providers/{CFG['provider']}.py")
     spec = importlib.util.spec_from_file_location(f"provider_{CFG['provider']}", path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -289,7 +305,7 @@ def _load_provider():
 
 def bg_run(name, args, tool_call_id, tool_fn):
     bg_id = hashlib.sha256(f"{tool_call_id}{time.time()}".encode()).hexdigest()[:8]
-    bg_dir = pathlib.Path(f"{AGENTS_DIR}/{SELF}/bg")
+    bg_dir = pathlib.Path(f"{AGENT_DIR}/bg")
     bg_dir.mkdir(parents=True, exist_ok=True)
     holder = {"result": None, "done": False, "pid": None}
 
@@ -320,21 +336,14 @@ def bg_run(name, args, tool_call_id, tool_fn):
     }))
 
     def emit():
-        while not holder["done"]:
-            if not json_path.exists():
-                if holder.get("pid"):
-                    try: os.kill(holder["pid"], signal.SIGTERM)
-                    except Exception: pass
-                append_msg({"role": "system", "content": f"[bg {bg_id} killed, tc:{tool_call_id}]"})
-                return
-            time.sleep(1)
+        t.join()
         append_msg({"role": "system", "content": f"[bg {bg_id} done, tc:{tool_call_id}] {holder['result']}"})
         try: json_path.unlink()
         except Exception: pass
 
     threading.Thread(target=emit, daemon=True).start()
     pid_info = f" (pid {holder['pid']})" if holder.get("pid") else ""
-    return f"[backgrounded bg/{bg_id}{pid_info} — rm agents/{SELF}/bg/{bg_id}.json to kill]"
+    return f"[backgrounded bg/{bg_id}{pid_info} — see {AGENT_DIR}/bg/{bg_id}.json; kill the pid to stop it]"
 
 # ---------- channels ----------
 
@@ -342,7 +351,7 @@ def start_chat():
     token = CFG["telegram_token"]
     locked_cid = CFG["telegram_chat_id"]
     locked_tid = CFG.get("telegram_thread_id")
-    poll_offset = pathlib.Path(f"{AGENTS_DIR}/{SELF}/tg_poll.offset")
+    poll_offset = pathlib.Path(f"{AGENT_DIR}/tg_poll.offset")
 
     def poll_in():
         try: offset = int(poll_offset.read_text())
@@ -383,7 +392,7 @@ def start_chat():
                                             params={"file_id": file_id}, timeout=30).json()
                         rel = meta["result"]["file_path"]
                         blob = requests.get(f"https://api.telegram.org/file/bot{token}/{rel}", timeout=60).content
-                        inbound = pathlib.Path(f"{AGENTS_DIR}/{SELF}/inbound")
+                        inbound = pathlib.Path(f"{AGENT_DIR}/inbound")
                         inbound.mkdir(parents=True, exist_ok=True)
                         save = inbound / f"{u['update_id']}_{rel.rsplit('/', 1)[-1]}"
                         save.write_bytes(blob)
@@ -405,7 +414,7 @@ def start_chat():
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
 
 def start_cron():
-    cron_dir = pathlib.Path(f"{AGENTS_DIR}/{SELF}/cron")
+    cron_dir = pathlib.Path(f"{AGENT_DIR}/cron")
     cron_dir.mkdir(parents=True, exist_ok=True)
 
     def loop():
@@ -429,7 +438,7 @@ def start_cron():
     threading.Thread(target=loop, daemon=True, name="cron").start()
 
 def start_inbox():
-    inbox = pathlib.Path(f"{AGENTS_DIR}/{SELF}/mail_inbox")
+    inbox = pathlib.Path(f"{AGENT_DIR}/mail_inbox")
     inbox.mkdir(parents=True, exist_ok=True)
 
     def deliver(drop):
@@ -455,18 +464,29 @@ def start_inbox():
 
 # ---------- main loop ----------
 
+def _life_tail(chunk=65536):
+    with open(f"{AGENT_DIR}/LIFE.md", "rb") as f:
+        size = f.seek(0, 2)
+        f.seek(max(0, size - chunk))
+        data = f.read().decode("utf-8", errors="replace")
+    lines = data.splitlines(keepends=True)
+    if size > chunk and lines:
+        lines = lines[1:]  # drop partial first line
+    tail = "".join(lines[-CFG["life_tail"]:])
+    return size - len(tail.encode()), tail
+
 def build_system():
-    soul = open(f"{AGENTS_DIR}/{SELF}/SOUL.md").read().replace("<self>", SELF)
+    soul = open(f"{AGENT_DIR}/SOUL.md").read()
     harness = open(__file__).read()
-    memory = open(f"{AGENTS_DIR}/{SELF}/MEMORY.md").read()
+    memory = open(f"{AGENT_DIR}/MEMORY.md").read()
     if len(memory) > CFG["memory_limit"]:
         h = CFG["memory_limit"] // 2
         memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md is too large and partially omitted, rewrite it.]"
-    tail = open(f"{AGENTS_DIR}/{SELF}/LIFE.md").readlines()
+    earlier, tail = _life_tail()
     return (f"<soul>\n{soul}\n</soul>\n\n"
             f"<harness>\n{harness}\n</harness>\n\n"
             f"<memory>\n{memory}\n</memory>\n\n"
-            f"<life>\n[{max(0, len(tail)-CFG['life_tail'])} earlier]\n{''.join(tail[-CFG['life_tail']:])}</life>")
+            f"<life>\n[{earlier} bytes earlier]\n{tail}</life>")
 
 _pending_reactions = []
 
@@ -480,7 +500,7 @@ def _react(mid, emoji):
 def _adjust_heartbeat(active):
     """active=True → reset to 225s (3.75 min); active=False → double, cap at 3600s (60 min).
     Idle backoff sequence: 3.75 → 7.5 → 15 → 30 → 60 min."""
-    path = pathlib.Path(f"{AGENTS_DIR}/{SELF}/cron/heartbeat.json")
+    path = pathlib.Path(f"{AGENT_DIR}/cron/heartbeat.json")
     try:
         job = json.loads(path.read_text())
     except Exception:
@@ -501,14 +521,11 @@ def serialize_assistant(msg):
     return out
 
 def main():
-    global SELF
-    soul_template = sys.argv[2] if len(sys.argv) > 2 else "SOUL.md"
-    soul_text = open(soul_template).read()
-    SELF = sys.argv[1] if len(sys.argv) > 1 else hashlib.sha256(soul_text.encode()).hexdigest()[:12]
-    self_dir = f"{AGENTS_DIR}/{SELF}"
-    config_path = pathlib.Path(f"{self_dir}/config.json")
+    config_path = pathlib.Path(f"{AGENT_DIR}/config.json")
     if not config_path.exists():
-        sys.exit(f"missing {config_path}. Run: python setup.py {SELF}")
+        sys.exit(f"missing {config_path}. Run: python setup.py")
+    if not pathlib.Path(f"{AGENT_DIR}/SOUL.md").exists():
+        sys.exit(f"missing {AGENT_DIR}/SOUL.md — copy a soul template in")
     CFG.update(json.loads(config_path.read_text()))
     for key in ("telegram_token", "telegram_chat_id", "api_key"):
         if not CFG.get(key):
@@ -517,31 +534,28 @@ def main():
         CFG["opt"].append("tools/ocr_image")
     if CFG["provider"] and f"providers/{CFG['provider']}" not in CFG["opt"]:
         CFG["opt"].append(f"providers/{CFG['provider']}")
-    os.makedirs(self_dir, exist_ok=True)
-    if not pathlib.Path(f"{self_dir}/SOUL.md").exists():
-        shutil.copy(soul_template, f"{self_dir}/SOUL.md")
     for entry in CFG["opt"]:
         src = pathlib.Path(f"opt/{entry}.py")
-        dst = pathlib.Path(f"{self_dir}/{entry}.py")
+        dst = pathlib.Path(f"{AGENT_DIR}/{entry}.py")
         if src.exists() and not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(src, dst)
     load_agent_tools()
     if CFG["provider"]:
         _load_provider()
-    pathlib.Path(f"{self_dir}/MEMORY.md").touch(exist_ok=True)
-    pathlib.Path(f"{self_dir}/messages.jsonl").touch(exist_ok=True)
-    heartbeat = pathlib.Path(f"{self_dir}/cron/heartbeat.json")
+    pathlib.Path(f"{AGENT_DIR}/MEMORY.md").touch(exist_ok=True)
+    pathlib.Path(f"{AGENT_DIR}/messages.jsonl").touch(exist_ok=True)
+    heartbeat = pathlib.Path(f"{AGENT_DIR}/cron/heartbeat.json")
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     if not heartbeat.exists():
         heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "message": "tick"}))
     start_chat()
     start_cron()
     start_inbox()
-    append_msg({"role": "system", "content": f"[start] self={SELF} multimodal_support={CFG['multimodal_support']} provider={CFG['provider'] or 'openai_compat'}"})
+    append_msg({"role": "system", "content": f"[start] multimodal_support={CFG['multimodal_support']} provider={CFG['provider'] or 'openai_compat'}"})
 
     def file_hash():
-        return hashlib.sha256(open(f"{self_dir}/messages.jsonl", "rb").read()).hexdigest()
+        return hashlib.sha256(open(f"{AGENT_DIR}/messages.jsonl", "rb").read()).hexdigest()
 
     last_hash = file_hash()
     messages = load_messages()

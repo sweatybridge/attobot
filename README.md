@@ -2,7 +2,7 @@
 
 A persistent agent in a single `agent.py`.
 
-One agent = one `agents/<self>/` directory + one process running `agent.py <self>`.
+One agent = one working directory (in production, one unix user's `$HOME`) + one process running `agent.py`. All agent state lives in `./agent/`.
 The process is a loop that re-runs the LLM every time `messages.jsonl` changes.
 
 ## The loop
@@ -24,9 +24,9 @@ That's `agent.py`. Channels, tools, and the backgrounding wrapper all live inlin
 
 Three daemon threads append to `messages.jsonl`:
 
-- **telegram** — `start_chat()` long-polls `getUpdates`. Inbound text → `{role:user, content:"[telegram <id>] …"}`. Discovers `chat_id` on first message, persists to `agents/<self>/telegram_chat`.
-- **cron** — `start_cron()` scans `agents/<self>/cron/*.json` every 30s. Job format: `{"next": <ts>, "repeat_s": <s?>, "message": "…"}`. Due jobs append `{role:system, content:"[cron <name>] …"}`. Repeating jobs reschedule; one-shots delete.
-- **mail** — `start_inbox()` polls `agents/<self>/mail_inbox/`. New files append `{role:system, content:"[mail from <unix-user>] <name>\n<preview>"}` and notify the operator via chat.
+- **telegram** — `start_chat()` long-polls `getUpdates`. Inbound text → `{role:user, content:"[telegram <id>] …"}`. Only the `chat_id`/`thread_id` locked in `config.json` is accepted.
+- **cron** — `start_cron()` scans `agent/cron/*.json` every 30s. Job format: `{"next": <ts>, "repeat_s": <s?>, "message": "…"}`. Due jobs append `{role:system, content:"[cron <name>] …"}`. Repeating jobs reschedule; one-shots delete.
+- **mail** — `start_inbox()` polls `agent/mail_inbox/`. New files append `{role:system, content:"[mail from <unix-user>] <name>\n<preview>"}` and notify the operator via chat.
 
 ## Channel out
 
@@ -41,48 +41,47 @@ Declared in the `TOOLS` list in `agent.py`: `(NAME, fn, description, parameters)
 | `APPEND_MESSAGE` | inject a message into `messages.jsonl` (also used by channels) |
 | `SEND_CHAT` | post to telegram |
 | `READ_FILE` | file → line-numbered text; images → multimodal content blocks (when `MULTIMODAL_SUPPORT=true`) |
-| `WRITE_FILE` / `EDIT_FILE` | filesystem writes (SOUL.md is immutable); `EDIT_FILE` has optional `replace_all` |
+| `WRITE_FILE` / `EDIT_FILE` | filesystem writes; `EDIT_FILE` has optional `replace_all` |
 | `BASH` | run a shell command (returns Popen → `bg_run` can background it) |
 | `SEARCH` / `WEB_FETCH` | DuckDuckGo + plain HTML scrape |
-| `STASH` | content-addressed save to `blobs/<hash>`, returns `[stash <hash>]` |
+| `STASH` | content-addressed save to `agent/blobs/<hash>`, returns `[stash <hash>]` |
 
 A tool returning a `subprocess.Popen` (or anything with `.pid` + `.communicate`) gets handled by `bg_run`.
 
-Tool results longer than `TOOL_OUTPUT_LIMIT` (5000 chars) are auto-clipped to `<head>\n... N chars truncated, [stash <hash>] ...\n<tail>`. The agent recovers the full content with `READ_FILE blobs/<hash>`.
+Tool results longer than `tool_output_limit` (5000 chars) are auto-clipped to `<head>\n... N chars truncated, [stash <hash>] ...\n<tail>`. The agent recovers the full content with `READ_FILE agent/blobs/<hash>`.
 
 ## Backgrounding
 
-`bg_run` runs the tool in a thread with `TOOL_TIMEOUT` (30s). Finishes in time → inline (post-clip) result. Otherwise:
+`bg_run` runs the tool in a thread with `tool_timeout` (30s). Finishes in time → inline (post-clip) result. Otherwise:
 
-- registers `agents/<self>/bg/<id>.json` (with pid if known)
-- returns `[backgrounded bg/<id> — rm … to kill]` to the assistant immediately
-- spawns an emitter thread that appends `[bg <id> done, tc:…] <result>` when the work finishes
+- registers `agent/bg/<id>.json` (with pid if known)
+- returns `[backgrounded bg/<id> (pid …)]` to the assistant immediately
+- spawns an emitter thread that appends `[bg <id> done, tc:…] <result>` when the work finishes (and removes the json)
 
-Kill a backgrounded call by deleting its json file. The emitter SIGTERMs the pid (if any) and appends a `[bg <id> killed]` message.
+Kill a backgrounded subprocess by killing its pid (recorded in the json and the placeholder); the emitter then reports `[bg <id> done] (exit -15)`.
 
 ## State
 
 ```
-SOUL.md                       # the prompt template (copied to each agent at first boot)
+SOUL.md                       # the prompt template (copied into agent/ by setup.py)
 agent.py                      # the harness, included verbatim in the system prompt
 opt/
   tools/<name>.py             # optional capability tools (see Optional add-ons)
   providers/<name>.py         # alternative LLM providers
-agents/<self>/
+agent/
   SOUL.md                     # this agent's soul (copy of the template)
   MEMORY.md                   # long-term memory, edited by the agent
   LIFE.md                     # append-only event log; tail goes into system prompt
   messages.jsonl              # canonical conversation, one JSON message per line
-  telegram_token              # required at boot
-  telegram_chat               # learned on first inbound message
+  config.json                 # telegram token/chat, api key, overrides
   tg_poll.offset              # telegram update_id cursor
   cron/<name>.json            # scheduled jobs
-  cron/heartbeat.json         # auto-created at boot, 60s tick
+  cron/heartbeat.json         # auto-created at boot, 225s tick (backs off when idle)
   mail_inbox/                 # drop files here
   bg/<id>.json                # in-flight background work
   tools/<name>.py             # opt-in tools (copied from opt/tools/ at first boot)
   providers/<name>.py         # opt-in provider (copied from opt/providers/ at first boot)
-blobs/<hash>                  # content-addressed store, shared across agents
+  blobs/<hash>                # content-addressed store
 ```
 
 ## System prompt
@@ -90,10 +89,10 @@ blobs/<hash>                  # content-addressed store, shared across agents
 Built fresh every turn:
 
 ```
-<soul>      agents/<self>/SOUL.md (with <self> substituted)
+<soul>      agent/SOUL.md
 <harness>   agent.py source
 <memory>    MEMORY.md (middle-elided if > MEMORY_LIMIT)
-<life>      last LIFE_TAIL lines of LIFE.md, prefixed with [N earlier lines]
+<life>      last life_tail lines of LIFE.md, prefixed with [N bytes earlier]
 ```
 
 The agent sees its own harness. Modify `agent.py` and the agent's self-model updates next turn.
@@ -101,7 +100,7 @@ The agent sees its own harness. Modify `agent.py` and the agent's self-model upd
 ## Memory pressure
 
 - `MEMORY.md > MEMORY_LIMIT` (10000) → middle is elided with a warning telling the agent to shrink it.
-- System prompt + serialized messages, divided by 4 chars/token, > `CONTEXT_TOKENS * 0.8` → `stash_messages` runs automatically; the first half of `messages.jsonl` goes to a blob, replaced by a single system message holding `[stash <hash>]`. The agent can `READ_FILE blobs/<hash>` to recover.
+- System prompt + serialized messages, divided by 4 chars/token, > `context_tokens * 0.8` → `stash_messages` runs automatically; the middle half of `messages.jsonl` goes to a blob, replaced by a single system message holding `[stash <hash>]` plus an LLM summary. The agent can `READ_FILE agent/blobs/<hash>` to recover.
 
 The 4-chars-per-token heuristic over-counts base64 image content — safe direction.
 
@@ -113,9 +112,9 @@ Anything under `opt/` is opt-in via the `opt` field in `config.json` (a list of 
 "opt": ["tools/ocr_image", "providers/anthropic"]
 ```
 
-Each entry copies `opt/<path>.py` → `agents/<self>/<path>.py` at first boot. From then on, the agent owns its copy.
+Each entry copies `opt/<path>.py` → `agent/<path>.py` at first boot. From then on, the agent owns its copy.
 
-**Tools** in `agents/<self>/tools/` auto-register at startup. Built-in:
+**Tools** in `agent/tools/` auto-register at startup. Built-in:
 - `ocr_image` — RapidOCR + spatial ASCII layout, for text-only LLMs. Auto-included when `multimodal_support=false`. Requires `rapidocr-onnxruntime` + `opencv-python`.
 
 **Providers** swap `_chat_fn`. Set `provider: "anthropic"` (auto-includes `providers/anthropic`) to use it. Built-in:
@@ -125,47 +124,45 @@ Each entry copies `opt/<path>.py` → `agents/<self>/<path>.py` at first boot. F
 
 ```
 pip install -r requirements.txt
-python setup.py myagent                            # prompts for token, auto-discovers chat_id, prompts for api_key
-python agent.py myagent
+python setup.py                            # prompts for token, auto-discovers chat_id, prompts for api_key
+python agent.py
 ```
 
 `setup.py` accepts CLI args for non-interactive use (e.g. an HR-style agent spawning new agents):
 
 ```
-python setup.py newhire --token 123:abc --chat -1001234567 --api-key sk-... [--thread 42] [--systemd]
+python setup.py --token 123:abc --chat -1001234567 --api-key sk-... [--thread 42] [--systemd]
 ```
 
-Required config (`agents/<self>/config.json`) is created by `setup.py`. It validates `GET /getMe` and refuses to proceed if the bot's privacy mode is on or `can_join_groups` is off.
+Required config (`agent/config.json`) is created by `setup.py`. It validates `GET /getMe` and refuses to proceed if the bot's privacy mode is on or `can_join_groups` is off.
 
 ## Deploy
 
-On macOS or for quick testing, just run `python agent.py myagent` (use `tmux` to keep it alive across logout).
+One agent per unix user: give the agent its own user, clone this repo into their `$HOME`, run `setup.py` and `agent.py` from there. The agent owns its copy of the harness; editing it affects no other agent.
 
-On Linux, run `setup.py --systemd` to emit a systemd template unit + install instructions:
+On macOS or for quick testing, just run `python agent.py` (use `tmux` to keep it alive across logout).
+
+On Linux, run `setup.py --systemd` as the dedicated user to emit a systemd unit + install instructions:
 
 ```bash
-python setup.py myagent --systemd
-# wrote agents/myagent/config.json
-# wrote attobot@.service
+python setup.py --systemd
+# wrote agent/config.json
+# wrote attobot.service
 #
-# Install once (user service, no sudo):
+# Install (user service, no sudo):
 #   mkdir -p ~/.config/systemd/user
-#   cp attobot@.service ~/.config/systemd/user/
+#   cp attobot.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   loginctl enable-linger $USER          # so it survives logout
-#
-# Then for each agent:
-#   systemctl --user enable --now attobot@myagent
-#   journalctl --user -u attobot@myagent -f
+#   systemctl --user enable --now attobot
+#   journalctl --user -u attobot -f
 ```
-
-Same template handles N agents — `attobot@newhire`, etc. Per the project's "new unix user per agent" convention, run `setup.py --systemd` as the dedicated user so user-mode systemd lives in their `$HOME`.
 
 Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `model` / `api_base` in `config.json` to point at any OpenAI-compatible endpoint, or set `provider: "anthropic"` to switch the request shape.
 
-`python agent.py <self> [soul_path]` — second arg overrides the SOUL template (defaults to `./SOUL.md`). No `<self>` argument → derived from `sha256(soul_text)`; useful for ephemeral agents.
+`python agent.py [agent_dir]` — the arg is the agent state folder (default `./agent`); same optional arg on `setup.py`. It must hold `config.json` and `SOUL.md` (`setup.py` creates both).
 
-`agents/<self>/config.json` fields (only `telegram_token`, `telegram_chat_id`, `api_key` are required — the rest fall back to sensible defaults baked into `agent.py`):
+`agent/config.json` fields (only `telegram_token`, `telegram_chat_id`, `api_key` are required — the rest fall back to sensible defaults baked into `agent.py`):
 
 ```jsonc
 {
@@ -184,7 +181,7 @@ Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `model` / `api_b
 }
 ```
 
-Constants tuned in-source (rarely worth changing): `LIFE_TAIL`, `MEMORY_LIMIT`, `TOOL_TIMEOUT`, `CRON_TICK`, `INBOX_TICK`, `INBOX_PREVIEW`, `CHAT_MSG_MAX`, `TOOL_OUTPUT_LIMIT`, `AGENTS_DIR`, `BLOB_DIR`.
+Tunables with defaults in `CFG` (rarely worth changing, override in `config.json`): `life_tail`, `memory_limit`, `tool_timeout`, `cron_tick`, `inbox_tick`, `inbox_preview`, `chat_msg_max`, `tool_output_limit`. `AGENT_DIR` / `BLOB_DIR` are in-source constants.
 
 ## Principles
 

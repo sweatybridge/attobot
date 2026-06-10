@@ -43,8 +43,23 @@ def chat(messages, tools):
     )
     data = r.json()
     if "content" not in data:
-        raise RuntimeError(f"{r.status_code}: {data}")
+        raise agent.classify_llm_error(r.status_code, data)
     return _convert_response(data)
+
+
+def _convert_blocks(content):
+    """OpenAI-shape content blocks (image_url/text) → Anthropic blocks."""
+    blocks = []
+    for b in content:
+        if b.get("type") == "image_url":
+            url = b["image_url"]["url"]
+            meta, b64 = url.split(",", 1)
+            mime = meta.split(":", 1)[1].split(";", 1)[0]
+            blocks.append({"type": "image", "source": {
+                "type": "base64", "media_type": mime, "data": b64}})
+        else:
+            blocks.append({"type": "text", "text": b.get("text", json.dumps(b))})
+    return blocks
 
 
 def _split_system_and_convert(messages):
@@ -73,7 +88,7 @@ def _split_system_and_convert(messages):
                 blocks.append({"type": "text", "text": ""})
             out.append({"role": "assistant", "content": blocks})
         elif role == "tool":
-            result_content = content if isinstance(content, str) else json.dumps(content)
+            result_content = content if isinstance(content, str) else _convert_blocks(content)
             out.append({"role": "user", "content": [{
                 "type": "tool_result",
                 "tool_use_id": m["tool_call_id"],
@@ -81,7 +96,7 @@ def _split_system_and_convert(messages):
             }]})
         else:  # user
             if isinstance(content, list):
-                out.append({"role": "user", "content": content})
+                out.append({"role": "user", "content": _convert_blocks(content)})
             else:
                 out.append({"role": "user", "content": [{"type": "text", "text": content or ""}]})
     return system, out
