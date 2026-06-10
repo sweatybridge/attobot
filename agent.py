@@ -372,8 +372,7 @@ def start_chat():
                     if not msg_cid:
                         continue
                     if msg_cid != locked_cid or msg_tid != locked_tid:
-                        append_msg({"role": "system", "content": f"[chat reject {msg_cid}/{msg_tid or '-'}]"})
-                        continue
+                        continue  # not our chat/topic — drop silently (no bus, no LIFE)
                     text = msg.get("text") or ""
                     caption = msg.get("caption") or ""
                     file_id = None
