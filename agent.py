@@ -292,7 +292,7 @@ TOOLS = [
         {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}),
     ("STASH", lambda args: stash(args["content"]), "Save text to a blob, return [stash <hash>].",
         {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}),
-    ("STASH_MESSAGES", stash_messages, "Stash a contiguous range of lines from a messages.jsonl into a blob with an LLM summary. Lines are 1-indexed, end inclusive. Defaults to your own log. If start/end omitted, auto-picks the middle quarter. Whatever range you pass gets snapped forward to the nearest turn boundaries so you don't have to worry about splitting a turn. Line numbers shift after this (stashed range collapses to 1 line) — re-read before the next call, or stash in descending start-line order.",
+    ("STASH_MESSAGES", stash_messages, "Collapse a line range of a messages.jsonl (default: your own, middle half) into one [stash <hash>] line with an LLM summary. 1-indexed, end inclusive, snapped to turn boundaries. Line numbers shift afterwards — re-read, or stash bottom-up.",
         {"type": "object", "properties": {"path": {"type": "string"}, "start": {"type": "integer"}, "end": {"type": "integer"}}}),
 ]
 TOOL_FNS = {n: f for n, f, _, _ in TOOLS}
