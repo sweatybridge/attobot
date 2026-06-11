@@ -126,7 +126,10 @@ _TG_MEDIA = {
     "mp3": ("sendAudio", "audio"), "m4a": ("sendAudio", "audio"), "wav": ("sendAudio", "audio"),
 }
 
-def _tg_check(r):
+def _tg_send(endpoint, payload, files=None):
+    """Post to the telegram API; returns an error string or None. Failures land in LIFE."""
+    r = requests.post(f"https://api.telegram.org/bot{CFG['telegram_token']}/{endpoint}",
+                      data=payload, files=files, timeout=60)
     data = r.json()
     if not data.get("ok"):
         life(f"[send_chat error] {data}")
@@ -136,7 +139,6 @@ def _tg_check(r):
 def send_chat(args):
     if not CFG.get("telegram_token"):
         return "no chat configured"
-    token = CFG["telegram_token"]
     base = {"chat_id": CFG["telegram_chat_id"]}
     if CFG.get("telegram_thread_id"):
         base["message_thread_id"] = CFG["telegram_thread_id"]
@@ -146,17 +148,13 @@ def send_chat(args):
         ext = pathlib.Path(path).suffix.lower().lstrip(".")
         endpoint, field = _TG_MEDIA.get(ext, ("sendDocument", "document"))
         with open(path, "rb") as f:
-            r = requests.post(f"https://api.telegram.org/bot{token}/{endpoint}",
-                              data={**base, "caption": text[:1024]},
-                              files={field: f}, timeout=60)
+            err = _tg_send(endpoint, {**base, "caption": text[:1024]}, files={field: f})
         while _pending_reactions:
             _react(_pending_reactions.pop(), "")
-        return _tg_check(r) or f"sent {field} {path}"
+        return err or f"sent {field} {path}"
     errors = []
     for i in range(0, len(text), CFG["chat_msg_max"]):
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          data={**base, "text": text[i:i+CFG['chat_msg_max']]}, timeout=45)
-        if err := _tg_check(r):
+        if err := _tg_send("sendMessage", {**base, "text": text[i:i+CFG['chat_msg_max']]}):
             errors.append(err)
     while _pending_reactions:
         _react(_pending_reactions.pop(), "")
