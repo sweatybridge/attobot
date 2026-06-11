@@ -418,6 +418,26 @@ def _is_machinery(line):
     m = _parse_msg(line) or {}
     return m.get("role") == "system" and str(m.get("content", "")).startswith(("[trigger ", "[subconscious]"))
 
+def _is_idle_turn(m):
+    """An idle reply: bare [IDLE]/empty content with no tools, or whose only action is
+    SEND_CHAT-ing [IDLE]. Treated like a content [IDLE] — suppressed, turn ends, no loop."""
+    if m.get("role") != "assistant":
+        return False
+    tcs = m.get("tool_calls") or []
+    if not tcs:
+        c = (m.get("content") or "").strip()
+        return not c or c.startswith("[IDLE]")
+    for tc in tcs:
+        if tc.get("function", {}).get("name") != "SEND_CHAT":
+            return False
+        try:
+            text = str(json.loads(tc["function"].get("arguments") or "{}").get("text", "")).strip()
+        except Exception:
+            return False
+        if not text.startswith("[IDLE]"):
+            return False
+    return True
+
 def start_triggers():
     """Only this thread writes trigger files. Its sole contract with the turn loop is the
     stream itself: fires are appended to it, and the agent's replies read back from it are
@@ -465,7 +485,7 @@ def start_triggers():
             c = m.get("content")
             if m.get("role") == "assistant":
                 if verdict:
-                    idle = not m.get("tool_calls") and (not c or str(c).strip().startswith("[IDLE]"))
+                    idle = _is_idle_turn(m)
                     adjust(pending, active=not idle)
                 pending.clear()
             elif m.get("role") == "system" and isinstance(c, str) and c.startswith("[trigger "):
@@ -665,12 +685,20 @@ def main():
         msg = llm([{"role": "system", "content": system}] + messages + [{"role": "system", "content": life}], tools=TOOL_SCHEMAS)
         assistant = serialize_assistant(msg)
 
+        # Idle turn — bare [IDLE], or its only act is SEND_CHAT-ing [IDLE]: suppress, end the turn.
+        if _is_idle_turn(assistant):
+            with _append_lock:
+                append_msg(assistant)
+                for tc in assistant.get("tool_calls") or []:  # keep the tool protocol valid; nothing sent
+                    append_msg({"role": "tool", "tool_call_id": tc["id"], "content": "[IDLE] suppressed"})
+            last_hash = file_hash()
+            tool_called = False
+            continue
+
         if not assistant.get("tool_calls"):
             append_msg(assistant)
             last_hash = file_hash()
-            text = (msg.get("content") or "").strip()
-            if text and not text.startswith("[IDLE]"):  # idle sentinel, see SOUL.md
-                send_chat({"text": text})
+            send_chat({"text": (msg.get("content") or "").strip()})
             tool_called = False
             continue
 
