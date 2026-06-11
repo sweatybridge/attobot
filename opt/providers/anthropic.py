@@ -21,6 +21,7 @@ def chat(messages, tools):
     Exceptions bubble up to agent.py's retry loop.
     """
     system, anthropic_messages = _split_system_and_convert(messages)
+    _mark_message_cache(anthropic_messages)
     body = {
         "model": agent.CFG["model"],
         "max_tokens": int(agent.CFG.get("max_tokens", 4096)),
@@ -59,6 +60,27 @@ def _system_blocks(system):
         {"type": "text", "text": system[:i], "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": system[i:]},
     ]
+
+
+def _mark_message_cache(messages):
+    """Incrementally cache the conversation. Anthropic caching is prefix-based: it
+    reads the longest previously-written prefix automatically, so we only need a write
+    breakpoint near the tail each turn. Without this, the whole growing message history
+    (tool results especially) is reprocessed every turn — only the fixed system prefix
+    gets cached, which is why cache-read share collapses as the conversation grows.
+
+    Mark the last block of the final two messages so the rolling write breakpoints stay
+    within Anthropic's lookback window as history grows. (System holds 1 breakpoint;
+    these add up to 2; Anthropic's cap is 4.)"""
+    marked = 0
+    for m in reversed(messages):
+        blocks = m.get("content")
+        if not isinstance(blocks, list) or not blocks:
+            continue
+        blocks[-1] = {**blocks[-1], "cache_control": {"type": "ephemeral"}}
+        marked += 1
+        if marked == 2:
+            break
 
 
 def _convert_blocks(content):
