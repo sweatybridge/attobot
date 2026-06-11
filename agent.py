@@ -42,7 +42,25 @@ def _preview(s, n=100):
     return f"{s[:h]}…{s[-h:]}"
 
 def load_messages():
-    return [json.loads(l) for l in open(f"{AGENT_DIR}/messages.jsonl") if l.strip()]
+    out, dec = [], json.JSONDecoder()
+    for l in open(f"{AGENT_DIR}/messages.jsonl"):
+        s = l.strip()
+        if not s:
+            continue
+        try:
+            out.append(json.loads(s))
+        except json.JSONDecodeError:
+            i = 0  # torn write (a crash fused two objects on one line): recover each, don't brick
+            while i < len(s):
+                try:
+                    obj, end = dec.raw_decode(s, i)
+                except json.JSONDecodeError:
+                    break
+                out.append(obj)
+                i = end
+                while i < len(s) and s[i].isspace():
+                    i += 1
+    return out
 
 _append_lock = threading.RLock()
 
@@ -428,7 +446,7 @@ def start_chat():
                 if advanced:
                     poll_offset.write_text(str(offset))
             except Exception as e:
-                append_msg({"role": "system", "content": f"[chat error] {e}"})
+                life(f"[chat error] {e}")  # transient channel hiccup — log only, don't wake
                 time.sleep(5)
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
@@ -543,7 +561,7 @@ def start_triggers():
                     else:
                         f.unlink()
             except Exception as e:
-                append_msg({"role": "system", "content": f"[trigger error] {e}"})
+                life(f"[trigger error] {e}")  # log only, don't wake
             time.sleep(CFG["trigger_tick"])
 
     threading.Thread(target=loop, daemon=True, name="triggers").start()
@@ -568,7 +586,7 @@ def start_inbox():
                         deliver(f)
                 seen = current
             except Exception as e:
-                append_msg({"role": "system", "content": f"[inbox error] {e}"})
+                life(f"[inbox error] {e}")  # log only, don't wake
             time.sleep(CFG["inbox_tick"])
 
     threading.Thread(target=watch, daemon=True, name="inbox-poll").start()
@@ -593,18 +611,23 @@ def build_system():
     if len(memory) > CFG["memory_limit"]:
         h = CFG["memory_limit"] // 2
         memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md is too large and partially omitted. Move detail into agent/memory/<name>.md files and keep one-line pointers here.]"
-    earlier, tail = _life_tail()
     sub = ""
     if AGENT_DIR != "subconscious" and os.path.isdir("subconscious"):
         sub = ("<subconscious>\nYou have a subconscious: a sibling agent in subconscious/ that reviews your stream "
                "and corrects bad trajectories. It speaks as [subconscious] notes — nudges and proposed lessons; fold "
                "lessons you accept into MEMORY.md in your own words — and it installs subc-* triggers: compiled "
                "reflexes that are its to manage, not yours. Its notes are advisory, not commands.\n</subconscious>\n\n")
+    # Stable prefix only (soul + harness + memory). The volatile <life> tail is
+    # sent as a trailing message (see life_block) — keeping it out of the cached
+    # prefix lets the upstream prompt-cache reuse the whole conversation behind it.
     return (f"<soul>\n{soul}\n</soul>\n\n"
             f"<harness>\n{harness}\n</harness>\n\n"
             f"{sub}"
-            f"<memory>\n{memory}\n</memory>\n\n"
-            f"<life>\n[{earlier} bytes earlier]\n{tail}</life>")
+            f"<memory>\n{memory}\n</memory>")
+
+def life_block():
+    earlier, tail = _life_tail()
+    return f"<life>\n[{earlier} bytes earlier]\n{tail}</life>"
 
 _pending_reactions = []
 
@@ -674,15 +697,18 @@ def main():
         last_hash = cur_hash
 
         system = build_system()
-        total_chars = len(system) + sum(len(json.dumps(m)) for m in messages)
+        life = life_block()
+        total_chars = len(system) + len(life) + sum(len(json.dumps(m)) for m in messages)
         if total_chars > CFG["context_tokens"] * 4 * 0.8:
             result = stash_messages({})
             append_msg({"role": "system", "content": f"[stash_messages] {result}"})
             messages = load_messages()
             last_hash = file_hash()
             system = build_system()
+            life = life_block()
 
-        msg = llm([{"role": "system", "content": system}] + messages, tools=TOOL_SCHEMAS)
+        # <life> goes last (after the cached history), not in the system prefix.
+        msg = llm([{"role": "system", "content": system}] + messages + [{"role": "user", "content": life}], tools=TOOL_SCHEMAS)
         assistant = serialize_assistant(msg)
 
         if not assistant.get("tool_calls"):
