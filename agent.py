@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Minimal agent."""
-import os, sys
-import base64, fcntl, hashlib, importlib.util, json, mimetypes, pathlib, pwd, requests, shutil, subprocess, threading, time
+import base64, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, requests, shutil, subprocess, sys, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
 AGENT_DIR = sys.argv[1] if len(sys.argv) > 1 else "agent"
@@ -48,25 +47,19 @@ def _parse_msg(line):
     return m if isinstance(m, dict) else None
 
 def load_messages():
-    out, dec = [], json.JSONDecoder()
-    for l in open(f"{AGENT_DIR}/messages.jsonl"):
-        s = l.strip()
-        if not s:
+    """The stream is a sequence of json values; the messages are the dicts with a role.
+    Scanning value-by-value makes torn writes (fused or truncated lines) a non-event."""
+    s, dec, out, i = open(f"{AGENT_DIR}/messages.jsonl").read(), json.JSONDecoder(), [], 0
+    while i < len(s):
+        if s[i].isspace():
+            i += 1
             continue
-        if m := _parse_msg(s):
-            out.append(m)
-        else:
-            i = 0  # torn write (a crash fused two objects on one line): recover each, don't brick
-            while i < len(s):
-                try:
-                    obj, end = dec.raw_decode(s, i)
-                except json.JSONDecodeError:
-                    break
-                if isinstance(obj, dict):
-                    out.append(obj)
-                i = end
-                while i < len(s) and s[i].isspace():
-                    i += 1
+        try:
+            obj, i = dec.raw_decode(s, i)
+            if isinstance(obj, dict) and "role" in obj:
+                out.append(obj)
+        except json.JSONDecodeError:
+            i += 1  # garbage byte — skip; whatever parses next is recovered
     return out
 
 _append_lock = threading.RLock()
@@ -125,13 +118,9 @@ def llm(messages, tools=None):
 
 # ---------- tools ----------
 
-_TG_MEDIA = {
-    "jpg": ("sendPhoto", "photo"), "jpeg": ("sendPhoto", "photo"),
-    "png": ("sendPhoto", "photo"), "gif": ("sendPhoto", "photo"), "webp": ("sendPhoto", "photo"),
-    "mp4": ("sendVideo", "video"), "mov": ("sendVideo", "video"), "webm": ("sendVideo", "video"),
-    "ogg": ("sendVoice", "voice"),
-    "mp3": ("sendAudio", "audio"), "m4a": ("sendAudio", "audio"), "wav": ("sendAudio", "audio"),
-}
+_TG_MEDIA = {ext: (f"send{kind}", kind.lower())
+             for kind, exts in {"Photo": "jpg jpeg png gif webp", "Video": "mp4 mov webm",
+                                "Voice": "ogg", "Audio": "mp3 m4a wav"}.items() for ext in exts.split()}
 
 def _tg_send(endpoint, payload, files=None, cfg=None):
     """Post to an agent's chat via the telegram API; returns an error string or None. Failures land in LIFE."""
@@ -195,15 +184,12 @@ def edit_file(args):
     path, old, new = args["path"], args["old"], args["new"]
     text = open(path).read()
     count = text.count(old)
-    if args.get("replace_all"):
-        if count == 0:
-            return f"error: OLD not found in {path}"
-        open(path, "w").write(text.replace(old, new))
-        return f"edited {path} ({count} replacements)"
-    if count != 1:
+    if not args.get("replace_all") and count != 1:
         return f"error: OLD must appear exactly once in {path} (found {count}; pass replace_all to replace every occurrence)"
+    if count == 0:
+        return f"error: OLD not found in {path}"
     open(path, "w").write(text.replace(old, new))
-    return f"edited {path}"
+    return f"edited {path}" + (f" ({count} replacements)" if args.get("replace_all") else "")
 
 def bash(args):
     return subprocess.Popen(args["cmd"], shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -386,18 +372,15 @@ def start_chat():
         except (FileNotFoundError, ValueError): offset = 0
         while True:
             try:
-                advanced = False
                 r = requests.post(f"https://api.telegram.org/bot{token}/getUpdates",
                                   data={"offset": offset, "timeout": 25}, timeout=45)
-                for u in r.json().get("result") or []:
+                updates = r.json().get("result") or []
+                for u in updates:
                     offset = u["update_id"] + 1
-                    advanced = True
                     msg = u.get("message") or {}
                     msg_cid = str((msg.get("chat") or {}).get("id") or "")
                     tid_raw = msg.get("message_thread_id")
                     msg_tid = str(tid_raw) if tid_raw is not None else None
-                    if not msg_cid:
-                        continue
                     if msg_cid != locked_cid or msg_tid != locked_tid:
                         continue  # not our chat/topic — drop silently (no bus, no LIFE)
                     if msg.get("photo"):
@@ -422,7 +405,7 @@ def start_chat():
                     if mid := msg.get("message_id"):
                         _pending_reactions.append(mid)
                         _react(mid, "👀")
-                if advanced:
+                if updates:
                     poll_offset.write_text(str(offset))
             except Exception as e:
                 life(f"[chat error] {e}")  # transient channel hiccup — log only, don't wake
@@ -619,12 +602,8 @@ def _react(mid, emoji):
     except Exception: pass
 
 def serialize_assistant(msg):
-    out = {"role": "assistant", "content": msg.get("content") or ""}
-    if msg.get("reasoning_content"):
-        out["reasoning_content"] = msg["reasoning_content"]
-    if msg.get("tool_calls"):
-        out["tool_calls"] = msg["tool_calls"]
-    return out
+    return {"role": "assistant", "content": msg.get("content") or "",
+            **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
 
 def main():
     config_path = pathlib.Path(f"{AGENT_DIR}/config.json")
