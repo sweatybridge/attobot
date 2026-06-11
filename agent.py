@@ -99,27 +99,18 @@ def _default_chat(messages, tools):
         json=body, timeout=120)
     data = r.json()
     if "choices" not in data:
-        raise classify_llm_error(r.status_code, data)
+        if 400 <= r.status_code < 500 and r.status_code != 429:
+            sys.exit(f"fatal llm error {r.status_code}: {data}")  # bad key/model/request — retrying won't help
+        raise RuntimeError(f"{r.status_code}: {data}")
     return data["choices"][0]["message"]
 
 _chat_fn = _default_chat
-
-class LLMFatal(Exception):
-    pass
-
-def classify_llm_error(status, data):
-    """4xx except 429 is not retryable."""
-    if 400 <= status < 500 and status != 429:
-        return LLMFatal(f"{status}: {data}")
-    return RuntimeError(f"{status}: {data}")
 
 def llm(messages, tools=None):
     delay = 1
     while True:
         try:
             return _chat_fn(messages, tools)
-        except LLMFatal:
-            raise
         except Exception as e:
             append_msg({"role": "system", "content": f"[llm retry in {delay}s] {e}"})
             time.sleep(delay)

@@ -7,6 +7,7 @@ Reads from agent.CFG:
   max_tokens          defaults to 4096
 """
 import json
+import sys
 
 import requests
 
@@ -44,7 +45,9 @@ def chat(messages, tools):
     )
     data = r.json()
     if "content" not in data:
-        raise agent.classify_llm_error(r.status_code, data)
+        if 400 <= r.status_code < 500 and r.status_code != 429:
+            sys.exit(f"fatal llm error {r.status_code}: {data}")  # bad key/model/request — retrying won't help
+        raise RuntimeError(f"{r.status_code}: {data}")
     return _convert_response(data)
 
 
