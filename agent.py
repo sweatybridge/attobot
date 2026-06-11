@@ -41,22 +41,29 @@ def _preview(s, n=100):
     h = n // 2
     return f"{s[:h]}…{s[-h:]}"
 
+def _parse_msg(line):
+    """The only way a line becomes a message: a json dict, or None — anything else isn't a message."""
+    try: m = json.loads(line)
+    except Exception: return None
+    return m if isinstance(m, dict) else None
+
 def load_messages():
     out, dec = [], json.JSONDecoder()
     for l in open(f"{AGENT_DIR}/messages.jsonl"):
         s = l.strip()
         if not s:
             continue
-        try:
-            out.append(json.loads(s))
-        except json.JSONDecodeError:
+        if m := _parse_msg(s):
+            out.append(m)
+        else:
             i = 0  # torn write (a crash fused two objects on one line): recover each, don't brick
             while i < len(s):
                 try:
                     obj, end = dec.raw_decode(s, i)
                 except json.JSONDecodeError:
                     break
-                out.append(obj)
+                if isinstance(obj, dict):
+                    out.append(obj)
                 i = end
                 while i < len(s) and s[i].isspace():
                     i += 1
@@ -239,9 +246,9 @@ def stash_messages(args):
     else:
         s, e = n // 4, (3 * n) // 4
 
-    while s < n and json.loads(lines[s]).get("role") not in ("user", "system"):
+    while s < n and (_parse_msg(lines[s]) or {}).get("role") not in ("user", "system"):
         s += 1
-    while e < n and json.loads(lines[e]).get("role") not in ("user", "system"):
+    while e < n and (_parse_msg(lines[e]) or {}).get("role") not in ("user", "system"):
         e += 1
     if s >= e:
         return "nothing safe to stash"
@@ -442,10 +449,8 @@ def start_chat():
 
 def _is_machinery(line):
     """A genuine harness system message (trigger fire / subconscious note) — not e.g. an operator quoting one."""
-    try: m = json.loads(line)
-    except Exception: return False
-    c = isinstance(m, dict) and m.get("content")
-    return m.get("role") == "system" and isinstance(c, str) and c.startswith(("[trigger ", "[subconscious]"))
+    m = _parse_msg(line) or {}
+    return m.get("role") == "system" and str(m.get("content", "")).startswith(("[trigger ", "[subconscious]"))
 
 def start_triggers():
     """Only this thread writes trigger files. Its sole contract with the turn loop is the
@@ -486,8 +491,8 @@ def start_triggers():
         whole = raw.rfind(b"\n") + 1  # a partially-written tail line waits for the next tick
         cursor += whole
         for line in raw[:whole].decode("utf-8", errors="replace").splitlines():
-            try: m = json.loads(line)
-            except Exception: continue
+            if not (m := _parse_msg(line)):
+                continue
             c = m.get("content")
             if m.get("role") == "assistant":
                 if verdict:
@@ -696,8 +701,7 @@ def main():
             system = build_system()
             life = life_block()
 
-        # <life> goes last (after the cached history), not in the system prefix.
-        msg = llm([{"role": "system", "content": system}] + messages + [{"role": "user", "content": life}], tools=TOOL_SCHEMAS)
+        msg = llm([{"role": "system", "content": system}] + messages + [{"role": "system", "content": life}], tools=TOOL_SCHEMAS)
         assistant = serialize_assistant(msg)
 
         if not assistant.get("tool_calls"):
