@@ -433,6 +433,22 @@ def start_chat():
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
 
+def _pending_triggers():
+    """Names of triggers whose last fire has not yet been answered by an assistant turn."""
+    p = set()
+    try:
+        for l in open(f"{AGENT_DIR}/messages.jsonl"):
+            if not l.strip(): continue
+            m = json.loads(l)
+            if m.get("role") == "assistant":
+                p.clear()
+            c = m.get("content")
+            if m.get("role") == "system" and isinstance(c, str) and c.startswith("[trigger "):
+                p.add(c.split("]", 1)[0][9:])
+    except Exception:
+        pass
+    return p
+
 def start_triggers():
     trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
     trig_dir.mkdir(parents=True, exist_ok=True)
@@ -441,9 +457,11 @@ def start_triggers():
         while True:
             try:
                 ts = time.time()
+                pending = _pending_triggers()
                 for f in trig_dir.glob("*.json"):
                     try: job = json.loads(f.read_text())
                     except Exception: continue
+                    if f.stem in pending: continue  # one unanswered fire in flight; hold, lose nothing
                     if job.get("next", 0 if "watch" in job or "cmd" in job else float("inf")) > ts: continue
                     delta = None
                     if w := job.get("watch"):
@@ -565,17 +583,31 @@ def _react(mid, emoji):
                   "reaction": [{"type":"emoji","emoji":emoji}] if emoji else []}, timeout=10)
     except Exception: pass
 
-def _adjust_backoff(active):
-    """Triggers with "backoff" track turn activity: an active turn resets the interval
-    to repeat_s, an idle turn doubles it (capped at backoff), and every turn defers
-    next — so they fire only after a full interval of silence."""
+def _fired_triggers(messages):
+    """Names of triggers that fired since the previous assistant turn — the ones that woke this turn."""
+    fired = set()
+    for m in reversed(messages):
+        if m.get("role") == "assistant":
+            break
+        c = m.get("content")
+        if m.get("role") == "system" and isinstance(c, str) and c.startswith("[trigger "):
+            fired.add(c.split("]", 1)[0][9:])
+    return fired
+
+def _adjust_backoff(active, fired):
+    """Backoff triggers are idle timers: every turn defers next, so they fire only after
+    cur_s of silence. The reply is the verdict for the triggers that woke this turn:
+    [IDLE] doubles their interval (up to backoff), anything else resets it to repeat_s.
+    Useless wakers quiet down on their own; useful ones stay prompt."""
     for f in pathlib.Path(f"{AGENT_DIR}/triggers").glob("*.json"):
         try:
             job = json.loads(f.read_text())
             if not job.get("backoff"):
                 continue
-            cur = job["repeat_s"] if active else min(job.get("cur_s", job["repeat_s"]) * 2, job["backoff"])
-            job["cur_s"] = cur
+            cur = job.get("cur_s", job["repeat_s"])
+            if f.stem in fired:
+                cur = job["repeat_s"] if active else min(cur * 2, job["backoff"])
+                job["cur_s"] = cur
             job["next"] = time.time() + cur
             f.write_text(json.dumps(job))
         except Exception:
@@ -652,12 +684,14 @@ def main():
         assistant = serialize_assistant(msg)
 
         if not assistant.get("tool_calls"):
+            fired = _fired_triggers(messages)
             append_msg(assistant)
             last_hash = file_hash()
             text = (msg.get("content") or "").strip()
-            if not text.startswith("[IDLE]"):  # idle sentinel, see SOUL.md
+            idle = not text or text.startswith("[IDLE]")
+            if not idle:  # idle sentinel, see SOUL.md
                 send_chat({"text": text})
-            _adjust_backoff(active=False)
+            _adjust_backoff(active=not idle, fired=fired)
             tool_called = False
             continue
 
@@ -679,7 +713,7 @@ def main():
             for tm in tool_results:
                 append_msg(tm)
         last_hash = file_hash()
-        _adjust_backoff(active=True)
+        _adjust_backoff(active=True, fired=_fired_triggers(messages))
         tool_called = True
 
 if __name__ == "__main__":
