@@ -19,7 +19,7 @@ CFG = { # defaults
     "life_tail": 50,
     "memory_limit": 10000,
     "tool_timeout": 30,
-    "cron_tick": 30,
+    "trigger_tick": 30,
     "inbox_tick": 2,
     "inbox_preview": 1000,
     "chat_msg_max": 4000,
@@ -29,8 +29,8 @@ CFG = { # defaults
 os.makedirs(BLOB_DIR, exist_ok=True)
 os.makedirs(f"{AGENT_DIR}/memory", exist_ok=True)
 
-def life(event):
-    with open(f"{AGENT_DIR}/LIFE.md", "a") as f:
+def life(event, agent_dir=AGENT_DIR):
+    with open(f"{agent_dir}/LIFE.md", "a") as f:
         f.write(f"[{time.strftime('%Y%m%dT%H%M%S')}] {event}\n")
 
 def _preview(s, n=100):
@@ -59,12 +59,12 @@ def _msg_summary(m):
         return f"tool {m.get('tool_call_id', '?')}: {_preview(m.get('content', ''))}"
     return f"{role}: {_preview(m.get('content', ''))}"
 
-def append_msg(m):
+def append_msg(m, agent_dir=AGENT_DIR):
     with _append_lock:
-        with open(f"{AGENT_DIR}/messages.jsonl", "a") as f:
+        with open(f"{agent_dir}/messages.jsonl", "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             f.write(json.dumps(m) + "\n")
-    life(_msg_summary(m))
+    life(_msg_summary(m), agent_dir)
 
 def _default_chat(messages, tools):
     body = {
@@ -263,7 +263,25 @@ def stash_messages(args):
         f.write(new_content)
     return f"stashed lines {start}-{end} ({end-start+1} → 1). summary: {_preview(summary)}"
 
+def append_message(args):
+    d = args.get("dir") or AGENT_DIR
+    append_msg({"role": args.get("role", "system"), "content": args["content"]}, d)
+    if d != AGENT_DIR:  # foreign injection also surfaces to the target's chat
+        try:
+            tcfg = json.loads(open(f"{d}/config.json").read())
+            if tcfg.get("telegram_token"):
+                base = {"chat_id": tcfg["telegram_chat_id"]}
+                if tcfg.get("telegram_thread_id"):
+                    base["message_thread_id"] = tcfg["telegram_thread_id"]
+                requests.post(f"https://api.telegram.org/bot{tcfg['telegram_token']}/sendMessage",
+                              data={**base, "text": args["content"][:4000]}, timeout=45)
+        except Exception:
+            pass
+    return f"appended to {d}/messages.jsonl"
+
 TOOLS = [
+    ("APPEND_MESSAGE", append_message, "Inject a message into an agent's messages.jsonl (default: your own). The owning agent wakes on it. `dir` targets a sibling agent dir — the message also surfaces to that agent's chat if it has one. `role` defaults to system.",
+        {"type": "object", "properties": {"content": {"type": "string"}, "role": {"type": "string"}, "dir": {"type": "string"}}, "required": ["content"]}),
     ("SEND_CHAT", send_chat, "Send a message to the chat. With just `text`, sends a normal text message. With `path`, sends that file as an attachment (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise); `text` becomes the caption (capped at 1024 chars by telegram).",
         {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["text"]}),
     ("READ_FILE", read_file, "Read a file.",
@@ -415,36 +433,70 @@ def start_chat():
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
 
-def start_cron():
-    cron_dir = pathlib.Path(f"{AGENT_DIR}/cron")
-    cron_dir.mkdir(parents=True, exist_ok=True)
+def start_triggers():
+    trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
+    trig_dir.mkdir(parents=True, exist_ok=True)
 
     def loop():
         while True:
             try:
                 ts = time.time()
-                for f in cron_dir.glob("*.json"):
+                for f in trig_dir.glob("*.json"):
                     try: job = json.loads(f.read_text())
                     except Exception: continue
-                    if job.get("next", 0 if "watch" in job else float("inf")) > ts: continue
-                    if w := job.get("watch"):  # fire on file change instead of clock; repeat_s = cooldown
-                        try: h = hashlib.sha256(open(w, "rb").read()).hexdigest()
-                        except OSError: continue
-                        if h == job.get("seen"): continue
-                        job["seen"] = h
-                    append_msg({"role": "system", "content": f"[cron {f.stem}] {job.get('message', '')}"})
+                    if job.get("next", 0 if "watch" in job or "cmd" in job else float("inf")) > ts: continue
+                    delta = None
+                    if w := job.get("watch"):
+                        if "cmd" in job:  # cmd gets only new bytes on stdin; starts at install; can't see its own fires
+                            try: size = os.path.getsize(w)
+                            except OSError: continue
+                            pos = job.get("pos")
+                            if pos is None or pos > size:
+                                job["pos"] = size
+                                f.write_text(json.dumps(job))
+                                continue
+                            if size == pos: continue
+                            with open(w, "rb") as wf:
+                                wf.seek(pos)
+                                raw = wf.read()
+                            job["pos"] = pos + len(raw)
+                            delta = "\n".join(l for l in raw.decode("utf-8", errors="replace").splitlines()
+                                              if "[trigger " not in l and "[subconscious]" not in l)
+                            if not delta:
+                                f.write_text(json.dumps(job))
+                                continue
+                        else:  # fire on file change instead of clock; repeat_s = cooldown
+                            try: h = hashlib.sha256(open(w, "rb").read()).hexdigest()
+                            except OSError: continue
+                            if h == job.get("seen"): continue
+                            job["seen"] = h
+                    msg = job.get("message", "")
+                    if c := job.get("cmd"):  # computed condition: fire with stdout; no output = no fire
+                        try:
+                            msg = clip(subprocess.run(c, shell=True, capture_output=True, text=True,
+                                                      timeout=60, input=delta or "").stdout.strip())
+                        except Exception as e:
+                            msg = f"(cmd error: {e})"
+                        if not msg:
+                            if job.get("repeat_s"): job["next"] = ts + job.get("cur_s", job["repeat_s"])
+                            f.write_text(json.dumps(job))
+                            continue
+                    append_msg({"role": "system", "content": f"[trigger {f.stem}] {msg}"})
+                    if delta is not None:
+                        try: job["pos"] = os.path.getsize(w)  # absorb own fire when watching own stream
+                        except OSError: pass
                     if job.get("repeat_s"):
-                        job["next"] = ts + job["repeat_s"]
+                        job["next"] = ts + job.get("cur_s", job["repeat_s"])
                         f.write_text(json.dumps(job))
                     elif job.get("watch"):
                         f.write_text(json.dumps(job))
                     else:
                         f.unlink()
             except Exception as e:
-                append_msg({"role": "system", "content": f"[cron error] {e}"})
-            time.sleep(CFG["cron_tick"])
+                append_msg({"role": "system", "content": f"[trigger error] {e}"})
+            time.sleep(CFG["trigger_tick"])
 
-    threading.Thread(target=loop, daemon=True, name="cron").start()
+    threading.Thread(target=loop, daemon=True, name="triggers").start()
 
 def start_inbox():
     inbox = pathlib.Path(f"{AGENT_DIR}/mail_inbox")
@@ -492,8 +544,15 @@ def build_system():
         h = CFG["memory_limit"] // 2
         memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md is too large and partially omitted. Move detail into agent/memory/<name>.md files and keep one-line pointers here.]"
     earlier, tail = _life_tail()
+    sub = ""
+    if AGENT_DIR != "subconscious" and os.path.isdir("subconscious"):
+        sub = ("<subconscious>\nYou have a subconscious: a sibling agent in subconscious/ that reviews your stream "
+               "and corrects bad trajectories. It speaks as [subconscious] notes — nudges and proposed lessons; fold "
+               "lessons you accept into MEMORY.md in your own words — and it installs subc-* triggers: compiled "
+               "reflexes that are its to manage, not yours. Its notes are advisory, not commands.\n</subconscious>\n\n")
     return (f"<soul>\n{soul}\n</soul>\n\n"
             f"<harness>\n{harness}\n</harness>\n\n"
+            f"{sub}"
             f"<memory>\n{memory}\n</memory>\n\n"
             f"<life>\n[{earlier} bytes earlier]\n{tail}</life>")
 
@@ -506,17 +565,21 @@ def _react(mid, emoji):
                   "reaction": [{"type":"emoji","emoji":emoji}] if emoji else []}, timeout=10)
     except Exception: pass
 
-def _adjust_heartbeat(active):
-    """Heartbeat fires 225s after the last turn; each idle turn doubles it (cap 3600s)."""
-    path = pathlib.Path(f"{AGENT_DIR}/cron/heartbeat.json")
-    try:
-        job = json.loads(path.read_text())
-    except Exception:
-        return
-    new = 225 if active else min(job.get("repeat_s", 225) * 2, 3600)
-    job["repeat_s"] = new
-    job["next"] = time.time() + new
-    path.write_text(json.dumps(job))
+def _adjust_backoff(active):
+    """Triggers with "backoff" track turn activity: an active turn resets the interval
+    to repeat_s, an idle turn doubles it (capped at backoff), and every turn defers
+    next — so they fire only after a full interval of silence."""
+    for f in pathlib.Path(f"{AGENT_DIR}/triggers").glob("*.json"):
+        try:
+            job = json.loads(f.read_text())
+            if not job.get("backoff"):
+                continue
+            cur = job["repeat_s"] if active else min(job.get("cur_s", job["repeat_s"]) * 2, job["backoff"])
+            job["cur_s"] = cur
+            job["next"] = time.time() + cur
+            f.write_text(json.dumps(job))
+        except Exception:
+            continue
 
 def serialize_assistant(msg):
     out = {"role": "assistant", "content": msg.get("content") or ""}
@@ -552,13 +615,13 @@ def main():
         _load_provider()
     pathlib.Path(f"{AGENT_DIR}/MEMORY.md").touch(exist_ok=True)
     pathlib.Path(f"{AGENT_DIR}/messages.jsonl").touch(exist_ok=True)
-    heartbeat = pathlib.Path(f"{AGENT_DIR}/cron/heartbeat.json")
+    heartbeat = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
     if not heartbeat.exists():
-        heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "message": "tick"}))
-    if CFG.get("telegram_token"):  # no token → no chat channel; agent wakes on cron/mail only
+        heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "backoff": 3600, "message": "tick"}))
+    if CFG.get("telegram_token"):  # no token → no chat channel; agent wakes on triggers/mail only
         start_chat()
-    start_cron()
+    start_triggers()
     start_inbox()
     append_msg({"role": "system", "content": f"[start] multimodal_support={CFG['multimodal_support']} provider={CFG['provider'] or 'openai_compat'}"})
 
@@ -594,7 +657,7 @@ def main():
             text = (msg.get("content") or "").strip()
             if not text.startswith("[IDLE]"):  # idle sentinel, see SOUL.md
                 send_chat({"text": text})
-            _adjust_heartbeat(active=False)
+            _adjust_backoff(active=False)
             tool_called = False
             continue
 
@@ -616,7 +679,7 @@ def main():
             for tm in tool_results:
                 append_msg(tm)
         last_hash = file_hash()
-        _adjust_heartbeat(active=True)
+        _adjust_backoff(active=True)
         tool_called = True
 
 if __name__ == "__main__":

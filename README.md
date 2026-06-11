@@ -24,8 +24,8 @@ That's `agent.py`. Channels, tools, and the backgrounding wrapper all live inlin
 
 Three daemon threads append to `messages.jsonl`:
 
-- **telegram** — `start_chat()` long-polls `getUpdates`. Inbound text → `{role:user, content:"[telegram <id>] …"}`. Only the `chat_id`/`thread_id` locked in `config.json` is accepted. Optional: no `telegram_token` in config → no chat channel, `SEND_CHAT` returns "no chat configured"; the agent wakes on cron/mail only.
-- **cron** — `start_cron()` scans `agent/cron/*.json` every 30s. Job format: `{"next": <ts>, "repeat_s": <s?>, "message": "…"}`. Due jobs append `{role:system, content:"[cron <name>] …"}`. Repeating jobs reschedule; one-shots delete. A job with `"watch": "<path>"` fires on file change instead of the clock (`repeat_s` = cooldown between fires) — any file becomes a wake source.
+- **telegram** — `start_chat()` long-polls `getUpdates`. Inbound text → `{role:user, content:"[telegram <id>] …"}`. Only the `chat_id`/`thread_id` locked in `config.json` is accepted. Optional: no `telegram_token` in config → no chat channel, `SEND_CHAT` returns "no chat configured"; the agent wakes on triggers/mail only.
+- **triggers** — `start_triggers()` scans `agent/triggers/*.json` every 30s; due ones append `{role:system, content:"[trigger <name>] …"}`. Three kinds: a **cron** — `{"next": <ts>, "repeat_s": <s?>, "message": "…"}` — fires on the clock (repeating ones reschedule, one-shots delete); a **watch** — `{"watch": "<path>", "repeat_s": <cooldown?>, "message": "…"}` — fires when the file's content changes; a **cmd** — `{"cmd": "<shell>", "repeat_s": <s?>}` — runs the command and fires with its stdout (clipped), no output = no fire. Combined with `watch`, the cmd runs when the file grows and gets only the new bytes on stdin, starting from install — `[trigger`/`[subconscious]` lines are filtered and its own fires absorbed, so heuristics structurally can't self-loop or ping-pong. A repeating trigger with `"backoff": <cap_s>` is idle-aware: every turn defers its `next`; an idle (no-tool-call) turn doubles the interval toward the cap, an active turn resets it to `repeat_s`. The heartbeat is just a shipped backoff cron.
 - **mail** — `start_inbox()` polls `agent/mail_inbox/`. New files append `{role:system, content:"[mail from <unix-user>] <name>\n<preview>"}` and notify the operator via chat.
 
 ## Channel out
@@ -38,7 +38,7 @@ Declared in the `TOOLS` list in `agent.py`: `(NAME, fn, description, parameters)
 
 | name | what |
 |---|---|
-| `APPEND_MESSAGE` | inject a message into `messages.jsonl` (also used by channels) |
+| `APPEND_MESSAGE` | inject a message into an agent's `messages.jsonl` (default own; `dir` targets a sibling agent, which wakes on it; also surfaced to the target's chat if it has one) |
 | `SEND_CHAT` | post to telegram |
 | `READ_FILE` | file → line-numbered text; images → multimodal content blocks (when `MULTIMODAL_SUPPORT=true`) |
 | `WRITE_FILE` / `EDIT_FILE` | filesystem writes; `EDIT_FILE` has optional `replace_all` |
@@ -68,7 +68,7 @@ agent.py                      # the harness, included verbatim in the system pro
 opt/
   tools/<name>.py             # optional capability tools (see Optional add-ons)
   providers/<name>.py         # alternative LLM providers
-  subconscious/               # reviewer agent skeleton (soul + seeded cron), copied out beside agent/
+  subconscious/               # reviewer agent skeleton (soul + seeded trigger), copied out beside agent/
 agent/
   SOUL.md                     # this agent's soul (copy of the template)
   MEMORY.md                   # memory index: one pointer line per memory
@@ -77,8 +77,8 @@ agent/
   messages.jsonl              # canonical conversation, one JSON message per line
   config.json                 # telegram token/chat, api key, overrides
   tg_poll.offset              # telegram update_id cursor
-  cron/<name>.json            # scheduled jobs
-  cron/heartbeat.json         # auto-created at boot, 225s tick (backs off when idle)
+  triggers/<name>.json        # crons (clock) and watches (file change)
+  triggers/heartbeat.json     # auto-created at boot, 225s tick (backs off when idle)
   mail_inbox/                 # drop files here
   bg/<id>.json                # in-flight background work
   tools/<name>.py             # opt-in tools (copied from opt/tools/ at first boot)
@@ -133,7 +133,7 @@ python agent.py agent subconscious   # one command, one process per dir
 
 For an existing install: `cp -r opt/subconscious . && echo '{"api_key": "sk-..."}' > subconscious/config.json`.
 
-It wakes when the primary's stream changes (a pre-seeded watch job on `agent/messages.jsonl`, 600s cooldown) or on its own heartbeat, reads `agent/messages.jsonl` / `agent/LIFE.md` since its last review marker, and acts through two hands only: lesson files added to `agent/memory/` (+ a pointer line in `agent/MEMORY.md`), and mail dropped in `agent/mail_inbox/` — which the mail channel already surfaces to the operator's chat. It never writes the primary's `messages.jsonl`.
+It wakes when the primary's stream changes (a pre-seeded watch trigger on `agent/messages.jsonl`, 600s cooldown) or on its own heartbeat, reads `agent/messages.jsonl` / `agent/LIFE.md` since its last review marker, and acts two ways: `APPEND_MESSAGE` — a `[subconscious] …` system message injected into the primary's stream (the tool serializes, so the stream can't be corrupted) and surfaced to the operator's chat — for nudges and proposed lessons (the primary folds accepted lessons into `MEMORY.md` itself, in its own words); and for mistakes that keep recurring, `subc-*` cmd triggers installed in `agent/triggers/` — compiled heuristics that grep the stream and inject a warning with no LLM in the loop. Every heuristic fire is greppable by name, so the subconscious reviews its own heuristics' precision and retires bad ones. It writes nothing else of the primary's.
 
 ## Run
 
@@ -196,7 +196,7 @@ Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `model` / `api_b
 }
 ```
 
-Tunables with defaults in `CFG` (rarely worth changing, override in `config.json`): `life_tail`, `memory_limit`, `tool_timeout`, `cron_tick`, `inbox_tick`, `inbox_preview`, `chat_msg_max`, `tool_output_limit`. `AGENT_DIR` / `BLOB_DIR` are in-source constants.
+Tunables with defaults in `CFG` (rarely worth changing, override in `config.json`): `life_tail`, `memory_limit`, `tool_timeout`, `trigger_tick`, `inbox_tick`, `inbox_preview`, `chat_msg_max`, `tool_output_limit`. `AGENT_DIR` / `BLOB_DIR` are in-source constants.
 
 ## Principles
 
