@@ -433,61 +433,96 @@ def start_chat():
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
 
-def _pending_triggers():
-    """Names of triggers whose last fire has not yet been answered by an assistant turn."""
-    p = set()
-    try:
-        for l in open(f"{AGENT_DIR}/messages.jsonl"):
-            if not l.strip(): continue
-            m = json.loads(l)
-            if m.get("role") == "assistant":
-                p.clear()
-            c = m.get("content")
-            if m.get("role") == "system" and isinstance(c, str) and c.startswith("[trigger "):
-                p.add(c.split("]", 1)[0][9:])
-    except Exception:
-        pass
-    return p
+def _is_machinery(line):
+    """A genuine harness system message (trigger fire / subconscious note) — not e.g. an operator quoting one."""
+    try: m = json.loads(line)
+    except Exception: return False
+    c = isinstance(m, dict) and m.get("content")
+    return m.get("role") == "system" and isinstance(c, str) and c.startswith(("[trigger ", "[subconscious]"))
 
 def start_triggers():
+    """Only this thread writes trigger files. Its sole contract with the turn loop is the
+    stream itself: fires are appended to it, and the agent's replies read back from it are
+    the verdicts (hold while unanswered, back off on [IDLE])."""
     trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
     trig_dir.mkdir(parents=True, exist_ok=True)
+    stream = f"{AGENT_DIR}/messages.jsonl"
+    pending, cursor = set(), 0  # unanswered fires + how far we've read our own stream
+
+    def adjust(fired, active):
+        # the reply is the verdict: defer every backoff trigger; reset the ones that woke
+        # this turn if it did work, double them toward the cap if it was [IDLE]
+        for f in trig_dir.glob("*.json"):
+            try:
+                job = json.loads(f.read_text())
+                if not job.get("backoff"): continue
+                cur = job.get("cur_s", job["repeat_s"])
+                if f.stem in fired:
+                    cur = job["repeat_s"] if active else min(cur * 2, job["backoff"])
+                    job["cur_s"] = cur
+                job["next"] = time.time() + cur
+                f.write_text(json.dumps(job))
+            except Exception: continue
+
+    def consume(verdict=True):
+        # advance over new stream lines: track unanswered fires, verdict each assistant turn
+        nonlocal cursor
+        try: size = os.path.getsize(stream)
+        except OSError: return
+        if size < cursor:  # stash rewrote the stream: rebuild the view, don't replay verdicts
+            cursor, verdict = 0, False
+            pending.clear()
+        if size == cursor: return
+        with open(stream, "rb") as sf:
+            sf.seek(cursor)
+            raw = sf.read(size - cursor)
+        whole = raw.rfind(b"\n") + 1  # a partially-written tail line waits for the next tick
+        cursor += whole
+        for line in raw[:whole].decode("utf-8", errors="replace").splitlines():
+            try: m = json.loads(line)
+            except Exception: continue
+            c = m.get("content")
+            if m.get("role") == "assistant":
+                if verdict:
+                    idle = not m.get("tool_calls") and (not c or str(c).strip().startswith("[IDLE]"))
+                    adjust(pending, active=not idle)
+                pending.clear()
+            elif m.get("role") == "system" and isinstance(c, str) and c.startswith("[trigger "):
+                pending.add(c.split("]", 1)[0][9:])
+
+    consume(verdict=False)  # seed from history: holds survive restarts, verdicts don't replay
 
     def loop():
         while True:
             try:
+                consume()
                 ts = time.time()
-                pending = _pending_triggers()
                 for f in trig_dir.glob("*.json"):
                     try: job = json.loads(f.read_text())
                     except Exception: continue
                     if f.stem in pending: continue  # one unanswered fire in flight; hold, lose nothing
                     if job.get("next", 0 if "watch" in job or "cmd" in job else float("inf")) > ts: continue
                     delta = None
-                    if w := job.get("watch"):
-                        if "cmd" in job:  # cmd gets only new bytes on stdin; starts at install; can't see its own fires
-                            try: size = os.path.getsize(w)
-                            except OSError: continue
-                            pos = job.get("pos")
+                    if w := job.get("watch"):  # fire on file change; repeat_s = cooldown
+                        try: h = hashlib.sha256(open(w, "rb").read()).hexdigest()
+                        except OSError: continue
+                        if h == job.get("seen"): continue
+                        job["seen"] = h
+                        if "cmd" in job:  # the cmd is fed each appended byte exactly once, via stdin
+                            pos, size = job.get("pos"), os.path.getsize(w)
                             if pos is None or pos > size:
-                                job["pos"] = size
+                                job["pos"] = size  # start at install (or after a shrinking rewrite)
                                 f.write_text(json.dumps(job))
                                 continue
-                            if size == pos: continue
                             with open(w, "rb") as wf:
                                 wf.seek(pos)
                                 raw = wf.read()
                             job["pos"] = pos + len(raw)
                             delta = "\n".join(l for l in raw.decode("utf-8", errors="replace").splitlines()
-                                              if "[trigger " not in l and "[subconscious]" not in l)
-                            if not delta:
+                                              if not _is_machinery(l))
+                            if not delta.strip():  # only our own fires / machinery arrived; nothing to judge
                                 f.write_text(json.dumps(job))
                                 continue
-                        else:  # fire on file change instead of clock; repeat_s = cooldown
-                            try: h = hashlib.sha256(open(w, "rb").read()).hexdigest()
-                            except OSError: continue
-                            if h == job.get("seen"): continue
-                            job["seen"] = h
                     msg = job.get("message", "")
                     if c := job.get("cmd"):  # computed condition: fire with stdout; no output = no fire
                         try:
@@ -500,9 +535,6 @@ def start_triggers():
                             f.write_text(json.dumps(job))
                             continue
                     append_msg({"role": "system", "content": f"[trigger {f.stem}] {msg}"})
-                    if delta is not None:
-                        try: job["pos"] = os.path.getsize(w)  # absorb own fire when watching own stream
-                        except OSError: pass
                     if job.get("repeat_s"):
                         job["next"] = ts + job.get("cur_s", job["repeat_s"])
                         f.write_text(json.dumps(job))
@@ -583,36 +615,6 @@ def _react(mid, emoji):
                   "reaction": [{"type":"emoji","emoji":emoji}] if emoji else []}, timeout=10)
     except Exception: pass
 
-def _fired_triggers(messages):
-    """Names of triggers that fired since the previous assistant turn — the ones that woke this turn."""
-    fired = set()
-    for m in reversed(messages):
-        if m.get("role") == "assistant":
-            break
-        c = m.get("content")
-        if m.get("role") == "system" and isinstance(c, str) and c.startswith("[trigger "):
-            fired.add(c.split("]", 1)[0][9:])
-    return fired
-
-def _adjust_backoff(active, fired):
-    """Backoff triggers are idle timers: every turn defers next, so they fire only after
-    cur_s of silence. The reply is the verdict for the triggers that woke this turn:
-    [IDLE] doubles their interval (up to backoff), anything else resets it to repeat_s.
-    Useless wakers quiet down on their own; useful ones stay prompt."""
-    for f in pathlib.Path(f"{AGENT_DIR}/triggers").glob("*.json"):
-        try:
-            job = json.loads(f.read_text())
-            if not job.get("backoff"):
-                continue
-            cur = job.get("cur_s", job["repeat_s"])
-            if f.stem in fired:
-                cur = job["repeat_s"] if active else min(cur * 2, job["backoff"])
-                job["cur_s"] = cur
-            job["next"] = time.time() + cur
-            f.write_text(json.dumps(job))
-        except Exception:
-            continue
-
 def serialize_assistant(msg):
     out = {"role": "assistant", "content": msg.get("content") or ""}
     if msg.get("reasoning_content"):
@@ -684,14 +686,11 @@ def main():
         assistant = serialize_assistant(msg)
 
         if not assistant.get("tool_calls"):
-            fired = _fired_triggers(messages)
             append_msg(assistant)
             last_hash = file_hash()
             text = (msg.get("content") or "").strip()
-            idle = not text or text.startswith("[IDLE]")
-            if not idle:  # idle sentinel, see SOUL.md
+            if text and not text.startswith("[IDLE]"):  # idle sentinel, see SOUL.md
                 send_chat({"text": text})
-            _adjust_backoff(active=not idle, fired=fired)
             tool_called = False
             continue
 
@@ -713,7 +712,6 @@ def main():
             for tm in tool_results:
                 append_msg(tm)
         last_hash = file_hash()
-        _adjust_backoff(active=True, fired=_fired_triggers(messages))
         tool_called = True
 
 if __name__ == "__main__":
