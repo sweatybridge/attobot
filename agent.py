@@ -133,9 +133,13 @@ _TG_MEDIA = {
     "mp3": ("sendAudio", "audio"), "m4a": ("sendAudio", "audio"), "wav": ("sendAudio", "audio"),
 }
 
-def _tg_send(endpoint, payload, files=None):
-    """Post to the telegram API; returns an error string or None. Failures land in LIFE."""
-    r = requests.post(f"https://api.telegram.org/bot{CFG['telegram_token']}/{endpoint}",
+def _tg_send(endpoint, payload, files=None, cfg=None):
+    """Post to an agent's chat via the telegram API; returns an error string or None. Failures land in LIFE."""
+    cfg = cfg or CFG
+    payload = {"chat_id": cfg["telegram_chat_id"], **payload}
+    if cfg.get("telegram_thread_id"):
+        payload["message_thread_id"] = cfg["telegram_thread_id"]
+    r = requests.post(f"https://api.telegram.org/bot{cfg['telegram_token']}/{endpoint}",
                       data=payload, files=files, timeout=60)
     data = r.json()
     if not data.get("ok"):
@@ -146,26 +150,20 @@ def _tg_send(endpoint, payload, files=None):
 def send_chat(args):
     if not CFG.get("telegram_token"):
         return "no chat configured"
-    base = {"chat_id": CFG["telegram_chat_id"]}
-    if CFG.get("telegram_thread_id"):
-        base["message_thread_id"] = CFG["telegram_thread_id"]
     text = args.get("text", "")
-    path = args.get("path")
-    if path:
+    if path := args.get("path"):
         ext = pathlib.Path(path).suffix.lower().lstrip(".")
         endpoint, field = _TG_MEDIA.get(ext, ("sendDocument", "document"))
         with open(path, "rb") as f:
-            err = _tg_send(endpoint, {**base, "caption": text[:1024]}, files={field: f})
-        while _pending_reactions:
-            _react(_pending_reactions.pop(), "")
-        return err or f"sent {field} {path}"
-    errors = []
-    for i in range(0, len(text), CFG["chat_msg_max"]):
-        if err := _tg_send("sendMessage", {**base, "text": text[i:i+CFG['chat_msg_max']]}):
-            errors.append(err)
+            err = _tg_send(endpoint, {"caption": text[:1024]}, files={field: f})
+        result = err or f"sent {field} {path}"
+    else:
+        errors = [err for i in range(0, len(text), CFG["chat_msg_max"])
+                  if (err := _tg_send("sendMessage", {"text": text[i:i+CFG['chat_msg_max']]}))]
+        result = errors[0] if errors else "sent"
     while _pending_reactions:
         _react(_pending_reactions.pop(), "")
-    return errors[0] if errors else "sent"
+    return result
 
 def stash(content):
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
@@ -284,11 +282,7 @@ def append_message(args):
         try:
             tcfg = json.loads(open(f"{d}/config.json").read())
             if tcfg.get("telegram_token"):
-                base = {"chat_id": tcfg["telegram_chat_id"]}
-                if tcfg.get("telegram_thread_id"):
-                    base["message_thread_id"] = tcfg["telegram_thread_id"]
-                requests.post(f"https://api.telegram.org/bot{tcfg['telegram_token']}/sendMessage",
-                              data={**base, "text": args["content"][:4000]}, timeout=45)
+                _tg_send("sendMessage", {"text": args["content"][:4000]}, cfg=tcfg)
         except Exception:
             pass
     return f"appended to {d}/messages.jsonl"
@@ -318,23 +312,22 @@ TOOLS = [
 TOOL_FNS = {n: f for n, f, _, _ in TOOLS}
 TOOL_SCHEMAS = [{"type": "function", "function": {"name": n, "description": d, "parameters": p}} for n, _, d, p in TOOLS]
 
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 def load_agent_tools():
-    tools_dir = pathlib.Path(f"{AGENT_DIR}/tools")
-    for path in sorted(tools_dir.glob("*.py")):
-        spec = importlib.util.spec_from_file_location(path.stem, path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+    for path in sorted(pathlib.Path(f"{AGENT_DIR}/tools").glob("*.py")):
+        mod = _load_module(path.stem, path)
         TOOL_FNS[mod.NAME] = mod.run
         TOOL_SCHEMAS.append({"type": "function", "function": {
             "name": mod.NAME, "description": mod.DESCRIPTION, "parameters": mod.PARAMETERS}})
 
 def _load_provider():
     global _chat_fn
-    path = pathlib.Path(f"{AGENT_DIR}/providers/{CFG['provider']}.py")
-    spec = importlib.util.spec_from_file_location(f"provider_{CFG['provider']}", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _chat_fn = mod.chat
+    _chat_fn = _load_module(f"provider_{CFG['provider']}", f"{AGENT_DIR}/providers/{CFG['provider']}.py").chat
 
 # ---------- background tool wrapper ----------
 
@@ -407,20 +400,11 @@ def start_chat():
                         continue
                     if msg_cid != locked_cid or msg_tid != locked_tid:
                         continue  # not our chat/topic — drop silently (no bus, no LIFE)
-                    text = msg.get("text") or ""
-                    caption = msg.get("caption") or ""
-                    file_id = None
                     if msg.get("photo"):
                         file_id = max(msg["photo"], key=lambda p: p.get("file_size", 0))["file_id"]
-                    elif msg.get("document"):
-                        file_id = msg["document"]["file_id"]
-                    elif msg.get("voice"):
-                        file_id = msg["voice"]["file_id"]
-                    elif msg.get("video"):
-                        file_id = msg["video"]["file_id"]
-                    elif msg.get("audio"):
-                        file_id = msg["audio"]["file_id"]
-                    appended = False
+                    else:
+                        file_id = next((msg[k]["file_id"] for k in ("document", "voice", "video", "audio") if msg.get(k)), None)
+                    body = msg.get("text") or ""
                     if file_id:
                         meta = requests.get(f"https://api.telegram.org/bot{token}/getFile",
                                             params={"file_id": file_id}, timeout=30).json()
@@ -430,13 +414,12 @@ def start_chat():
                         inbound.mkdir(parents=True, exist_ok=True)
                         save = inbound / f"{u['update_id']}_{rel.rsplit('/', 1)[-1]}"
                         save.write_bytes(blob)
+                        caption = msg.get("caption") or ""
                         body = f"(file: {save})" + (f" {caption}" if caption else "")
-                        append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {body}"})
-                        appended = True
-                    elif text:
-                        append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {text}"})
-                        appended = True
-                    if appended and (mid := msg.get("message_id")):
+                    if not body:
+                        continue
+                    append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {body}"})
+                    if mid := msg.get("message_id"):
                         _pending_reactions.append(mid)
                         _react(mid, "👀")
                 if advanced:
@@ -458,6 +441,9 @@ def start_triggers():
     the verdicts (hold while unanswered, back off on [IDLE])."""
     trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
     trig_dir.mkdir(parents=True, exist_ok=True)
+    heartbeat = trig_dir / "heartbeat.json"
+    if not heartbeat.exists():
+        heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "backoff": 3600, "message": "tick"}))
     stream = f"{AGENT_DIR}/messages.jsonl"
     pending, cursor = set(), 0  # unanswered fires + how far we've read our own stream
 
@@ -666,10 +652,6 @@ def main():
         _load_provider()
     pathlib.Path(f"{AGENT_DIR}/MEMORY.md").touch(exist_ok=True)
     pathlib.Path(f"{AGENT_DIR}/messages.jsonl").touch(exist_ok=True)
-    heartbeat = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
-    heartbeat.parent.mkdir(parents=True, exist_ok=True)
-    if not heartbeat.exists():
-        heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "backoff": 3600, "message": "tick"}))
     if CFG.get("telegram_token"):  # no token → no chat channel; agent wakes on triggers/mail only
         start_chat()
     start_triggers()
