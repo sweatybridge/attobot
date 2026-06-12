@@ -419,14 +419,16 @@ def _is_machinery(line):
     return m.get("role") == "system" and str(m.get("content", "")).startswith(("[trigger ", "[subconscious]"))
 
 def _is_idle_turn(m):
-    """An idle reply: bare [IDLE]/empty content with no tools, or whose only action is
-    SEND_CHAT-ing [IDLE]. Treated like a content [IDLE] — suppressed, turn ends, no loop."""
+    """An idle reply: content that is empty or starts/ends with [IDLE] with no tools, or whose
+    only action is SEND_CHAT-ing such content. A trailing [IDLE] is the agent's own closing
+    verdict even when narration precedes it. Suppressed, turn ends, no loop."""
+    def idle_text(t):
+        return not t or t.startswith("[IDLE]") or t.endswith("[IDLE]")
     if m.get("role") != "assistant":
         return False
     tcs = m.get("tool_calls") or []
     if not tcs:
-        c = (m.get("content") or "").strip()
-        return not c or c.startswith("[IDLE]")
+        return idle_text((m.get("content") or "").strip())
     for tc in tcs:
         if tc.get("function", {}).get("name") != "SEND_CHAT":
             return False
@@ -434,7 +436,7 @@ def _is_idle_turn(m):
             text = str(json.loads(tc["function"].get("arguments") or "{}").get("text", "")).strip()
         except Exception:
             return False
-        if not text.startswith("[IDLE]"):
+        if not text or not idle_text(text):
             return False
     return True
 
@@ -451,16 +453,15 @@ def start_triggers():
     pending, cursor = set(), 0  # unanswered fires + how far we've read our own stream
 
     def adjust(fired, active):
-        # the reply is the verdict: defer every backoff trigger; reset the ones that woke
-        # this turn if it did work, double them toward the cap if it was [IDLE]
+        # the reply is the verdict for the triggers that woke this turn: reset them if it
+        # did work, double them toward the cap if it was [IDLE]. Others keep their schedule —
+        # a fast wake-loop must not starve the rest.
         for f in trig_dir.glob("*.json"):
             try:
                 job = json.loads(f.read_text())
-                if not job.get("backoff"): continue
-                cur = job.get("cur_s", job["repeat_s"])
-                if f.stem in fired:
-                    cur = job["repeat_s"] if active else min(cur * 2, job["backoff"])
-                    job["cur_s"] = cur
+                if not job.get("backoff") or f.stem not in fired: continue
+                cur = job["repeat_s"] if active else min(job.get("cur_s", job["repeat_s"]) * 2, job["backoff"])
+                job["cur_s"] = cur
                 job["next"] = time.time() + cur
                 f.write_text(json.dumps(job))
             except Exception: continue
@@ -610,7 +611,9 @@ def build_system():
 
 def life_block():
     earlier, tail = _life_tail()
-    return f"<life>\n[{earlier} bytes earlier]\n{tail}</life>"
+    return (f"<life>\n[harness] the tail of your own LIFE.md — your past turns, attached to "
+            f"every wake. Not a message: nobody sent it, and seeing it is not an event.\n"
+            f"[{earlier} bytes earlier]\n{tail}</life>")
 
 _pending_reactions = []
 
