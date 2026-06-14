@@ -272,6 +272,8 @@ def append_message(args):
     return f"appended to {d}/messages.jsonl"
 
 TOOLS = [
+    ("heartbeat_idle", lambda args: "heartbeat_idle is only valid immediately after a `[trigger heartbeat] tick`; it had no effect and did not back off the heartbeat, which continues at its current interval.", "Respond to a heartbeat tick when there is nothing to do. Ends your turn without acting.",
+        {"type": "object", "properties": {}}),
     ("APPEND_MESSAGE", append_message, "Inject a message into an agent's messages.jsonl (default: your own). The owning agent wakes on it. `dir` targets a sibling agent dir — the message also surfaces to that agent's chat if it has one. `role` defaults to system.",
         {"type": "object", "properties": {"content": {"type": "string"}, "role": {"type": "string"}, "dir": {"type": "string"}}, "required": ["content"]}),
     ("SEND_CHAT", send_chat, "Send a message to the chat. With just `text`, sends a normal text message. With `path`, sends that file as an attachment (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise); `text` becomes the caption (capped at 1024 chars by telegram).",
@@ -410,25 +412,6 @@ def start_chat():
                 time.sleep(5)
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
-
-def _is_idle_turn(m):
-    def idle_text(t):
-        return not t or t.startswith("[IDLE]") or t.endswith("[IDLE]")
-    if m.get("role") != "assistant":
-        return False
-    tcs = m.get("tool_calls") or []
-    if not tcs:
-        return idle_text((m.get("content") or "").strip())
-    for tc in tcs:
-        if tc.get("function", {}).get("name") != "SEND_CHAT":
-            return False
-        try:
-            text = str(json.loads(tc["function"].get("arguments") or "{}").get("text", "")).strip()
-        except Exception:
-            return False
-        if not text or not idle_text(text):
-            return False
-    return True
 
 def _heartbeat_backoff(active):
     f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
@@ -630,7 +613,8 @@ def main():
             tools=TOOL_SCHEMAS))
         owe_turn = False
 
-        if _is_idle_turn(assistant):
+        if (any(tc["function"]["name"] == "heartbeat_idle" for tc in (assistant.get("tool_calls") or []))
+                and messages and str(messages[-1].get("content", "")).startswith("[trigger heartbeat]")):
             _heartbeat_backoff(active=False)
         elif not assistant.get("tool_calls"):
             append_msg(assistant)
