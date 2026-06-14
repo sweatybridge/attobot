@@ -30,25 +30,23 @@ os.makedirs(f"{AGENT_DIR}/memory", exist_ok=True)
 
 def life(event, agent_dir=AGENT_DIR):
     with open(f"{agent_dir}/LIFE.md", "a") as f:
-        f.write(f"[{time.strftime('%Y%m%dT%H%M%S')}] {event}\n")
+        f.write(f"[{time.strftime('%Y%m%dT%H%M%S')}] {_preview(event)}\n")
 
-def _preview(s, n=100):
+def _preview(s, n=200):
     if not isinstance(s, str):
         s = repr(s)
+    s = s.replace("\n", "\\n")
     if len(s) <= n:
         return s
     h = n // 2
     return f"{s[:h]}…{s[-h:]}"
 
-def _parse_msg(line):
-    """The only way a line becomes a message: a json dict, or None — anything else isn't a message."""
+def _msg(line):
     try: m = json.loads(line)
-    except Exception: return None
-    return m if isinstance(m, dict) else None
+    except Exception: return {}
+    return m if isinstance(m, dict) else {}
 
 def load_messages():
-    """The stream is a sequence of json values; the messages are the dicts with a role.
-    Scanning value-by-value makes torn writes (fused or truncated lines) a non-event."""
     s, dec, out, i = open(f"{AGENT_DIR}/messages.jsonl").read(), json.JSONDecoder(), [], 0
     while i < len(s):
         if s[i].isspace():
@@ -68,22 +66,21 @@ def _msg_summary(m):
     role = m.get("role", "?")
     if role == "assistant" and m.get("tool_calls"):
         calls = ", ".join(
-            f"{tc['function']['name']}({_preview(tc['function'].get('arguments', ''))})"
+            f"{tc['function']['name']}({tc['function'].get('arguments', '')})"
             for tc in m["tool_calls"]
         )
         content = m.get("content") or ""
-        return _preview(f"assistant {calls}" + (f" {content}" if content else ""))
+        return f"assistant {calls}" + (f" {content}" if content else "")
     if role == "tool":
-        return f"tool {m.get('tool_call_id', '?')}: {_preview(m.get('content', ''))}"
-    return f"{role}: {_preview(m.get('content', ''))}"
+        return f"tool {m.get('tool_call_id', '?')}: {m.get('content', '')}"
+    return f"{role}: {m.get('content', '')}"
 
 def append_msg(m, agent_dir=AGENT_DIR):
     with _append_lock:
         with open(f"{agent_dir}/messages.jsonl", "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             f.write(json.dumps(m) + "\n")
-    if not _is_idle_turn(m):  # idle markers are harness state, not life events
-        life(_msg_summary(m), agent_dir)
+    life(_msg_summary(m), agent_dir)
 
 def _default_chat(messages, tools):
     body = {
@@ -231,9 +228,9 @@ def stash_messages(args):
     else:
         s, e = n // 4, (3 * n) // 4
 
-    while s < n and (_parse_msg(lines[s]) or {}).get("role") not in ("user", "system"):
+    while s < n and _msg(lines[s]).get("role") == "tool":
         s += 1
-    while e < n and (_parse_msg(lines[e]) or {}).get("role") not in ("user", "system"):
+    while e < n and _msg(lines[e]).get("role") == "tool":
         e += 1
     if s >= e:
         return "nothing safe to stash"
@@ -242,25 +239,25 @@ def stash_messages(args):
     target = "\n".join(lines[s:e])
     try:
         response = _chat_fn(
-            [{"role": "user", "content": "Summarize this conversation segment in 2-4 sentences. Be terse, factual.\n\n" + target}],
+            [{"role": "user", "content": "Summarize this conversation segment in 1 paragraph. Be terse, factual.\n\n" + target}],
             None,
         )
         summary = (response.get("content") or "").strip()
     except Exception as exc:
         summary = f"(summary failed: {exc})"
     marker = stash(target)
-    placeholder = json.dumps({"role": "system", "content": f"<lines {start}-{end} stashed: {marker}>\nsummary: {summary}"})
+    placeholder = json.dumps({"role": "system", "content": f"<{end - start + 1} lines stashed to {marker}>\nsummary: {summary}"})
 
     with open(path, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         content = f.read()
         if target not in content:
-            return "error: target range no longer in file (file was modified)"
+            return "stash failed because target range no longer in file (file was modified)"
         new_content = content.replace(target, placeholder, 1)
         f.seek(0)
         f.truncate()
         f.write(new_content)
-    return f"stashed lines {start}-{end} ({end-start+1} → 1). summary: {_preview(summary)}"
+    return f"{end - start + 1} lines stashed to {marker}"
 
 def append_message(args):
     d = args.get("dir") or AGENT_DIR
@@ -414,15 +411,7 @@ def start_chat():
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
 
-def _is_machinery(line):
-    """A genuine harness system message (trigger fire / subconscious note) — not e.g. an operator quoting one."""
-    m = _parse_msg(line) or {}
-    return m.get("role") == "system" and str(m.get("content", "")).startswith(("[trigger ", "[subconscious]"))
-
 def _is_idle_turn(m):
-    """An idle reply: content that is empty or starts/ends with [IDLE] with no tools, or whose
-    only action is SEND_CHAT-ing such content. A trailing [IDLE] is the agent's own closing
-    verdict even when narration precedes it. Suppressed, turn ends, no loop."""
     def idle_text(t):
         return not t or t.startswith("[IDLE]") or t.endswith("[IDLE]")
     if m.get("role") != "assistant":
@@ -441,37 +430,22 @@ def _is_idle_turn(m):
             return False
     return True
 
-def _verdict_pending(active):
-    """Apply this turn's verdict directly to any trigger files marked pending. Replaces
-    the trigger-thread's stream-tail verdict path: state lives in each trigger's json,
-    not in messages.jsonl, so the stream doesn't need to carry [IDLE] markers as the
-    signal. Returns the min cur_s among backoff-enabled pending triggers (∞ if none)."""
-    trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
-    min_next = float("inf")
-    for f in trig_dir.glob("*.json"):
-        try:
-            job = json.loads(f.read_text())
-            if not job.get("pending"): continue
-            if job.get("backoff"):
-                cur = job["repeat_s"] if active else min(
-                    job.get("cur_s", job["repeat_s"]) * 2, job["backoff"])
-                job["cur_s"] = cur
-                job["next"] = time.time() + cur
-                min_next = min(min_next, cur)
-            job["pending"] = False
-            f.write_text(json.dumps(job))
-        except Exception: continue
-    return min_next
+def _heartbeat_backoff(active):
+    f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
+    try:
+        job = json.loads(f.read_text())
+    except Exception:
+        return
+    job["idles"] = 0 if active else job.get("idles", 0) + 1
+    job["next"] = time.time() + min(job["repeat_s"] * 2 ** job["idles"], job.get("cap", 3600))
+    f.write_text(json.dumps(job))
 
 def start_triggers():
-    """This thread fires due triggers, marks them pending in their own json, and lets the
-    main loop apply the verdict by editing the file directly via _verdict_pending(). The
-    stream stays clean of [IDLE] verdict markers — state lives in the trigger files."""
     trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
     trig_dir.mkdir(parents=True, exist_ok=True)
     heartbeat = trig_dir / "heartbeat.json"
     if not heartbeat.exists():
-        heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "backoff": 3600, "message": "tick"}))
+        heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "cap": 3600, "message": "tick"}))
 
     def loop():
         while True:
@@ -480,7 +454,6 @@ def start_triggers():
                 for f in trig_dir.glob("*.json"):
                     try: job = json.loads(f.read_text())
                     except Exception: continue
-                    if job.get("pending"): continue  # one unanswered fire in flight; hold, lose nothing
                     if job.get("next", 0 if "watch" in job or "cmd" in job else float("inf")) > ts: continue
                     delta = None
                     if w := job.get("watch"):  # fire on file change; repeat_s = cooldown
@@ -498,9 +471,8 @@ def start_triggers():
                                 wf.seek(pos)
                                 raw = wf.read()
                             job["pos"] = pos + len(raw)
-                            delta = "\n".join(l for l in raw.decode("utf-8", errors="replace").splitlines()
-                                              if not _is_machinery(l))
-                            if not delta.strip():  # only our own fires / machinery arrived; nothing to judge
+                            delta = "\n".join(l for l in raw.decode("utf-8", errors="replace").splitlines() if _msg(l).get("role") != "system")
+                            if not delta.strip():
                                 f.write_text(json.dumps(job))
                                 continue
                     msg = job.get("message", "")
@@ -511,17 +483,13 @@ def start_triggers():
                         except Exception as e:
                             msg = f"(cmd error: {e})"
                         if not msg:
-                            if job.get("repeat_s"): job["next"] = ts + job.get("cur_s", job["repeat_s"])
+                            if job.get("repeat_s"): job["next"] = ts + job["repeat_s"]
                             f.write_text(json.dumps(job))
                             continue
-                    # Mark pending in the file BEFORE publishing the [trigger ...] stream
-                    # event, so _verdict_pending() in the main loop always sees the pending
-                    # flag when it wakes from the stream change.
                     one_shot = not (job.get("repeat_s") or job.get("watch"))
                     if not one_shot:
-                        job["pending"] = True
                         if job.get("repeat_s"):
-                            job["next"] = ts + job.get("cur_s", job["repeat_s"])
+                            job["next"] = ts + job["repeat_s"]
                         f.write_text(json.dumps(job))
                     append_msg({"role": "system", "content": f"[trigger {f.stem}] {msg}"})
                     if one_shot:
@@ -646,71 +614,45 @@ def main():
         return hashlib.sha256(open(f"{AGENT_DIR}/messages.jsonl", "rb").read()).hexdigest()
 
     last_hash = file_hash()
-    messages = load_messages()
-    tool_called = False
+    owe_turn = False
     while True:
-        cur_hash = file_hash()
-        if cur_hash == last_hash and not tool_called:
+        if not owe_turn and file_hash() == last_hash:
             time.sleep(1)
             continue
-        messages = load_messages()
-        last_hash = cur_hash
 
-        system = build_system()
-        life = life_block()
-        total_chars = len(system) + len(life) + sum(len(json.dumps(m)) for m in messages)
-        if total_chars > CFG["context_tokens"] * 4 * 0.8:
-            result = stash_messages({})
-            append_msg({"role": "system", "content": f"[stash_messages] {result}"})
-            messages = load_messages()
-            last_hash = file_hash()
-            system = build_system()
-            life = life_block()
+        system, life_tail, messages = build_system(), life_block(), load_messages()
+        if len(system) + len(life_tail) + sum(len(json.dumps(m)) for m in messages) > (CFG["context_tokens"] * 4 * 0.8): # ≈4 chars/token, 20% buffer
+            append_msg({"role": "system", "content": f"[stash_messages] {stash_messages({})}"})
+            system, life_tail, messages = build_system(), life_block(), load_messages()
 
-        msg = llm([{"role": "system", "content": system}] + messages + [{"role": "system", "content": life}], tools=TOOL_SCHEMAS)
-        assistant = serialize_assistant(msg)
+        assistant = serialize_assistant(llm(
+            [{"role": "system", "content": system}] + messages + [{"role": "system", "content": life_tail}],
+            tools=TOOL_SCHEMAS))
+        owe_turn = False
 
-        # Idle turn — apply backoff verdict directly to pending triggers (no stream marker
-        # needed for that). Then collapse: only persist one [IDLE] per run so the model's
-        # context doesn't fill with self-reinforcing idles.
         if _is_idle_turn(assistant):
-            next_s = _verdict_pending(active=False)
-            last_asst = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
-            if not (last_asst and _is_idle_turn(last_asst)):
-                hint = f" (next ~{int(next_s)//60}m)" if next_s != float("inf") else ""
-                append_msg({"role": "assistant", "content": f"[IDLE]{hint}"})
-            last_hash = file_hash()
-            tool_called = False
-            continue
-
-        if not assistant.get("tool_calls"):
+            _heartbeat_backoff(active=False)
+        elif not assistant.get("tool_calls"):
             append_msg(assistant)
-            _verdict_pending(active=True)
-            last_hash = file_hash()
-            send_chat({"text": (msg.get("content") or "").strip()})
-            tool_called = False
-            continue
+            _heartbeat_backoff(active=True)
+            send_chat({"text": (assistant.get("content") or "").strip()})
+        else:
+            tool_results = []
+            for tc in assistant["tool_calls"]:
+                name = tc["function"]["name"]
+                try:
+                    result = bg_run(name, json.loads(tc["function"]["arguments"]), tc["id"], TOOL_FNS[name])
+                except Exception as e:
+                    result = f"error: {e}"
+                tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+            with _append_lock:
+                append_msg(assistant)
+                for tm in tool_results:
+                    append_msg(tm)
+            _heartbeat_backoff(active=True)
+            owe_turn = True
 
-        # Run all tools first; collect results without writing anything yet so
-        # daemon appends during bg_run can't interleave between assistant and tool results.
-        tool_results = []
-        for tc in assistant["tool_calls"]:
-            name = tc["function"]["name"]
-            try:
-                tc_args = json.loads(tc["function"]["arguments"])
-                result = bg_run(name, tc_args, tc["id"], TOOL_FNS[name])
-            except Exception as e:
-                result = f"error: {e}"
-            tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-
-        # Atomic flush: lock blocks daemons + bg emit threads from interleaving.
-        with _append_lock:
-            append_msg(assistant)
-            for tm in tool_results:
-                append_msg(tm)
-        _verdict_pending(active=True)
         last_hash = file_hash()
-        tool_called = True
 
 if __name__ == "__main__":
     for extra in sys.argv[2:]:  # extra agent dirs each get their own process
