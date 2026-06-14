@@ -551,10 +551,7 @@ def start_triggers():
     threading.Thread(target=loop, daemon=True, name="triggers").start()
 
 def start_inbox():
-    # Attobot agents run with AGENT_DIR=/home/<agent>/agent. Mail is delivered
-    # via the FUSE workspace inbox at /matron/workspaces/<agent>/inbox/.
-    agent_name = os.path.basename(os.path.dirname(os.path.abspath(AGENT_DIR)))
-    inbox = pathlib.Path(f"/matron/workspaces/{agent_name}/inbox")
+    inbox = pathlib.Path(f"{AGENT_DIR}/mail_inbox")
     inbox.mkdir(parents=True, exist_ok=True)
 
     def deliver(drop):
