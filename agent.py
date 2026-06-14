@@ -82,7 +82,8 @@ def append_msg(m, agent_dir=AGENT_DIR):
         with open(f"{agent_dir}/messages.jsonl", "a") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             f.write(json.dumps(m) + "\n")
-    life(_msg_summary(m), agent_dir)
+    if not _is_idle_turn(m):  # idle markers are harness state, not life events
+        life(_msg_summary(m), agent_dir)
 
 def _default_chat(messages, tools):
     body = {
@@ -440,69 +441,46 @@ def _is_idle_turn(m):
             return False
     return True
 
+def _verdict_pending(active):
+    """Apply this turn's verdict directly to any trigger files marked pending. Replaces
+    the trigger-thread's stream-tail verdict path: state lives in each trigger's json,
+    not in messages.jsonl, so the stream doesn't need to carry [IDLE] markers as the
+    signal. Returns the min cur_s among backoff-enabled pending triggers (∞ if none)."""
+    trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
+    min_next = float("inf")
+    for f in trig_dir.glob("*.json"):
+        try:
+            job = json.loads(f.read_text())
+            if not job.get("pending"): continue
+            if job.get("backoff"):
+                cur = job["repeat_s"] if active else min(
+                    job.get("cur_s", job["repeat_s"]) * 2, job["backoff"])
+                job["cur_s"] = cur
+                job["next"] = time.time() + cur
+                min_next = min(min_next, cur)
+            job["pending"] = False
+            f.write_text(json.dumps(job))
+        except Exception: continue
+    return min_next
+
 def start_triggers():
-    """Only this thread writes trigger files. Its sole contract with the turn loop is the
-    stream itself: fires are appended to it, and the agent's replies read back from it are
-    the verdicts (hold while unanswered, back off on [IDLE])."""
+    """This thread fires due triggers, marks them pending in their own json, and lets the
+    main loop apply the verdict by editing the file directly via _verdict_pending(). The
+    stream stays clean of [IDLE] verdict markers — state lives in the trigger files."""
     trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
     trig_dir.mkdir(parents=True, exist_ok=True)
     heartbeat = trig_dir / "heartbeat.json"
     if not heartbeat.exists():
         heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "backoff": 3600, "message": "tick"}))
-    stream = f"{AGENT_DIR}/messages.jsonl"
-    pending, cursor = set(), 0  # unanswered fires + how far we've read our own stream
-
-    def adjust(fired, active):
-        # the reply is the verdict for the triggers that woke this turn: reset them if it
-        # did work, double them toward the cap if it was [IDLE]. Others keep their schedule —
-        # a fast wake-loop must not starve the rest.
-        for f in trig_dir.glob("*.json"):
-            try:
-                job = json.loads(f.read_text())
-                if not job.get("backoff") or f.stem not in fired: continue
-                cur = job["repeat_s"] if active else min(job.get("cur_s", job["repeat_s"]) * 2, job["backoff"])
-                job["cur_s"] = cur
-                job["next"] = time.time() + cur
-                f.write_text(json.dumps(job))
-            except Exception: continue
-
-    def consume(verdict=True):
-        # advance over new stream lines: track unanswered fires, verdict each assistant turn
-        nonlocal cursor
-        try: size = os.path.getsize(stream)
-        except OSError: return
-        if size < cursor:  # stash rewrote the stream: rebuild the view, don't replay verdicts
-            cursor, verdict = 0, False
-            pending.clear()
-        if size == cursor: return
-        with open(stream, "rb") as sf:
-            sf.seek(cursor)
-            raw = sf.read(size - cursor)
-        whole = raw.rfind(b"\n") + 1  # a partially-written tail line waits for the next tick
-        cursor += whole
-        for line in raw[:whole].decode("utf-8", errors="replace").splitlines():
-            if not (m := _parse_msg(line)):
-                continue
-            c = m.get("content")
-            if m.get("role") == "assistant":
-                if verdict:
-                    idle = _is_idle_turn(m)
-                    adjust(pending, active=not idle)
-                pending.clear()
-            elif m.get("role") == "system" and isinstance(c, str) and c.startswith("[trigger "):
-                pending.add(c.split("]", 1)[0][9:])
-
-    consume(verdict=False)  # seed from history: holds survive restarts, verdicts don't replay
 
     def loop():
         while True:
             try:
-                consume()
                 ts = time.time()
                 for f in trig_dir.glob("*.json"):
                     try: job = json.loads(f.read_text())
                     except Exception: continue
-                    if f.stem in pending: continue  # one unanswered fire in flight; hold, lose nothing
+                    if job.get("pending"): continue  # one unanswered fire in flight; hold, lose nothing
                     if job.get("next", 0 if "watch" in job or "cmd" in job else float("inf")) > ts: continue
                     delta = None
                     if w := job.get("watch"):  # fire on file change; repeat_s = cooldown
@@ -536,13 +514,17 @@ def start_triggers():
                             if job.get("repeat_s"): job["next"] = ts + job.get("cur_s", job["repeat_s"])
                             f.write_text(json.dumps(job))
                             continue
+                    # Mark pending in the file BEFORE publishing the [trigger ...] stream
+                    # event, so _verdict_pending() in the main loop always sees the pending
+                    # flag when it wakes from the stream change.
+                    one_shot = not (job.get("repeat_s") or job.get("watch"))
+                    if not one_shot:
+                        job["pending"] = True
+                        if job.get("repeat_s"):
+                            job["next"] = ts + job.get("cur_s", job["repeat_s"])
+                        f.write_text(json.dumps(job))
                     append_msg({"role": "system", "content": f"[trigger {f.stem}] {msg}"})
-                    if job.get("repeat_s"):
-                        job["next"] = ts + job.get("cur_s", job["repeat_s"])
-                        f.write_text(json.dumps(job))
-                    elif job.get("watch"):
-                        f.write_text(json.dumps(job))
-                    else:
+                    if one_shot:
                         f.unlink()
             except Exception as e:
                 life(f"[trigger error] {e}")  # log only, don't wake
@@ -688,18 +670,22 @@ def main():
         msg = llm([{"role": "system", "content": system}] + messages + [{"role": "system", "content": life}], tools=TOOL_SCHEMAS)
         assistant = serialize_assistant(msg)
 
-        # Idle turn — bare [IDLE], or its only act is SEND_CHAT-ing [IDLE]: suppress, end the turn.
+        # Idle turn — apply backoff verdict directly to pending triggers (no stream marker
+        # needed for that). Then collapse: only persist one [IDLE] per run so the model's
+        # context doesn't fill with self-reinforcing idles.
         if _is_idle_turn(assistant):
-            with _append_lock:
-                append_msg(assistant)
-                for tc in assistant.get("tool_calls") or []:  # keep the tool protocol valid; nothing sent
-                    append_msg({"role": "tool", "tool_call_id": tc["id"], "content": "[IDLE] suppressed"})
+            next_s = _verdict_pending(active=False)
+            last_asst = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
+            if not (last_asst and _is_idle_turn(last_asst)):
+                hint = f" (next ~{int(next_s)//60}m)" if next_s != float("inf") else ""
+                append_msg({"role": "assistant", "content": f"[IDLE]{hint}"})
             last_hash = file_hash()
             tool_called = False
             continue
 
         if not assistant.get("tool_calls"):
             append_msg(assistant)
+            _verdict_pending(active=True)
             last_hash = file_hash()
             send_chat({"text": (msg.get("content") or "").strip()})
             tool_called = False
@@ -722,6 +708,7 @@ def main():
             append_msg(assistant)
             for tm in tool_results:
                 append_msg(tm)
+        _verdict_pending(active=True)
         last_hash = file_hash()
         tool_called = True
 
