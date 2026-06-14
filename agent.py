@@ -7,7 +7,7 @@ AGENT_DIR = sys.argv[1] if len(sys.argv) > 1 else "agent"
 BLOB_DIR = f"{AGENT_DIR}/blobs"
 
 CFG = { # defaults
-    "model": "kimi-k2.6",
+    "model": "kimi-k2.7-code",
     "api_base": "https://api.moonshot.ai/v1",
     "temperature": 1.0,
     "reasoning_effort": "medium",
@@ -68,7 +68,7 @@ def _msg_summary(m):
     role = m.get("role", "?")
     if role == "assistant" and m.get("tool_calls"):
         calls = ", ".join(
-            f"{tc['function']['name']}({tc['function'].get('arguments', '')})"
+            f"{tc['function']['name']}({_preview(tc['function'].get('arguments', ''))})"
             for tc in m["tool_calls"]
         )
         content = m.get("content") or ""
@@ -551,7 +551,10 @@ def start_triggers():
     threading.Thread(target=loop, daemon=True, name="triggers").start()
 
 def start_inbox():
-    inbox = pathlib.Path(f"{AGENT_DIR}/mail_inbox")
+    # Attobot agents run with AGENT_DIR=/home/<agent>/agent. Mail is delivered
+    # via the FUSE workspace inbox at /matron/workspaces/<agent>/inbox/.
+    agent_name = os.path.basename(os.path.dirname(os.path.abspath(AGENT_DIR)))
+    inbox = pathlib.Path(f"/matron/workspaces/{agent_name}/inbox")
     inbox.mkdir(parents=True, exist_ok=True)
 
     def deliver(drop):
