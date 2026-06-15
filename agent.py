@@ -272,7 +272,7 @@ def append_message(args):
     return f"appended to {d}/messages.jsonl"
 
 TOOLS = [
-    ("heartbeat_idle", lambda args: "heartbeat_idle is only valid immediately after a `[trigger heartbeat] tick`; it had no effect and did not back off the heartbeat, which continues at its current interval.", "Respond to a heartbeat tick when there is nothing to do. Ends your turn without acting.",
+    ("heartbeat_idle", lambda args: "", "Respond to a heartbeat tick when there is nothing to do. Ends your turn without acting.",
         {"type": "object", "properties": {}}),
     ("APPEND_MESSAGE", append_message, "Inject a message into an agent's messages.jsonl (default: your own). The owning agent wakes on it. `dir` targets a sibling agent dir — the message also surfaces to that agent's chat if it has one. `role` defaults to system.",
         {"type": "object", "properties": {"content": {"type": "string"}, "role": {"type": "string"}, "dir": {"type": "string"}}, "required": ["content"]}),
@@ -613,8 +613,7 @@ def main():
             tools=TOOL_SCHEMAS))
         owe_turn = False
 
-        if (any(tc["function"]["name"] == "heartbeat_idle" for tc in (assistant.get("tool_calls") or []))
-                and messages and str(messages[-1].get("content", "")).startswith("[trigger heartbeat]")):
+        if any(tc["function"]["name"] == "heartbeat_idle" for tc in (assistant.get("tool_calls") or [])):
             _heartbeat_backoff(active=False)
         elif not assistant.get("tool_calls"):
             append_msg(assistant)
