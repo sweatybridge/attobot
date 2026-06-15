@@ -9,6 +9,7 @@ BLOB_DIR = f"{AGENT_DIR}/blobs"
 CFG = { # defaults
     "model": "deepseek-v4-pro",
     "api_base": "https://api.deepseek.com/v1",
+    "telegram_api_base": "https://api.telegram.org",
     "temperature": 1.0,
     "reasoning_effort": "medium",
     "context_tokens": 1000000,
@@ -126,7 +127,8 @@ def _tg_send(endpoint, payload, files=None, cfg=None):
     payload = {"chat_id": cfg["telegram_chat_id"], **payload}
     if cfg.get("telegram_thread_id"):
         payload["message_thread_id"] = cfg["telegram_thread_id"]
-    r = requests.post(f"https://api.telegram.org/bot{cfg['telegram_token']}/{endpoint}",
+    base = cfg.get("telegram_api_base", "https://api.telegram.org")
+    r = requests.post(f"{base}/bot{cfg['telegram_token']}/{endpoint}",
                       data=payload, files=files, timeout=60)
     data = r.json()
     if not data.get("ok"):
@@ -363,6 +365,7 @@ def bg_run(name, args, tool_call_id, tool_fn):
 
 def start_chat():
     token = CFG["telegram_token"]
+    base = CFG.get("telegram_api_base", "https://api.telegram.org")
     locked_cid = CFG["telegram_chat_id"]
     locked_tid = CFG.get("telegram_thread_id")
     poll_offset = pathlib.Path(f"{AGENT_DIR}/tg_poll.offset")
@@ -372,7 +375,7 @@ def start_chat():
         except (FileNotFoundError, ValueError): offset = 0
         while True:
             try:
-                r = requests.post(f"https://api.telegram.org/bot{token}/getUpdates",
+                r = requests.post(f"{base}/bot{token}/getUpdates",
                                   data={"offset": offset, "timeout": 25}, timeout=45)
                 updates = r.json().get("result") or []
                 for u in updates:
@@ -389,10 +392,10 @@ def start_chat():
                         file_id = next((msg[k]["file_id"] for k in ("document", "voice", "video", "audio") if msg.get(k)), None)
                     body = msg.get("text") or ""
                     if file_id:
-                        meta = requests.get(f"https://api.telegram.org/bot{token}/getFile",
+                        meta = requests.get(f"{base}/bot{token}/getFile",
                                             params={"file_id": file_id}, timeout=30).json()
                         rel = meta["result"]["file_path"]
-                        blob = requests.get(f"https://api.telegram.org/file/bot{token}/{rel}", timeout=60).content
+                        blob = requests.get(f"{base}/file/bot{token}/{rel}", timeout=60).content
                         inbound = pathlib.Path(f"{AGENT_DIR}/inbound")
                         inbound.mkdir(parents=True, exist_ok=True)
                         save = inbound / f"{u['update_id']}_{rel.rsplit('/', 1)[-1]}"
@@ -552,7 +555,8 @@ _pending_reactions = []
 
 def _react(mid, emoji):
     try:
-        requests.post(f"https://api.telegram.org/bot{CFG['telegram_token']}/setMessageReaction",
+        base = CFG.get("telegram_api_base", "https://api.telegram.org")
+        requests.post(f"{base}/bot{CFG['telegram_token']}/setMessageReaction",
             json={"chat_id": CFG["telegram_chat_id"], "message_id": mid,
                   "reaction": [{"type":"emoji","emoji":emoji}] if emoji else []}, timeout=10)
     except Exception: pass
