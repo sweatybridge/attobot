@@ -173,7 +173,7 @@ python setup.py --systemd
 #   journalctl --user -u attobot -f
 ```
 
-Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `model` / `api_base` in `config.json` to point at any OpenAI-compatible endpoint, or set `provider: "anthropic"` to switch the request shape.
+Default: `deepseek-v4-pro` via `https://api.deepseek.com/v1`. Override `model` / `api_base` in `config.json` to point at any OpenAI-compatible endpoint, or set `provider: "anthropic"` to switch the request shape.
 
 `python agent.py [agent_dir ...]` — the arg is the agent state folder (default `./agent`); same optional arg on `setup.py`. It must hold `config.json` and `SOUL.md` (`setup.py` creates both). Extra dirs each get their own process (`python agent.py agent subconscious` runs the pair; ctrl-C kills both).
 
@@ -185,12 +185,12 @@ Default: `kimi-k2.6` via `https://api.moonshot.ai/v1`. Override `model` / `api_b
   "telegram_chat_id": "...",       // required if telegram_token is set
   "telegram_thread_id": "...",     // optional, forum supergroup topic
   "api_key": "...",                // required, LLM provider key
-  "model": "kimi-k2.6",
-  "api_base": "https://api.moonshot.ai/v1",
+  "model": "deepseek-v4-pro",
+  "api_base": "https://api.deepseek.com/v1",
   "temperature": 1.0,
   "reasoning_effort": "medium",
-  "context_tokens": 100000,
-  "multimodal_support": true,
+  "context_tokens": 1000000,
+  "multimodal_support": false,
   "provider": "",                  // "" = openai-compat default; "anthropic" loads opt/providers/anthropic
   "opt": []                        // additional opt/ entries to copy in
 }
@@ -202,4 +202,4 @@ Tunables with defaults in `CFG` (rarely worth changing, override in `config.json
 
 1. **The agent is a loop.** One process, one file watch, one LLM call per change.
 2. **The bus is the filesystem.** Channels in, channels out, scheduled jobs, background work, memory — all files. No daemon, no queue, no IPC.
-3. **Opinionated cuts code.** Telegram is the chat. One operator, one chat. Default is Kimi K2.6 via Moonshot, but anything OpenAI-shape works out of the box and other shapes live in `opt/providers/`. No abstractions for things that aren't pluralized.
+3. **Opinionated cuts code.** Telegram is the chat. One operator, one chat. Default is DeepSeek V4 Pro via DeepSeek, but anything OpenAI-shape works out of the box and other shapes live in `opt/providers/`. No abstractions for things that aren't pluralized.

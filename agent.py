@@ -7,12 +7,12 @@ AGENT_DIR = sys.argv[1] if len(sys.argv) > 1 else "agent"
 BLOB_DIR = f"{AGENT_DIR}/blobs"
 
 CFG = { # defaults
-    "model": "kimi-k2.7-code",
-    "api_base": "https://api.moonshot.ai/v1",
+    "model": "deepseek-v4-pro",
+    "api_base": "https://api.deepseek.com/v1",
     "temperature": 1.0,
     "reasoning_effort": "medium",
-    "context_tokens": 100000,
-    "multimodal_support": True,
+    "context_tokens": 1000000,
+    "multimodal_support": False,
     "provider": "",
     "opt": [],
     "life_tail": 50,
