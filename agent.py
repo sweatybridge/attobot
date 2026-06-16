@@ -47,8 +47,32 @@ def _msg(line):
     except Exception: return {}
     return m if isinstance(m, dict) else {}
 
+def _pair_sanitize(msgs):
+    out, i, n = [], 0, len(msgs)
+    while i < n:
+        m = msgs[i]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            need = [tc.get("id") for tc in m["tool_calls"]]
+            j = i + 1
+            while j < n and msgs[j].get("role") == "tool":
+                j += 1
+            got = [msgs[k].get("tool_call_id") for k in range(i + 1, j)]
+            if need and all(cid in got for cid in need):
+                out.append(m)
+                out.extend(msgs[i + 1:j])
+            i = j  # incomplete -> assistant and any partial tool results are dropped together
+        elif m.get("role") == "tool":
+            i += 1  # tool result with no kept assistant before it -> orphan, drop
+        else:
+            out.append(m)
+            i += 1
+    return out
+
 def load_messages():
-    s, dec, out, i = open(f"{AGENT_DIR}/messages.jsonl").read(), json.JSONDecoder(), [], 0
+    with open(f"{AGENT_DIR}/messages.jsonl") as f:
+        fcntl.flock(f, fcntl.LOCK_SH)
+        s = f.read()
+    dec, out, i = json.JSONDecoder(), [], 0
     while i < len(s):
         if s[i].isspace():
             i += 1
@@ -59,7 +83,7 @@ def load_messages():
                 out.append(obj)
         except json.JSONDecodeError:
             i += 1  # garbage byte — skip; whatever parses next is recovered
-    return out
+    return _pair_sanitize(out)
 
 _append_lock = threading.RLock()
 
@@ -261,23 +285,9 @@ def stash_messages(args):
         f.write(new_content)
     return f"{end - start + 1} lines stashed to {marker}"
 
-def append_message(args):
-    d = args.get("dir") or AGENT_DIR
-    append_msg({"role": args.get("role", "system"), "content": args["content"]}, d)
-    if d != AGENT_DIR:  # foreign injection also surfaces to the target's chat
-        try:
-            tcfg = json.loads(open(f"{d}/config.json").read())
-            if tcfg.get("telegram_token"):
-                _tg_send("sendMessage", {"text": args["content"][:4000]}, cfg=tcfg)
-        except Exception:
-            pass
-    return f"appended to {d}/messages.jsonl"
-
 TOOLS = [
     ("heartbeat_idle", lambda args: "", "Respond to a heartbeat tick when there is nothing to do. Ends your turn without acting.",
         {"type": "object", "properties": {}}),
-    ("APPEND_MESSAGE", append_message, "Inject a message into an agent's messages.jsonl (default: your own). The owning agent wakes on it. `dir` targets a sibling agent dir — the message also surfaces to that agent's chat if it has one. `role` defaults to system.",
-        {"type": "object", "properties": {"content": {"type": "string"}, "role": {"type": "string"}, "dir": {"type": "string"}}, "required": ["content"]}),
     ("SEND_CHAT", send_chat, "Send a message to the chat. With just `text`, sends a normal text message. With `path`, sends that file as an attachment (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise); `text` becomes the caption (capped at 1024 chars by telegram).",
         {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["text"]}),
     ("READ_FILE", read_file, "Read a file.",
@@ -308,10 +318,13 @@ def _load_module(name, path):
 
 def load_agent_tools():
     for path in sorted(pathlib.Path(f"{AGENT_DIR}/tools").glob("*.py")):
-        mod = _load_module(path.stem, path)
-        TOOL_FNS[mod.NAME] = mod.run
-        TOOL_SCHEMAS.append({"type": "function", "function": {
-            "name": mod.NAME, "description": mod.DESCRIPTION, "parameters": mod.PARAMETERS}})
+        try:
+            mod = _load_module(path.stem, path)
+            TOOL_FNS[mod.NAME] = mod.run
+            TOOL_SCHEMAS.append({"type": "function", "function": {
+                "name": mod.NAME, "description": mod.DESCRIPTION, "parameters": mod.PARAMETERS}})
+        except Exception as e:
+            life(f"[tool load failed] {path.name}: {e}")
 
 def _load_provider():
     global _chat_fn
@@ -432,6 +445,10 @@ def start_triggers():
     heartbeat = trig_dir / "heartbeat.json"
     if not heartbeat.exists():
         heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "cap": 3600, "message": "tick"}))
+    if os.path.basename(os.path.abspath(AGENT_DIR)) == "subconscious":
+        self_stash = trig_dir / "self-stash.json"
+        if not self_stash.exists():
+            self_stash.write_text(json.dumps({"next": time.time() + 1800, "repeat_s": 1800, "message": "STASH_MESSAGE: all"}))
 
     def loop():
         while True:
@@ -493,7 +510,7 @@ def start_inbox():
     def deliver(drop):
         sender = pwd.getpwuid(drop.stat().st_uid).pw_name
         text = drop.read_bytes()[:CFG["inbox_preview"] * 4].decode("utf-8", errors="replace")[:CFG["inbox_preview"]]
-        append_msg({"role": "system", "content": f"[mail from {sender}] {drop.name}\n{text}"})
+        append_msg({"role": "user", "content": f"[mail from {sender}] {drop.name}\n{text}"})
         send_chat({"text": f"mail from {sender}\n{text}"})
 
     def watch():
@@ -510,6 +527,44 @@ def start_inbox():
             time.sleep(CFG["inbox_tick"])
 
     threading.Thread(target=watch, daemon=True, name="inbox-poll").start()
+
+def _stash_directive_arg(content):
+    marker = "STASH_MESSAGE:"
+    if marker not in content:
+        return None
+    head, _, tail = content.partition(marker)
+    head = head.strip()
+    if head and not (head.startswith("[trigger ") and head.endswith("]")):
+        return None
+    return tail.strip()
+
+def _exec_stash_directive(arg):
+    path = f"{AGENT_DIR}/messages.jsonl"
+    with _append_lock:
+        with open(path, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            kept, n = [], 0
+            for ln in f.read().splitlines():
+                try:
+                    m = json.loads(ln)
+                except Exception:
+                    kept.append(ln); continue
+                if m.get("role") == "system" and _stash_directive_arg(m.get("content") or "") is not None:
+                    continue
+                kept.append(ln)
+            f.seek(0); f.truncate()
+            f.write("\n".join(kept) + ("\n" if kept else ""))
+            n = len(kept)
+    if arg == "all":
+        if n > 1:
+            stash_messages({"start": 1, "end": n})
+    elif arg:
+        p = arg.split()
+        if len(p) == 2 and p[0].isdigit() and p[1].isdigit():
+            stash_messages({"start": int(p[0]), "end": int(p[1])})
+    else:
+        stash_messages({})
+    life(f"[stash directive] {arg or 'default'}")
 
 # ---------- main loop ----------
 
@@ -565,6 +620,27 @@ def serialize_assistant(msg):
     return {"role": "assistant", "content": msg.get("content") or "",
             **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
 
+def _drop_idle_tick():
+    with _append_lock:
+        with open(f"{AGENT_DIR}/messages.jsonl", "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            lines = f.read().splitlines()
+            if not lines or "[trigger heartbeat]" not in lines[-1]:
+                return
+            lines.pop()
+            f.seek(0)
+            f.truncate()
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+    try:
+        lines = open(f"{AGENT_DIR}/LIFE.md").read().splitlines(keepends=True)
+        for i in range(len(lines) - 1, -1, -1):
+            if "[trigger heartbeat]" in lines[i]:
+                del lines[i]
+                break
+        open(f"{AGENT_DIR}/LIFE.md", "w").write("".join(lines))
+    except Exception:
+        pass
+
 def main():
     config_path = pathlib.Path(f"{AGENT_DIR}/config.json")
     if not config_path.exists():
@@ -581,7 +657,7 @@ def main():
     if CFG["provider"] and f"providers/{CFG['provider']}" not in CFG["opt"]:
         CFG["opt"].append(f"providers/{CFG['provider']}")
     for entry in CFG["opt"]:
-        src = pathlib.Path(f"opt/{entry}.py")
+        src = pathlib.Path(__file__).resolve().parent / "opt" / f"{entry}.py"
         dst = pathlib.Path(f"{AGENT_DIR}/{entry}.py")
         if src.exists() and not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -607,6 +683,15 @@ def main():
             time.sleep(1)
             continue
 
+        directive = next((_stash_directive_arg(m.get("content") or "")
+                          for m in load_messages()
+                          if m.get("role") == "system" and _stash_directive_arg(m.get("content") or "") is not None), None)
+        if directive is not None:
+            _exec_stash_directive(directive)
+            owe_turn = False
+            last_hash = file_hash()
+            continue
+
         system, life_tail, messages = build_system(), life_block(), load_messages()
         if len(system) + len(life_tail) + sum(len(json.dumps(m)) for m in messages) > (CFG["context_tokens"] * 4 * 0.8): # ≈4 chars/token, 20% buffer
             append_msg({"role": "system", "content": f"[stash_messages] {stash_messages({})}"})
@@ -619,6 +704,7 @@ def main():
 
         if any(tc["function"]["name"] == "heartbeat_idle" for tc in (assistant.get("tool_calls") or [])):
             _heartbeat_backoff(active=False)
+            _drop_idle_tick()
         elif not assistant.get("tool_calls"):
             append_msg(assistant)
             _heartbeat_backoff(active=True)
