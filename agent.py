@@ -173,6 +173,11 @@ def send_chat(args):
         result = errors[0] if errors else "sent"
     return result
 
+def send_attachment(args):  # files only; plain text goes out as a normal assistant reply
+    if not args.get("path"):
+        return "SEND_ATTACHMENT needs a file path; for plain text just write a normal reply"
+    return send_chat(args)
+
 def stash(content):
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
     open(f"{BLOB_DIR}/{h}", "w").write(content)
@@ -281,6 +286,8 @@ def stash_messages(args):
     return f"{end - start + 1} lines stashed to {marker}"
 
 TOOLS = [
+    ("SEND_ATTACHMENT", send_attachment, "Send a file to your Telegram topic (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise). `text` is an optional caption (capped at 1024 chars). For a plain text message, do NOT use this — just write a normal assistant reply.",
+        {"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"}}, "required": ["path"]}),
     ("READ_FILE", read_file, "Read a file.",
         {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
     ("WRITE_FILE", write_file, "Overwrite a file.",
