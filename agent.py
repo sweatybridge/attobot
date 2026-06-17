@@ -715,7 +715,7 @@ def main():
     def file_hash():
         return hashlib.sha256(open(f"{AGENT_DIR}/messages.jsonl", "rb").read()).hexdigest()
 
-    last_hash = file_hash()
+    last_hash = ""  # force a first turn on boot so the gate has an assistant turn to open on
     owe_turn = False
     while True:
         if not owe_turn and file_hash() == last_hash:
