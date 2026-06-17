@@ -692,8 +692,9 @@ def main():
             tools=TOOL_SCHEMAS))
         owe_turn = False
 
+        i, inbound = _last_inbound(messages)
+        woke_hb = (inbound.get("content") or "").startswith("[trigger heartbeat]")  # only a heartbeat wake tunes the heartbeat
         if not assistant.get("tool_calls"):
-            i, inbound = _last_inbound(messages)
             tail = messages[i + 1:] if i is not None else messages
             used_tools = any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
             # a tool-less turn reaches Telegram only as a reply to a real message (user);
@@ -701,9 +702,9 @@ def main():
             idle = inbound.get("role") != "user" and not used_tools
             append_msg(assistant)
             if idle:
-                _heartbeat_backoff(active=False)
+                if woke_hb: _heartbeat_backoff(active=False)
             else:
-                _heartbeat_backoff(active=True)
+                if woke_hb: _heartbeat_backoff(active=True)
                 send_chat({"text": (assistant.get("content") or "").strip()})
         else:
             tool_results = []
@@ -715,7 +716,7 @@ def main():
                     result = f"error: {e}"
                 tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
             append_msg([assistant] + tool_results)
-            _heartbeat_backoff(active=True)
+            if woke_hb: _heartbeat_backoff(active=True)
             owe_turn = True
 
         last_hash = file_hash()
