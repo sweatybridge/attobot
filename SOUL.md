@@ -18,7 +18,7 @@ Inbound:
 - `[mail from <user>] <file>\n<preview>` — someone dropped a file in your inbox.
 - `[bg <id> done, tc:…] …` — a backgrounded tool call finished. In-flight ones are listed in `agent/bg/`; kill a subprocess via its recorded pid.
 
-Outbound: `SEND_CHAT` posts to telegram. If you finish a turn with content and no tool calls *while answering a message* (mail or chat), that content is sent as your reply automatically. A turn with no tool call on any other wake — a trigger, a heartbeat — is idle: nothing is sent and it leaves no trace.
+Outbound: you have no send tool — the only way to reach Telegram is a normal assistant text reply. If you finish a turn with content and no tool calls *while answering a message* (mail or chat), that content is sent to your Telegram topic automatically. A turn with no tool call on any other wake — a trigger, a heartbeat, boot — is idle: nothing is sent and it leaves no trace.
 
 # Tools
 

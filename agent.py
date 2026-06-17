@@ -281,8 +281,6 @@ def stash_messages(args):
     return f"{end - start + 1} lines stashed to {marker}"
 
 TOOLS = [
-    ("SEND_CHAT", send_chat, "Send a message to the chat. With just `text`, sends a normal text message. With `path`, sends that file as an attachment (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise); `text` becomes the caption (capped at 1024 chars by telegram).",
-        {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["text"]}),
     ("READ_FILE", read_file, "Read a file.",
         {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
     ("WRITE_FILE", write_file, "Overwrite a file.",
@@ -691,9 +689,11 @@ def main():
             i, inbound = _last_inbound(messages)
             tail = messages[i + 1:] if i is not None else messages
             used_tools = any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
-            idle_trigger = inbound.get("role") == "system" and (inbound.get("content") or "").startswith("[trigger ") and not used_tools
+            # a tool-less turn reaches Telegram only as a reply to a real message (user);
+            # answering a trigger/heartbeat/[start]/[bg] with no work done is idle — nothing sent
+            idle = inbound.get("role") != "user" and not used_tools
             append_msg(assistant)
-            if idle_trigger:
+            if idle:
                 _heartbeat_backoff(active=False)
             else:
                 _heartbeat_backoff(active=True)
