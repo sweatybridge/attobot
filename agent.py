@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal agent."""
-import base64, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, requests, shutil, subprocess, sys, threading, time
+import base64, collections, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, requests, shutil, subprocess, sys, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
 AGENT_DIR = sys.argv[1] if len(sys.argv) > 1 else "agent"
@@ -106,6 +106,12 @@ def append_msg(m, agent_dir=AGENT_DIR):
             fcntl.flock(f, fcntl.LOCK_EX)
             f.write(json.dumps(m) + "\n")
     life(_msg_summary(m), agent_dir)
+
+def append_raw(m, agent_dir=AGENT_DIR):  # append a message with no LIFE.md entry
+    with _append_lock:
+        with open(f"{agent_dir}/messages.jsonl", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.write(json.dumps(m) + "\n")
 
 def _default_chat(messages, tools):
     body = {
@@ -286,8 +292,6 @@ def stash_messages(args):
     return f"{end - start + 1} lines stashed to {marker}"
 
 TOOLS = [
-    ("heartbeat_idle", lambda args: "", "Respond to a heartbeat tick when there is nothing to do. Ends your turn without acting.",
-        {"type": "object", "properties": {}}),
     ("SEND_CHAT", send_chat, "Send a message to the chat. With just `text`, sends a normal text message. With `path`, sends that file as an attachment (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise); `text` becomes the caption (capped at 1024 chars by telegram).",
         {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["text"]}),
     ("READ_FILE", read_file, "Read a file.",
@@ -439,6 +443,54 @@ def _heartbeat_backoff(active):
     job["next"] = time.time() + min(job["repeat_s"] * 2 ** job["idles"], job.get("cap", 3600))
     f.write_text(json.dumps(job))
 
+# Triggers queue rather than appending. A queued trigger is released only when
+# the agent's last turn is an assistant turn, so two system messages never sit
+# adjacent and a trigger never lands ahead of unanswered mail.
+_trigger_queue = collections.deque()
+_trigger_queue_lock = threading.Lock()
+
+def _last_inbound_role(messages):  # role of the most recent message this turn answers
+    for m in reversed(messages):
+        r = m.get("role")
+        if r in ("user", "system"):
+            return r
+    return None
+
+def _flush_trigger():  # release one queued trigger if the agent's last turn is an assistant turn
+    m = None
+    with _append_lock:
+        path = f"{AGENT_DIR}/messages.jsonl"
+        try:
+            with open(path, "r+") as f:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                lines = f.read().splitlines()
+                if lines and _msg(lines[-1]).get("role") != "assistant":
+                    return
+                with _trigger_queue_lock:
+                    if not _trigger_queue:
+                        return
+                    m = _trigger_queue.popleft()
+                f.write(json.dumps(m) + "\n")
+        except FileNotFoundError:
+            return
+    life(_msg_summary(m))
+
+def _collapse_bare_tail():  # collapse two adjacent [system, tool-less-assistant] pairs into one
+    with _append_lock:
+        path = f"{AGENT_DIR}/messages.jsonl"
+        with open(path, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            lines = f.read().splitlines()
+            if len(lines) < 4:
+                return
+            a, b, c, d = (_msg(l) for l in lines[-4:])
+            sysm = lambda x: x.get("role") == "system"
+            bare = lambda x: x.get("role") == "assistant" and not x.get("tool_calls")
+            if sysm(a) and bare(b) and sysm(c) and bare(d):
+                del lines[-4:-2]
+                f.seek(0); f.truncate()
+                f.write("\n".join(lines) + ("\n" if lines else ""))
+
 def start_triggers():
     trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
     trig_dir.mkdir(parents=True, exist_ok=True)
@@ -494,11 +546,13 @@ def start_triggers():
                         if job.get("repeat_s"):
                             job["next"] = ts + job["repeat_s"]
                         f.write_text(json.dumps(job))
-                    append_msg({"role": "system", "content": f"[trigger {f.stem}] {msg}"})
+                    with _trigger_queue_lock:
+                        _trigger_queue.append({"role": "system", "content": f"[trigger {f.stem}] {msg}"})
                     if one_shot:
                         f.unlink()
             except Exception as e:
                 life(f"[trigger error] {e}")  # log only, don't wake
+            _flush_trigger()
             time.sleep(CFG["trigger_tick"])
 
     threading.Thread(target=loop, daemon=True, name="triggers").start()
@@ -514,14 +568,20 @@ def start_inbox():
         send_chat({"text": f"mail from {sender}\n{text}"})
 
     def watch():
-        seen = set(inbox.iterdir())
+        done = inbox / "processed"
         while True:
             try:
-                current = set(inbox.iterdir())
-                for f in current - seen:
-                    if f.is_file() and not f.name.startswith("."):
+                done.mkdir(exist_ok=True)
+                for f in sorted(inbox.iterdir()):
+                    if not (f.is_file() and not f.name.startswith(".")):
+                        continue
+                    try:
                         deliver(f)
-                seen = current
+                        f.rename(done / f.name)  # delivered exactly once; survives restarts
+                    except Exception as e:
+                        life(f"[inbox deliver error] {f.name}: {e}")
+                        try: f.rename(done / f.name)  # move aside so a bad file can't block the rest
+                        except Exception: pass
             except Exception as e:
                 life(f"[inbox error] {e}")  # log only, don't wake
             time.sleep(CFG["inbox_tick"])
@@ -620,27 +680,6 @@ def serialize_assistant(msg):
     return {"role": "assistant", "content": msg.get("content") or "",
             **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
 
-def _drop_idle_tick():
-    with _append_lock:
-        with open(f"{AGENT_DIR}/messages.jsonl", "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            lines = f.read().splitlines()
-            if not lines or "[trigger heartbeat]" not in lines[-1]:
-                return
-            lines.pop()
-            f.seek(0)
-            f.truncate()
-            f.write("\n".join(lines) + ("\n" if lines else ""))
-    try:
-        lines = open(f"{AGENT_DIR}/LIFE.md").read().splitlines(keepends=True)
-        for i in range(len(lines) - 1, -1, -1):
-            if "[trigger heartbeat]" in lines[i]:
-                del lines[i]
-                break
-        open(f"{AGENT_DIR}/LIFE.md", "w").write("".join(lines))
-    except Exception:
-        pass
-
 def main():
     config_path = pathlib.Path(f"{AGENT_DIR}/config.json")
     if not config_path.exists():
@@ -702,13 +741,15 @@ def main():
             tools=TOOL_SCHEMAS))
         owe_turn = False
 
-        if any(tc["function"]["name"] == "heartbeat_idle" for tc in (assistant.get("tool_calls") or [])):
-            _heartbeat_backoff(active=False)
-            _drop_idle_tick()
-        elif not assistant.get("tool_calls"):
-            append_msg(assistant)
-            _heartbeat_backoff(active=True)
-            send_chat({"text": (assistant.get("content") or "").strip()})
+        if not assistant.get("tool_calls"):
+            if _last_inbound_role(messages) == "user":   # reply to mail/telegram
+                append_msg(assistant)
+                _heartbeat_backoff(active=True)
+                send_chat({"text": (assistant.get("content") or "").strip()})
+            else:                                         # idle on a trigger/system wake
+                append_raw(assistant)                     # no LIFE.md, no chat
+                _heartbeat_backoff(active=False)
+                _collapse_bare_tail()
         else:
             tool_results = []
             for tc in assistant["tool_calls"]:
@@ -726,6 +767,7 @@ def main():
             owe_turn = True
 
         last_hash = file_hash()
+        _flush_trigger()
 
 if __name__ == "__main__":
     for extra in sys.argv[2:]:  # extra agent dirs each get their own process
