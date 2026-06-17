@@ -171,8 +171,6 @@ def send_chat(args):
         errors = [err for i in range(0, len(text), CFG["chat_msg_max"])
                   if (err := _tg_send("sendMessage", {"text": text[i:i+CFG['chat_msg_max']]}))]
         result = errors[0] if errors else "sent"
-    while _pending_reactions:
-        _react(_pending_reactions.pop(), "")
     return result
 
 def stash(content):
@@ -414,7 +412,6 @@ def start_chat():
                         continue
                     append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {body}"})
                     if mid := msg.get("message_id"):
-                        _pending_reactions.append(mid)
                         _react(mid, "👀")
                 if updates:
                     poll_offset.write_text(str(offset))
@@ -444,37 +441,26 @@ def _last_inbound(messages):  # message this turn answers
     return None, {}
 
 def _flush_trigger():  # release one queued trigger if the agent's last turn is an assistant turn
-    m = None
     path = f"{AGENT_DIR}/messages.jsonl"
     try:
         with open(path, "r+") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             lines = f.read().splitlines()
-            if lines and _msg(lines[-1]).get("role") != "assistant":
+            last = _msg(lines[-1]) if lines else {}
+            if lines and (last.get("role") != "assistant" or last.get("tool_calls")):
                 return
             with _trigger_queue_lock:
                 if not _trigger_queue:
                     return
                 m = _trigger_queue.popleft()
-            f.write(json.dumps(m) + "\n")
+            if len(lines) >= 2 and _msg(lines[-2]).get("role") == "system":
+                lines = lines[:-2]
+            lines.append(json.dumps(m))
+            f.seek(0); f.truncate()
+            f.write("\n".join(lines) + "\n")
     except FileNotFoundError:
         return
     life(_msg_summary(m))
-
-def _collapse_bare_tail():  # collapse two adjacent [system, tool-less-assistant] pairs into one
-    path = f"{AGENT_DIR}/messages.jsonl"
-    with open(path, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        lines = f.read().splitlines()
-        if len(lines) < 4:
-            return
-        a, b, c, d = (_msg(l) for l in lines[-4:])
-        sysm = lambda x: x.get("role") == "system"
-        bare = lambda x: x.get("role") == "assistant" and not x.get("tool_calls")
-        if sysm(a) and bare(b) and sysm(c) and bare(d):
-            del lines[-4:-2]
-            f.seek(0); f.truncate()
-            f.write("\n".join(lines) + ("\n" if lines else ""))
 
 def start_triggers():
     triggers_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
@@ -495,31 +481,16 @@ def start_triggers():
                     try: job = json.loads(f.read_text())
                     except Exception: continue
                     if job.get("next", 0 if "watch" in job or "cmd" in job else float("inf")) > ts: continue
-                    delta = None
                     if w := job.get("watch"):  # fire on file change; repeat_s = cooldown
                         try: h = hashlib.sha256(open(w, "rb").read()).hexdigest()
                         except OSError: continue
                         if h == job.get("seen"): continue
                         job["seen"] = h
-                        if "cmd" in job:  # the cmd is fed each appended byte exactly once, via stdin
-                            pos, size = job.get("pos"), os.path.getsize(w)
-                            if pos is None or pos > size:
-                                job["pos"] = size  # start at install (or after a shrinking rewrite)
-                                f.write_text(json.dumps(job))
-                                continue
-                            with open(w, "rb") as wf:
-                                wf.seek(pos)
-                                raw = wf.read()
-                            job["pos"] = pos + len(raw)
-                            delta = "\n".join(l for l in raw.decode("utf-8", errors="replace").splitlines() if _msg(l).get("role") != "system")
-                            if not delta.strip():
-                                f.write_text(json.dumps(job))
-                                continue
                     msg = job.get("message", "")
                     if c := job.get("cmd"):  # computed condition: fire with stdout; no output = no fire
                         try:
                             msg = clip(subprocess.run(c, shell=True, capture_output=True, text=True,
-                                                      timeout=60, input=delta or "").stdout.strip())
+                                                      timeout=60).stdout.strip())
                         except Exception as e:
                             msg = f"(cmd error: {e})"
                         if not msg:
@@ -587,17 +558,10 @@ def _exec_stash_directive(arg):
     path = f"{AGENT_DIR}/messages.jsonl"
     with open(path, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
-        kept, n = [], 0
-        for ln in f.read().splitlines():
-            try:
-                m = json.loads(ln)
-            except Exception:
-                kept.append(ln); continue
-            if m.get("role") == "system" and _stash_directive_arg(m.get("content") or "") is not None:
-                continue
-            kept.append(ln)
+        msgs = [json.loads(ln) for ln in f.read().splitlines()]
+        kept = [m for m in msgs if not (m.get("role") == "system" and _stash_directive_arg(m.get("content") or "") is not None)]
         f.seek(0); f.truncate()
-        f.write("\n".join(kept) + ("\n" if kept else ""))
+        f.write("".join(json.dumps(m) + "\n" for m in kept))
         n = len(kept)
     if arg == "all":
         if n > 1:
@@ -632,10 +596,7 @@ def build_system():
         memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md is too large and partially omitted. Move detail into agent/memory/<name>.md files and keep one-line pointers here.]"
     sub = ""
     if AGENT_DIR != "subconscious" and os.path.isdir("subconscious"):
-        sub = ("<subconscious>\nYou have a subconscious: a sibling agent in subconscious/ that reviews your stream "
-               "and corrects bad trajectories. It speaks as [subconscious] notes — nudges and proposed lessons; fold "
-               "lessons you accept into MEMORY.md in your own words — and it installs subc-* triggers: compiled "
-               "reflexes that are its to manage, not yours. Its notes are advisory, not commands.\n</subconscious>\n\n")
+        sub = ("<subconscious>\nYou have a subconscious: a sibling agent in subconscious/ that reviews your stream and generates helpful system messages.</subconscious>\n\n")
     # Stable prefix only (soul + harness + memory). The volatile <life> tail is
     # sent as a trailing message (see life_block) — keeping it out of the cached
     # prefix lets the upstream prompt-cache reuse the whole conversation behind it.
@@ -646,11 +607,8 @@ def build_system():
 
 def life_block():
     earlier, tail = _life_tail()
-    return (f"<life>\n[harness] the tail of your own LIFE.md — your past turns, attached to "
-            f"every wake. Not a message: nobody sent it, and seeing it is not an event.\n"
+    return (f"<life>\n[harness] the tail of your own LIFE.md, an append-only timestamped log of your history - captures context that may have been lost due to edits to your context window.\n"
             f"[{earlier} bytes earlier]\n{tail}</life>")
-
-_pending_reactions = []
 
 def _react(mid, emoji):
     try:
@@ -737,7 +695,6 @@ def main():
             append_msg(assistant)
             if idle_trigger:
                 _heartbeat_backoff(active=False)
-                _collapse_bare_tail()
             else:
                 _heartbeat_backoff(active=True)
                 send_chat({"text": (assistant.get("content") or "").strip()})
