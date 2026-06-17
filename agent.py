@@ -47,45 +47,40 @@ def _msg(line):
     except Exception: return {}
     return m if isinstance(m, dict) else {}
 
-def _pair_sanitize(msgs):
-    out, i, n = [], 0, len(msgs)
-    while i < n:
-        m = msgs[i]
-        if m.get("role") == "assistant" and m.get("tool_calls"):
-            need = [tc.get("id") for tc in m["tool_calls"]]
-            j = i + 1
-            while j < n and msgs[j].get("role") == "tool":
-                j += 1
-            got = [msgs[k].get("tool_call_id") for k in range(i + 1, j)]
-            if need and all(cid in got for cid in need):
-                out.append(m)
-                out.extend(msgs[i + 1:j])
-            i = j  # incomplete -> assistant and any partial tool results are dropped together
-        elif m.get("role") == "tool":
-            i += 1  # tool result with no kept assistant before it -> orphan, drop
-        else:
-            out.append(m)
-            i += 1
-    return out
-
 def load_messages():
-    with open(f"{AGENT_DIR}/messages.jsonl") as f:
-        fcntl.flock(f, fcntl.LOCK_SH)
-        s = f.read()
-    dec, out, i = json.JSONDecoder(), [], 0
-    while i < len(s):
-        if s[i].isspace():
-            i += 1
-            continue
-        try:
-            obj, i = dec.raw_decode(s, i)
-            if isinstance(obj, dict) and "role" in obj:
-                out.append(obj)
-        except json.JSONDecodeError:
-            i += 1  # garbage byte — skip; whatever parses next is recovered
-    return _pair_sanitize(out)
+    with open(f"{AGENT_DIR}/messages.jsonl", "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        msgs = [] # drop invalid lines from jsonl file
+        for line in f.read().splitlines():
+            try:
+                m = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(m, dict) and "role" in m:
+                msgs.append(m)
+        f.seek(0); f.truncate()
+        f.write("".join(json.dumps(m) + "\n" for m in msgs))
 
-_append_lock = threading.RLock()
+        out, i = [], 0
+        while i < len(msgs):
+            m = msgs[i] # check for tool call and tool result matching, drop mismatch
+            if m.get("role") != "assistant" or not m.get("tool_calls"):
+                if m.get("role") != "tool":
+                    out.append(m)
+                i += 1
+                continue
+
+            j = i + 1
+            while j < len(msgs) and msgs[j].get("role") == "tool":
+                j += 1
+            need = [tc.get("id") for tc in m["tool_calls"]]
+            got = [t.get("tool_call_id") for t in msgs[i + 1:j]]
+            if need and all(cid in got for cid in need):
+                out.extend(msgs[i:j])
+            i = j
+        f.seek(0); f.truncate()
+        f.write("".join(json.dumps(m) + "\n" for m in out))
+        return out
 
 def _msg_summary(m):
     role = m.get("role", "?")
@@ -101,17 +96,13 @@ def _msg_summary(m):
     return f"{role}: {m.get('content', '')}"
 
 def append_msg(m, agent_dir=AGENT_DIR):
-    with _append_lock:
-        with open(f"{agent_dir}/messages.jsonl", "a") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(json.dumps(m) + "\n")
-    life(_msg_summary(m), agent_dir)
-
-def append_raw(m, agent_dir=AGENT_DIR):  # append a message with no LIFE.md entry
-    with _append_lock:
-        with open(f"{agent_dir}/messages.jsonl", "a") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            f.write(json.dumps(m) + "\n")
+    msgs = m if isinstance(m, list) else [m]
+    with open(f"{agent_dir}/messages.jsonl", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        for msg in msgs:
+            f.write(json.dumps(msg) + "\n")
+    for msg in msgs:
+        life(_msg_summary(msg), agent_dir)
 
 def _default_chat(messages, tools):
     body = {
@@ -133,13 +124,13 @@ def _default_chat(messages, tools):
         raise RuntimeError(f"{r.status_code}: {data}")
     return data["choices"][0]["message"]
 
-_chat_fn = _default_chat
+llm = _default_chat
 
-def llm(messages, tools=None):
+def llm_w_retry(messages, tools=None):
     delay = 1
     while True:
         try:
-            return _chat_fn(messages, tools)
+            return llm(messages, tools)
         except Exception as e:
             append_msg({"role": "system", "content": f"[llm retry in {delay}s] {e}"})
             time.sleep(delay)
@@ -270,7 +261,7 @@ def stash_messages(args):
 
     target = "\n".join(lines[s:e])
     try:
-        response = _chat_fn(
+        response = llm(
             [{"role": "user", "content": "Summarize this conversation segment in 1 paragraph. Be terse, factual.\n\n" + target}],
             None,
         )
@@ -331,8 +322,8 @@ def load_agent_tools():
             life(f"[tool load failed] {path.name}: {e}")
 
 def _load_provider():
-    global _chat_fn
-    _chat_fn = _load_module(f"provider_{CFG['provider']}", f"{AGENT_DIR}/providers/{CFG['provider']}.py").chat
+    global llm
+    llm = _load_module(f"provider_{CFG['provider']}", f"{AGENT_DIR}/providers/{CFG['provider']}.py").chat
 
 # ---------- background tool wrapper ----------
 
@@ -443,62 +434,56 @@ def _heartbeat_backoff(active):
     job["next"] = time.time() + min(job["repeat_s"] * 2 ** job["idles"], job.get("cap", 3600))
     f.write_text(json.dumps(job))
 
-# Triggers queue rather than appending. A queued trigger is released only when
-# the agent's last turn is an assistant turn, so two system messages never sit
-# adjacent and a trigger never lands ahead of unanswered mail.
 _trigger_queue = collections.deque()
 _trigger_queue_lock = threading.Lock()
 
-def _last_inbound_role(messages):  # role of the most recent message this turn answers
-    for m in reversed(messages):
-        r = m.get("role")
-        if r in ("user", "system"):
-            return r
-    return None
+def _last_inbound(messages):  # message this turn answers
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") in ("user", "system"):
+            return i, messages[i]
+    return None, {}
 
 def _flush_trigger():  # release one queued trigger if the agent's last turn is an assistant turn
     m = None
-    with _append_lock:
-        path = f"{AGENT_DIR}/messages.jsonl"
-        try:
-            with open(path, "r+") as f:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                lines = f.read().splitlines()
-                if lines and _msg(lines[-1]).get("role") != "assistant":
-                    return
-                with _trigger_queue_lock:
-                    if not _trigger_queue:
-                        return
-                    m = _trigger_queue.popleft()
-                f.write(json.dumps(m) + "\n")
-        except FileNotFoundError:
-            return
-    life(_msg_summary(m))
-
-def _collapse_bare_tail():  # collapse two adjacent [system, tool-less-assistant] pairs into one
-    with _append_lock:
-        path = f"{AGENT_DIR}/messages.jsonl"
+    path = f"{AGENT_DIR}/messages.jsonl"
+    try:
         with open(path, "r+") as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             lines = f.read().splitlines()
-            if len(lines) < 4:
+            if lines and _msg(lines[-1]).get("role") != "assistant":
                 return
-            a, b, c, d = (_msg(l) for l in lines[-4:])
-            sysm = lambda x: x.get("role") == "system"
-            bare = lambda x: x.get("role") == "assistant" and not x.get("tool_calls")
-            if sysm(a) and bare(b) and sysm(c) and bare(d):
-                del lines[-4:-2]
-                f.seek(0); f.truncate()
-                f.write("\n".join(lines) + ("\n" if lines else ""))
+            with _trigger_queue_lock:
+                if not _trigger_queue:
+                    return
+                m = _trigger_queue.popleft()
+            f.write(json.dumps(m) + "\n")
+    except FileNotFoundError:
+        return
+    life(_msg_summary(m))
+
+def _collapse_bare_tail():  # collapse two adjacent [system, tool-less-assistant] pairs into one
+    path = f"{AGENT_DIR}/messages.jsonl"
+    with open(path, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        lines = f.read().splitlines()
+        if len(lines) < 4:
+            return
+        a, b, c, d = (_msg(l) for l in lines[-4:])
+        sysm = lambda x: x.get("role") == "system"
+        bare = lambda x: x.get("role") == "assistant" and not x.get("tool_calls")
+        if sysm(a) and bare(b) and sysm(c) and bare(d):
+            del lines[-4:-2]
+            f.seek(0); f.truncate()
+            f.write("\n".join(lines) + ("\n" if lines else ""))
 
 def start_triggers():
-    trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
-    trig_dir.mkdir(parents=True, exist_ok=True)
-    heartbeat = trig_dir / "heartbeat.json"
+    triggers_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
+    triggers_dir.mkdir(parents=True, exist_ok=True)
+    heartbeat = triggers_dir / "heartbeat.json"
     if not heartbeat.exists():
         heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "cap": 3600, "message": "tick"}))
     if os.path.basename(os.path.abspath(AGENT_DIR)) == "subconscious":
-        self_stash = trig_dir / "self-stash.json"
+        self_stash = triggers_dir / "self-stash.json"
         if not self_stash.exists():
             self_stash.write_text(json.dumps({"next": time.time() + 1800, "repeat_s": 1800, "message": "STASH_MESSAGE: all"}))
 
@@ -506,7 +491,7 @@ def start_triggers():
         while True:
             try:
                 ts = time.time()
-                for f in trig_dir.glob("*.json"):
+                for f in triggers_dir.glob("*.json"):
                     try: job = json.loads(f.read_text())
                     except Exception: continue
                     if job.get("next", 0 if "watch" in job or "cmd" in job else float("inf")) > ts: continue
@@ -600,21 +585,20 @@ def _stash_directive_arg(content):
 
 def _exec_stash_directive(arg):
     path = f"{AGENT_DIR}/messages.jsonl"
-    with _append_lock:
-        with open(path, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            kept, n = [], 0
-            for ln in f.read().splitlines():
-                try:
-                    m = json.loads(ln)
-                except Exception:
-                    kept.append(ln); continue
-                if m.get("role") == "system" and _stash_directive_arg(m.get("content") or "") is not None:
-                    continue
-                kept.append(ln)
-            f.seek(0); f.truncate()
-            f.write("\n".join(kept) + ("\n" if kept else ""))
-            n = len(kept)
+    with open(path, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        kept, n = [], 0
+        for ln in f.read().splitlines():
+            try:
+                m = json.loads(ln)
+            except Exception:
+                kept.append(ln); continue
+            if m.get("role") == "system" and _stash_directive_arg(m.get("content") or "") is not None:
+                continue
+            kept.append(ln)
+        f.seek(0); f.truncate()
+        f.write("\n".join(kept) + ("\n" if kept else ""))
+        n = len(kept)
     if arg == "all":
         if n > 1:
             stash_messages({"start": 1, "end": n})
@@ -676,7 +660,7 @@ def _react(mid, emoji):
                   "reaction": [{"type":"emoji","emoji":emoji}] if emoji else []}, timeout=10)
     except Exception: pass
 
-def serialize_assistant(msg):
+def assistant_msg(msg):
     return {"role": "assistant", "content": msg.get("content") or "",
             **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
 
@@ -722,9 +706,13 @@ def main():
             time.sleep(1)
             continue
 
-        directive = next((_stash_directive_arg(m.get("content") or "")
-                          for m in load_messages()
-                          if m.get("role") == "system" and _stash_directive_arg(m.get("content") or "") is not None), None)
+        directive = None
+        for m in load_messages():
+            if m.get("role") != "system":
+                continue
+            directive = _stash_directive_arg(m.get("content") or "")
+            if directive is not None:
+                break
         if directive is not None:
             _exec_stash_directive(directive)
             owe_turn = False
@@ -736,20 +724,23 @@ def main():
             append_msg({"role": "system", "content": f"[stash_messages] {stash_messages({})}"})
             system, life_tail, messages = build_system(), life_block(), load_messages()
 
-        assistant = serialize_assistant(llm(
+        assistant = assistant_msg(llm_w_retry(
             [{"role": "system", "content": system}] + messages + [{"role": "system", "content": life_tail}],
             tools=TOOL_SCHEMAS))
         owe_turn = False
 
         if not assistant.get("tool_calls"):
-            if _last_inbound_role(messages) == "user":   # reply to mail/telegram
-                append_msg(assistant)
-                _heartbeat_backoff(active=True)
-                send_chat({"text": (assistant.get("content") or "").strip()})
-            else:                                         # idle on a trigger/system wake
-                append_raw(assistant)                     # no LIFE.md, no chat
+            i, inbound = _last_inbound(messages)
+            tail = messages[i + 1:] if i is not None else messages
+            used_tools = any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
+            idle_trigger = inbound.get("role") == "system" and (inbound.get("content") or "").startswith("[trigger ") and not used_tools
+            append_msg(assistant)
+            if idle_trigger:
                 _heartbeat_backoff(active=False)
                 _collapse_bare_tail()
+            else:
+                _heartbeat_backoff(active=True)
+                send_chat({"text": (assistant.get("content") or "").strip()})
         else:
             tool_results = []
             for tc in assistant["tool_calls"]:
@@ -759,10 +750,7 @@ def main():
                 except Exception as e:
                     result = f"error: {e}"
                 tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-            with _append_lock:
-                append_msg(assistant)
-                for tm in tool_results:
-                    append_msg(tm)
+            append_msg([assistant] + tool_results)
             _heartbeat_backoff(active=True)
             owe_turn = True
 
