@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal agent."""
-import base64, collections, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, requests, shutil, subprocess, sys, threading, time
+import base64, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, requests, shutil, subprocess, sys, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
 AGENT_DIR = sys.argv[1] if len(sys.argv) > 1 else "agent"
@@ -9,7 +9,6 @@ BLOB_DIR = f"{AGENT_DIR}/blobs"
 CFG = { # defaults
     "model": "deepseek-v4-pro",
     "api_base": "https://api.deepseek.com/v1",
-    "telegram_api_base": "https://api.telegram.org",
     "temperature": 1.0,
     "reasoning_effort": "medium",
     "context_tokens": 1000000,
@@ -30,49 +29,38 @@ os.makedirs(BLOB_DIR, exist_ok=True)
 os.makedirs(f"{AGENT_DIR}/memory", exist_ok=True)
 
 def life(event, agent_dir=AGENT_DIR):
-    if not isinstance(event, str):
-        event = repr(event)
-    event = event.replace("\n", "\\n")
-    if len(event) > 200:
-        event = f"{event[:100]}…{event[-100:]}"
     with open(f"{agent_dir}/LIFE.md", "a") as f:
-        f.write(f"[{time.strftime('%Y%m%dT%H%M%S')}] {event}\n")
+        f.write(f"[{time.strftime('%Y%m%dT%H%M%S')}] {_preview(event)}\n")
+
+def _preview(s, n=200):
+    if not isinstance(s, str):
+        s = repr(s)
+    s = s.replace("\n", "\\n")
+    if len(s) <= n:
+        return s
+    h = n // 2
+    return f"{s[:h]}…{s[-h:]}"
 
 def _msg(line):
     try: m = json.loads(line)
     except Exception: return {}
     return m if isinstance(m, dict) else {}
 
-def load_messages(): # Loads and heals messages.jsonl by dropping malformed lines and invalid tool-call blocks.
-    with open(f"{AGENT_DIR}/messages.jsonl", "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        msgs = []
-        for line in f.read().splitlines():
-            try:
-                m = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(m, dict) and "role" in m:
-                msgs.append(m)
-        out, i = [], 0
-        while i < len(msgs):
-            m = msgs[i]
-            if m.get("role") != "assistant" or not m.get("tool_calls"):
-                if m.get("role") != "tool":
-                    out.append(m)
-                i += 1
-                continue
-            j = i + 1
-            while j < len(msgs) and msgs[j].get("role") == "tool":
-                j += 1
-            need = [tc.get("id") for tc in m["tool_calls"]]
-            got = [t.get("tool_call_id") for t in msgs[i + 1:j]]
-            if need and all(cid in got for cid in need):
-                out.extend(msgs[i:j])
-            i = j
-        f.seek(0); f.truncate()
-        f.write("".join(json.dumps(m) + "\n" for m in out))
-        return out
+def load_messages():
+    s, dec, out, i = open(f"{AGENT_DIR}/messages.jsonl").read(), json.JSONDecoder(), [], 0
+    while i < len(s):
+        if s[i].isspace():
+            i += 1
+            continue
+        try:
+            obj, i = dec.raw_decode(s, i)
+            if isinstance(obj, dict) and "role" in obj:
+                out.append(obj)
+        except json.JSONDecodeError:
+            i += 1  # garbage byte — skip; whatever parses next is recovered
+    return out
+
+_append_lock = threading.RLock()
 
 def _msg_summary(m):
     role = m.get("role", "?")
@@ -88,13 +76,11 @@ def _msg_summary(m):
     return f"{role}: {m.get('content', '')}"
 
 def append_msg(m, agent_dir=AGENT_DIR):
-    msgs = m if isinstance(m, list) else [m]
-    with open(f"{agent_dir}/messages.jsonl", "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        for msg in msgs:
-            f.write(json.dumps(msg) + "\n")
-    for msg in msgs:
-        life(_msg_summary(msg), agent_dir)
+    with _append_lock:
+        with open(f"{agent_dir}/messages.jsonl", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.write(json.dumps(m) + "\n")
+    life(_msg_summary(m), agent_dir)
 
 def _default_chat(messages, tools):
     body = {
@@ -112,58 +98,59 @@ def _default_chat(messages, tools):
     data = r.json()
     if "choices" not in data:
         if 400 <= r.status_code < 500 and r.status_code != 429:
-            sys.exit(f"fatal llm error {r.status_code}: {data}")
+            sys.exit(f"fatal llm error {r.status_code}: {data}")  # bad key/model/request — retrying won't help
         raise RuntimeError(f"{r.status_code}: {data}")
     return data["choices"][0]["message"]
 
-llm = _default_chat
+_chat_fn = _default_chat
 
-def llm_w_retry(messages, tools=None):
+def llm(messages, tools=None):
     delay = 1
     while True:
         try:
-            return llm(messages, tools)
+            return _chat_fn(messages, tools)
         except Exception as e:
             append_msg({"role": "system", "content": f"[llm retry in {delay}s] {e}"})
             time.sleep(delay)
             delay = min(delay * 2, 900)
+
+# ---------- tools ----------
 
 _TG_MEDIA = {ext: (f"send{kind}", kind.lower())
              for kind, exts in {"Photo": "jpg jpeg png gif webp", "Video": "mp4 mov webm",
                                 "Voice": "ogg", "Audio": "mp3 m4a wav"}.items() for ext in exts.split()}
 
 def _tg_send(endpoint, payload, files=None, cfg=None):
+    """Post to an agent's chat via the telegram API; returns an error string or None. Failures land in LIFE."""
     cfg = cfg or CFG
     payload = {"chat_id": cfg["telegram_chat_id"], **payload}
     if cfg.get("telegram_thread_id"):
         payload["message_thread_id"] = cfg["telegram_thread_id"]
-    base = cfg.get("telegram_api_base", "https://api.telegram.org")
-    r = requests.post(f"{base}/bot{cfg['telegram_token']}/{endpoint}",
+    r = requests.post(f"https://api.telegram.org/bot{cfg['telegram_token']}/{endpoint}",
                       data=payload, files=files, timeout=60)
     data = r.json()
     if not data.get("ok"):
-        life(f"[telegram send error] {data}")
+        life(f"[send_chat error] {data}")
         return f"telegram error: {data.get('description', data)}"
     return None
 
-def send_text(text):
+def send_chat(args):
     if not CFG.get("telegram_token"):
         return "no chat configured"
-    errors = [err for i in range(0, len(text), CFG["chat_msg_max"])
-              if (err := _tg_send("sendMessage", {"text": text[i:i+CFG['chat_msg_max']]}))]
-    return errors[0] if errors else "sent"
-
-def send_attachment(args):
-    if not CFG.get("telegram_token"):
-        return "no chat configured"
-    if not (path := args.get("path")):
-        return "error: SEND_ATTACHMENT requires path; text-only chat replies are automatic"
     text = args.get("text", "")
-    ext = pathlib.Path(path).suffix.lower().lstrip(".")
-    endpoint, field = _TG_MEDIA.get(ext, ("sendDocument", "document"))
-    with open(path, "rb") as f:
-        err = _tg_send(endpoint, {"caption": text[:1024]}, files={field: f})
-    return err or f"sent {field} {path}"
+    if path := args.get("path"):
+        ext = pathlib.Path(path).suffix.lower().lstrip(".")
+        endpoint, field = _TG_MEDIA.get(ext, ("sendDocument", "document"))
+        with open(path, "rb") as f:
+            err = _tg_send(endpoint, {"caption": text[:1024]}, files={field: f})
+        result = err or f"sent {field} {path}"
+    else:
+        errors = [err for i in range(0, len(text), CFG["chat_msg_max"])
+                  if (err := _tg_send("sendMessage", {"text": text[i:i+CFG['chat_msg_max']]}))]
+        result = errors[0] if errors else "sent"
+    while _pending_reactions:
+        _react(_pending_reactions.pop(), "")
+    return result
 
 def stash(content):
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
@@ -176,9 +163,11 @@ def clip(s):
     h = CFG["tool_output_limit"] // 2
     return f"{s[:h]}\n... {len(s) - 2*h} chars truncated, {stash(s)} ...\n{s[-h:]}"
 
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
 def read_file(args):
     path = args["path"]
-    if pathlib.Path(path).suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp"} and CFG["multimodal_support"]:
+    if pathlib.Path(path).suffix.lower() in IMAGE_EXTS and CFG["multimodal_support"]:
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
         b64 = base64.b64encode(open(path, "rb").read()).decode()
         return [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]
@@ -249,7 +238,7 @@ def stash_messages(args):
 
     target = "\n".join(lines[s:e])
     try:
-        response = llm(
+        response = _chat_fn(
             [{"role": "user", "content": "Summarize this conversation segment in 1 paragraph. Be terse, factual.\n\n" + target}],
             None,
         )
@@ -270,9 +259,25 @@ def stash_messages(args):
         f.write(new_content)
     return f"{end - start + 1} lines stashed to {marker}"
 
+def append_message(args):
+    d = args.get("dir") or AGENT_DIR
+    append_msg({"role": args.get("role", "system"), "content": args["content"]}, d)
+    if d != AGENT_DIR:  # foreign injection also surfaces to the target's chat
+        try:
+            tcfg = json.loads(open(f"{d}/config.json").read())
+            if tcfg.get("telegram_token"):
+                _tg_send("sendMessage", {"text": args["content"][:4000]}, cfg=tcfg)
+        except Exception:
+            pass
+    return f"appended to {d}/messages.jsonl"
+
 TOOLS = [
-    ("SEND_ATTACHMENT", send_attachment, "Send a file to your Telegram topic (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise). `text` is an optional caption (capped at 1024 chars). For a plain text message, do NOT use this — just write a normal assistant reply.",
-        {"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"}}, "required": ["path"]}),
+    ("heartbeat_idle", lambda args: "", "Respond to a heartbeat tick when there is nothing to do. Ends your turn without acting.",
+        {"type": "object", "properties": {}}),
+    ("APPEND_MESSAGE", append_message, "Inject a message into an agent's messages.jsonl (default: your own). The owning agent wakes on it. `dir` targets a sibling agent dir — the message also surfaces to that agent's chat if it has one. `role` defaults to system.",
+        {"type": "object", "properties": {"content": {"type": "string"}, "role": {"type": "string"}, "dir": {"type": "string"}}, "required": ["content"]}),
+    ("SEND_CHAT", send_chat, "Send a message to the chat. With just `text`, sends a normal text message. With `path`, sends that file as an attachment (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise); `text` becomes the caption (capped at 1024 chars by telegram).",
+        {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["text"]}),
     ("READ_FILE", read_file, "Read a file.",
         {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
     ("WRITE_FILE", write_file, "Overwrite a file.",
@@ -301,13 +306,14 @@ def _load_module(name, path):
 
 def load_agent_tools():
     for path in sorted(pathlib.Path(f"{AGENT_DIR}/tools").glob("*.py")):
-        try:
-            mod = _load_module(path.stem, path)
-            TOOL_FNS[mod.NAME] = mod.run
-            TOOL_SCHEMAS.append({"type": "function", "function": {
-                "name": mod.NAME, "description": mod.DESCRIPTION, "parameters": mod.PARAMETERS}})
-        except Exception as e:
-            life(f"[tool load failed] {path.name}: {e}")
+        mod = _load_module(path.stem, path)
+        TOOL_FNS[mod.NAME] = mod.run
+        TOOL_SCHEMAS.append({"type": "function", "function": {
+            "name": mod.NAME, "description": mod.DESCRIPTION, "parameters": mod.PARAMETERS}})
+
+def _load_provider():
+    global _chat_fn
+    _chat_fn = _load_module(f"provider_{CFG['provider']}", f"{AGENT_DIR}/providers/{CFG['provider']}.py").chat
 
 # ---------- background tool wrapper ----------
 
@@ -357,7 +363,6 @@ def bg_run(name, args, tool_call_id, tool_fn):
 
 def start_chat():
     token = CFG["telegram_token"]
-    base = CFG.get("telegram_api_base", "https://api.telegram.org")
     locked_cid = CFG["telegram_chat_id"]
     locked_tid = CFG.get("telegram_thread_id")
     poll_offset = pathlib.Path(f"{AGENT_DIR}/tg_poll.offset")
@@ -367,7 +372,7 @@ def start_chat():
         except (FileNotFoundError, ValueError): offset = 0
         while True:
             try:
-                r = requests.post(f"{base}/bot{token}/getUpdates",
+                r = requests.post(f"https://api.telegram.org/bot{token}/getUpdates",
                                   data={"offset": offset, "timeout": 25}, timeout=45)
                 updates = r.json().get("result") or []
                 for u in updates:
@@ -384,10 +389,10 @@ def start_chat():
                         file_id = next((msg[k]["file_id"] for k in ("document", "voice", "video", "audio") if msg.get(k)), None)
                     body = msg.get("text") or ""
                     if file_id:
-                        meta = requests.get(f"{base}/bot{token}/getFile",
+                        meta = requests.get(f"https://api.telegram.org/bot{token}/getFile",
                                             params={"file_id": file_id}, timeout=30).json()
                         rel = meta["result"]["file_path"]
-                        blob = requests.get(f"{base}/file/bot{token}/{rel}", timeout=60).content
+                        blob = requests.get(f"https://api.telegram.org/file/bot{token}/{rel}", timeout=60).content
                         inbound = pathlib.Path(f"{AGENT_DIR}/inbound")
                         inbound.mkdir(parents=True, exist_ok=True)
                         save = inbound / f"{u['update_id']}_{rel.rsplit('/', 1)[-1]}"
@@ -398,11 +403,8 @@ def start_chat():
                         continue
                     append_msg({"role": "user", "content": f"[telegram {u['update_id']}] {body}"})
                     if mid := msg.get("message_id"):
-                        try:
-                            requests.post(f"{base}/bot{token}/setMessageReaction",
-                                json={"chat_id": locked_cid, "message_id": mid,
-                                      "reaction": [{"type":"emoji","emoji":"👀"}]}, timeout=10)
-                        except Exception: pass
+                        _pending_reactions.append(mid)
+                        _react(mid, "👀")
                 if updates:
                     poll_offset.write_text(str(offset))
             except Exception as e:
@@ -421,60 +423,46 @@ def _heartbeat_backoff(active):
     job["next"] = time.time() + min(job["repeat_s"] * 2 ** job["idles"], job.get("cap", 3600))
     f.write_text(json.dumps(job))
 
-_trigger_queue = collections.deque()
-_trigger_queue_lock = threading.Lock()
-
-def _flush_trigger_over_idle():  # release one queued trigger if the agent's last turn is an assistant turn, replaces idle turns
-    path = f"{AGENT_DIR}/messages.jsonl"
-    try:
-        with open(path, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            lines = f.read().splitlines()
-            last = _msg(lines[-1]) if lines else {}
-            if lines and (last.get("role") != "assistant" or last.get("tool_calls")):
-                return
-            with _trigger_queue_lock:
-                if not _trigger_queue:
-                    return
-                m = _trigger_queue.popleft()
-            if len(lines) >= 2 and _msg(lines[-2]).get("role") == "system":
-                lines = lines[:-2]
-            lines.append(json.dumps(m))
-            f.seek(0); f.truncate()
-            f.write("\n".join(lines) + "\n")
-    except FileNotFoundError:
-        return
-    life(_msg_summary(m))
-
 def start_triggers():
-    triggers_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
-    triggers_dir.mkdir(parents=True, exist_ok=True)
-    heartbeat = triggers_dir / "heartbeat.json"
+    trig_dir = pathlib.Path(f"{AGENT_DIR}/triggers")
+    trig_dir.mkdir(parents=True, exist_ok=True)
+    heartbeat = trig_dir / "heartbeat.json"
     if not heartbeat.exists():
         heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "cap": 3600, "message": "tick"}))
-    if os.path.basename(os.path.abspath(AGENT_DIR)) == "subconscious":
-        self_stash = triggers_dir / "self-stash.json"
-        if not self_stash.exists():
-            self_stash.write_text(json.dumps({"next": time.time() + 1800, "repeat_s": 1800, "message": "STASH_MESSAGE: all"}))
 
     def loop():
         while True:
             try:
                 ts = time.time()
-                for f in triggers_dir.glob("*.json"):
+                for f in trig_dir.glob("*.json"):
                     try: job = json.loads(f.read_text())
                     except Exception: continue
                     if job.get("next", 0 if "watch" in job or "cmd" in job else float("inf")) > ts: continue
+                    delta = None
                     if w := job.get("watch"):  # fire on file change; repeat_s = cooldown
                         try: h = hashlib.sha256(open(w, "rb").read()).hexdigest()
                         except OSError: continue
                         if h == job.get("seen"): continue
                         job["seen"] = h
+                        if "cmd" in job:  # the cmd is fed each appended byte exactly once, via stdin
+                            pos, size = job.get("pos"), os.path.getsize(w)
+                            if pos is None or pos > size:
+                                job["pos"] = size  # start at install (or after a shrinking rewrite)
+                                f.write_text(json.dumps(job))
+                                continue
+                            with open(w, "rb") as wf:
+                                wf.seek(pos)
+                                raw = wf.read()
+                            job["pos"] = pos + len(raw)
+                            delta = "\n".join(l for l in raw.decode("utf-8", errors="replace").splitlines() if _msg(l).get("role") != "system")
+                            if not delta.strip():
+                                f.write_text(json.dumps(job))
+                                continue
                     msg = job.get("message", "")
                     if c := job.get("cmd"):  # computed condition: fire with stdout; no output = no fire
                         try:
                             msg = clip(subprocess.run(c, shell=True, capture_output=True, text=True,
-                                                      timeout=60).stdout.strip())
+                                                      timeout=60, input=delta or "").stdout.strip())
                         except Exception as e:
                             msg = f"(cmd error: {e})"
                         if not msg:
@@ -486,16 +474,11 @@ def start_triggers():
                         if job.get("repeat_s"):
                             job["next"] = ts + job["repeat_s"]
                         f.write_text(json.dumps(job))
-                    content = f"[trigger {f.stem}] {msg}"
-                    if f.stem.startswith("subconscious-"):  # subc has no channel of its own; surface its triggers to Telegram via the primary
-                        send_text(content)
-                    with _trigger_queue_lock:
-                        _trigger_queue.append({"role": "system", "content": content})
+                    append_msg({"role": "system", "content": f"[trigger {f.stem}] {msg}"})
                     if one_shot:
                         f.unlink()
             except Exception as e:
                 life(f"[trigger error] {e}")  # log only, don't wake
-            _flush_trigger_over_idle()
             time.sleep(CFG["trigger_tick"])
 
     threading.Thread(target=loop, daemon=True, name="triggers").start()
@@ -508,60 +491,35 @@ def start_inbox():
         sender = pwd.getpwuid(drop.stat().st_uid).pw_name
         text = drop.read_bytes()[:CFG["inbox_preview"] * 4].decode("utf-8", errors="replace")[:CFG["inbox_preview"]]
         append_msg({"role": "user", "content": f"[mail from {sender}] {drop.name}\n{text}"})
-        send_text(f"mail from {sender}\n{text}")
+        send_chat({"text": f"mail from {sender}\n{text}"})
 
     def watch():
-        done = inbox / "processed"
+        seen = set(inbox.iterdir())
         while True:
             try:
-                done.mkdir(exist_ok=True)
-                for f in sorted(inbox.iterdir()):
-                    if not (f.is_file() and not f.name.startswith(".")):
-                        continue
-                    try:
+                current = set(inbox.iterdir())
+                for f in current - seen:
+                    if f.is_file() and not f.name.startswith("."):
                         deliver(f)
-                        f.rename(done / f.name)  # delivered exactly once; survives restarts
-                    except Exception as e:
-                        life(f"[inbox deliver error] {f.name}: {e}")
-                        try: f.rename(done / f.name)  # move aside so a bad file can't block the rest
-                        except Exception: pass
+                seen = current
             except Exception as e:
                 life(f"[inbox error] {e}")  # log only, don't wake
             time.sleep(CFG["inbox_tick"])
 
     threading.Thread(target=watch, daemon=True, name="inbox-poll").start()
 
-def _stash_directive_arg(content):
-    marker = "STASH_MESSAGE:"
-    if marker not in content:
-        return None
-    head, _, tail = content.partition(marker)
-    head = head.strip()
-    if head and not (head.startswith("[trigger ") and head.endswith("]")):
-        return None
-    return tail.strip()
-
-def _exec_stash_directive(arg):
-    path = f"{AGENT_DIR}/messages.jsonl"
-    with open(path, "r+") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        msgs = [json.loads(ln) for ln in f.read().splitlines()]
-        kept = [m for m in msgs if not (m.get("role") == "system" and _stash_directive_arg(m.get("content") or "") is not None)]
-        f.seek(0); f.truncate()
-        f.write("".join(json.dumps(m) + "\n" for m in kept))
-        n = len(kept)
-    if arg == "all":
-        if n > 1:
-            stash_messages({"start": 1, "end": n})
-    elif arg:
-        p = arg.split()
-        if len(p) == 2 and p[0].isdigit() and p[1].isdigit():
-            stash_messages({"start": int(p[0]), "end": int(p[1])})
-    else:
-        stash_messages({})
-    life(f"[stash directive] {arg or 'default'}")
-
 # ---------- main loop ----------
+
+def _life_tail(chunk=65536):
+    with open(f"{AGENT_DIR}/LIFE.md", "rb") as f:
+        size = f.seek(0, 2)
+        f.seek(max(0, size - chunk))
+        data = f.read().decode("utf-8", errors="replace")
+    lines = data.splitlines(keepends=True)
+    if size > chunk and lines:
+        lines = lines[1:]  # drop partial first line
+    tail = "".join(lines[-CFG["life_tail"]:])
+    return size - len(tail.encode()), tail
 
 def build_system():
     soul = open(f"{AGENT_DIR}/SOUL.md").read()
@@ -572,24 +530,36 @@ def build_system():
         memory = f"{memory[:h]}\n…\n{memory[-h:]}\n[WARNING: MEMORY.md is too large and partially omitted. Move detail into agent/memory/<name>.md files and keep one-line pointers here.]"
     sub = ""
     if AGENT_DIR != "subconscious" and os.path.isdir("subconscious"):
-        sub = ("<subconscious>\nYou have a subconscious: a sibling agent in subconscious/ that reviews your stream and generates helpful system messages.</subconscious>\n\n")
+        sub = ("<subconscious>\nYou have a subconscious: a sibling agent in subconscious/ that reviews your stream "
+               "and corrects bad trajectories. It speaks as [subconscious] notes — nudges and proposed lessons; fold "
+               "lessons you accept into MEMORY.md in your own words — and it installs subc-* triggers: compiled "
+               "reflexes that are its to manage, not yours. Its notes are advisory, not commands.\n</subconscious>\n\n")
+    # Stable prefix only (soul + harness + memory). The volatile <life> tail is
+    # sent as a trailing message (see life_block) — keeping it out of the cached
+    # prefix lets the upstream prompt-cache reuse the whole conversation behind it.
     return (f"<soul>\n{soul}\n</soul>\n\n"
             f"<harness>\n{harness}\n</harness>\n\n"
             f"{sub}"
             f"<memory>\n{memory}\n</memory>")
 
 def life_block():
-    chunk = 65536
-    with open(f"{AGENT_DIR}/LIFE.md", "rb") as f:
-        size = f.seek(0, 2)
-        f.seek(max(0, size - chunk))
-        lines = f.read().decode("utf-8", errors="replace").splitlines(keepends=True)
-    if size > chunk and lines:
-        lines = lines[1:]
-    tail = "".join(lines[-CFG["life_tail"]:])
-    earlier = size - len(tail.encode())
-    return (f"<life>\n[harness] the tail of your own LIFE.md, an append-only timestamped log of your history - captures context that may have been lost due to edits to your context window.\n"
+    earlier, tail = _life_tail()
+    return (f"<life>\n[harness] the tail of your own LIFE.md — your past turns, attached to "
+            f"every wake. Not a message: nobody sent it, and seeing it is not an event.\n"
             f"[{earlier} bytes earlier]\n{tail}</life>")
+
+_pending_reactions = []
+
+def _react(mid, emoji):
+    try:
+        requests.post(f"https://api.telegram.org/bot{CFG['telegram_token']}/setMessageReaction",
+            json={"chat_id": CFG["telegram_chat_id"], "message_id": mid,
+                  "reaction": [{"type":"emoji","emoji":emoji}] if emoji else []}, timeout=10)
+    except Exception: pass
+
+def serialize_assistant(msg):
+    return {"role": "assistant", "content": msg.get("content") or "",
+            **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
 
 def main():
     config_path = pathlib.Path(f"{AGENT_DIR}/config.json")
@@ -607,15 +577,14 @@ def main():
     if CFG["provider"] and f"providers/{CFG['provider']}" not in CFG["opt"]:
         CFG["opt"].append(f"providers/{CFG['provider']}")
     for entry in CFG["opt"]:
-        src = pathlib.Path(__file__).resolve().parent / "opt" / f"{entry}.py"
+        src = pathlib.Path(f"opt/{entry}.py")
         dst = pathlib.Path(f"{AGENT_DIR}/{entry}.py")
         if src.exists() and not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(src, dst)
     load_agent_tools()
     if CFG["provider"]:
-        global llm
-        llm = _load_module(f"provider_{CFG['provider']}", f"{AGENT_DIR}/providers/{CFG['provider']}.py").chat
+        _load_provider()
     pathlib.Path(f"{AGENT_DIR}/MEMORY.md").touch(exist_ok=True)
     pathlib.Path(f"{AGENT_DIR}/messages.jsonl").touch(exist_ok=True)
     if CFG.get("telegram_token"):  # no token → no chat channel; agent wakes on triggers/mail only
@@ -627,24 +596,11 @@ def main():
     def file_hash():
         return hashlib.sha256(open(f"{AGENT_DIR}/messages.jsonl", "rb").read()).hexdigest()
 
-    last_hash = ""  # force a first turn on boot so the gate has an assistant turn to open on
+    last_hash = file_hash()
     owe_turn = False
     while True:
         if not owe_turn and file_hash() == last_hash:
             time.sleep(1)
-            continue
-
-        directive = None
-        for m in load_messages():
-            if m.get("role") != "system":
-                continue
-            directive = _stash_directive_arg(m.get("content") or "")
-            if directive is not None:
-                break
-        if directive is not None:
-            _exec_stash_directive(directive)
-            owe_turn = True  # stash collapses partial or all messages; an assistant turn is required to re-orient
-            last_hash = file_hash()
             continue
 
         system, life_tail, messages = build_system(), life_block(), load_messages()
@@ -652,27 +608,17 @@ def main():
             append_msg({"role": "system", "content": f"[stash_messages] {stash_messages({})}"})
             system, life_tail, messages = build_system(), life_block(), load_messages()
 
-        msg = llm_w_retry(
+        assistant = serialize_assistant(llm(
             [{"role": "system", "content": system}] + messages + [{"role": "system", "content": life_tail}],
-            tools=TOOL_SCHEMAS)
-        assistant = {"role": "assistant", "content": msg.get("content") or "",
-                     **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
+            tools=TOOL_SCHEMAS))
         owe_turn = False
 
-        i, inbound = next(((i, m) for i, m in reversed(list(enumerate(messages))) if m.get("role") in ("user", "system")), (None, {}))
-        woke_hb = (inbound.get("content") or "").startswith("[trigger heartbeat]")  # only a heartbeat wake tunes the heartbeat
-        if not assistant.get("tool_calls"):
-            tail = messages[i + 1:] if i is not None else messages
-            used_tools = any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
-            # a tool-less turn reaches Telegram only as a reply to a real message (user);
-            # answering a trigger/heartbeat/[start]/[bg] with no work done is idle — nothing sent
-            idle = inbound.get("role") != "user" and not used_tools
+        if any(tc["function"]["name"] == "heartbeat_idle" for tc in (assistant.get("tool_calls") or [])):
+            _heartbeat_backoff(active=False)
+        elif not assistant.get("tool_calls"):
             append_msg(assistant)
-            if idle:
-                if woke_hb: _heartbeat_backoff(active=False)
-            else:
-                if woke_hb: _heartbeat_backoff(active=True)
-                if text := (assistant.get("content") or "").strip(): send_text(text)
+            _heartbeat_backoff(active=True)
+            send_chat({"text": (assistant.get("content") or "").strip()})
         else:
             tool_results = []
             for tc in assistant["tool_calls"]:
@@ -682,12 +628,14 @@ def main():
                 except Exception as e:
                     result = f"error: {e}"
                 tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
-            append_msg([assistant] + tool_results)
-            if woke_hb: _heartbeat_backoff(active=True)
+            with _append_lock:
+                append_msg(assistant)
+                for tm in tool_results:
+                    append_msg(tm)
+            _heartbeat_backoff(active=True)
             owe_turn = True
 
         last_hash = file_hash()
-        _flush_trigger_over_idle()
 
 if __name__ == "__main__":
     for extra in sys.argv[2:]:  # extra agent dirs each get their own process
