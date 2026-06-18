@@ -153,25 +153,28 @@ def _tg_send(endpoint, payload, files=None, cfg=None):
                       data=payload, files=files, timeout=60)
     data = r.json()
     if not data.get("ok"):
-        life(f"[send_chat error] {data}")
+        life(f"[telegram send error] {data}")
         return f"telegram error: {data.get('description', data)}"
     return None
 
-def send_chat(args):
+def send_text(text):
     if not CFG.get("telegram_token"):
         return "no chat configured"
+    errors = [err for i in range(0, len(text), CFG["chat_msg_max"])
+              if (err := _tg_send("sendMessage", {"text": text[i:i+CFG['chat_msg_max']]}))]
+    return errors[0] if errors else "sent"
+
+def send_attachment(args):
+    if not CFG.get("telegram_token"):
+        return "no chat configured"
+    if not (path := args.get("path")):
+        return "error: SEND_ATTACHMENT requires path; text-only chat replies are automatic"
     text = args.get("text", "")
-    if path := args.get("path"):
-        ext = pathlib.Path(path).suffix.lower().lstrip(".")
-        endpoint, field = _TG_MEDIA.get(ext, ("sendDocument", "document"))
-        with open(path, "rb") as f:
-            err = _tg_send(endpoint, {"caption": text[:1024]}, files={field: f})
-        result = err or f"sent {field} {path}"
-    else:
-        errors = [err for i in range(0, len(text), CFG["chat_msg_max"])
-                  if (err := _tg_send("sendMessage", {"text": text[i:i+CFG['chat_msg_max']]}))]
-        result = errors[0] if errors else "sent"
-    return result
+    ext = pathlib.Path(path).suffix.lower().lstrip(".")
+    endpoint, field = _TG_MEDIA.get(ext, ("sendDocument", "document"))
+    with open(path, "rb") as f:
+        err = _tg_send(endpoint, {"caption": text[:1024]}, files={field: f})
+    return err or f"sent {field} {path}"
 
 def stash(content):
     h = hashlib.sha256(content.encode()).hexdigest()[:12]
@@ -281,8 +284,8 @@ def stash_messages(args):
     return f"{end - start + 1} lines stashed to {marker}"
 
 TOOLS = [
-    ("SEND_CHAT", send_chat, "Send a message to the chat. With just `text`, sends a normal text message. With `path`, sends that file as an attachment (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise); `text` becomes the caption (capped at 1024 chars by telegram).",
-        {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["text"]}),
+    ("SEND_ATTACHMENT", send_attachment, "Send a file to the chat. Requires `path`; `text` becomes the caption (capped at 1024 chars by telegram). Text-only chat replies are automatic; this tool rejects text-only sends.",
+        {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["path"]}),
     ("READ_FILE", read_file, "Read a file.",
         {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
     ("WRITE_FILE", write_file, "Overwrite a file.",
@@ -521,7 +524,7 @@ def start_inbox():
         sender = pwd.getpwuid(drop.stat().st_uid).pw_name
         text = drop.read_bytes()[:CFG["inbox_preview"] * 4].decode("utf-8", errors="replace")[:CFG["inbox_preview"]]
         append_msg({"role": "user", "content": f"[mail from {sender}] {drop.name}\n{text}"})
-        send_chat({"text": f"mail from {sender}\n{text}"})
+        send_text(f"mail from {sender}\n{text}")
 
     def watch():
         done = inbox / "processed"
@@ -691,13 +694,15 @@ def main():
             i, inbound = _last_inbound(messages)
             tail = messages[i + 1:] if i is not None else messages
             used_tools = any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
-            idle_trigger = inbound.get("role") == "system" and (inbound.get("content") or "").startswith("[trigger ") and not used_tools
+            content = inbound.get("content") or ""
+            idle_trigger = inbound.get("role") == "system" and content.startswith("[trigger ") and not used_tools
             append_msg(assistant)
             if idle_trigger:
-                _heartbeat_backoff(active=False)
+                if content.startswith("[trigger heartbeat]"):
+                    _heartbeat_backoff(active=False)
             else:
                 _heartbeat_backoff(active=True)
-                send_chat({"text": (assistant.get("content") or "").strip()})
+                send_text((assistant.get("content") or "").strip())
         else:
             tool_results = []
             for tc in assistant["tool_calls"]:
