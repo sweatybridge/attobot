@@ -411,16 +411,6 @@ def start_chat():
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
 
-def _heartbeat_backoff(reset):
-    f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
-    try:
-        job = json.loads(f.read_text())
-    except Exception:
-        return
-    job["idles"] = 0 if reset else job.get("idles", 0) + 1
-    job["next"] = time.time() + min(job["repeat_s"] * 2 ** job["idles"], job.get("cap", 3600))
-    f.write_text(json.dumps(job))
-
 _trigger_queue = collections.deque()
 _trigger_queue_lock = threading.Lock()
 
@@ -679,9 +669,25 @@ def main():
             append_msg([assistant] + tool_results)
             owe_turn = True
 
-        # on a heartbeat wake, reset the interval if the agent did any tool call this wake, else lengthen it
-        if inbound.get("content", "").startswith("[trigger heartbeat]"):
-            _heartbeat_backoff(reset=did_tool_call)
+        # Tool activity resets heartbeat cadence; idle heartbeat turns back off.
+        if did_tool_call:
+            f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
+            try:
+                job = json.loads(f.read_text())
+                job["idles"] = 0
+                job["next"] = time.time() + job["repeat_s"]
+                f.write_text(json.dumps(job))
+            except Exception:
+                pass
+        elif inbound.get("content", "").startswith("[trigger heartbeat]"):
+            f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
+            try:
+                job = json.loads(f.read_text())
+                job["idles"] = job.get("idles", 0) + 1
+                job["next"] = time.time() + min(job["repeat_s"] * 2 ** job["idles"], job.get("cap", 3600))
+                f.write_text(json.dumps(job))
+            except Exception:
+                pass
 
         last_hash = file_hash()
         _flush_trigger_over_idle()
