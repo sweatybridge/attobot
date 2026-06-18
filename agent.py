@@ -640,7 +640,7 @@ def main():
                 break
         if directive is not None:
             _exec_stash_directive(directive)
-            owe_turn = True  # a stash collapses the stream to a system pointer; owe a turn to re-orient, else the loop wedges (no hash change, gate can't release a trigger over a system line)
+            owe_turn = True  # stash collapses partial or all messages; an assistant turn is required to re-orient
             last_hash = file_hash()
             continue
 
