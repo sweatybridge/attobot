@@ -284,8 +284,8 @@ def stash_messages(args):
     return f"{end - start + 1} lines stashed to {marker}"
 
 TOOLS = [
-    ("SEND_ATTACHMENT", send_attachment, "Send a file to the chat. Requires `path`; `text` becomes the caption (capped at 1024 chars by telegram). Text-only chat replies are automatic; this tool rejects text-only sends.",
-        {"type": "object", "properties": {"text": {"type": "string"}, "path": {"type": "string"}}, "required": ["path"]}),
+    ("SEND_ATTACHMENT", send_attachment, "Send a file to your Telegram topic (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise). `text` is an optional caption (capped at 1024 chars). For a plain text message, do NOT use this — just write a normal assistant reply.",
+        {"type": "object", "properties": {"path": {"type": "string"}, "text": {"type": "string"}}, "required": ["path"]}),
     ("READ_FILE", read_file, "Read a file.",
         {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}),
     ("WRITE_FILE", write_file, "Overwrite a file.",
@@ -690,18 +690,19 @@ def main():
             tools=TOOL_SCHEMAS))
         owe_turn = False
 
+        i, inbound = _last_inbound(messages)
+        woke_hb = (inbound.get("content") or "").startswith("[trigger heartbeat]")  # only a heartbeat wake tunes the heartbeat
         if not assistant.get("tool_calls"):
-            i, inbound = _last_inbound(messages)
             tail = messages[i + 1:] if i is not None else messages
             used_tools = any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
-            content = inbound.get("content") or ""
-            idle_trigger = inbound.get("role") == "system" and content.startswith("[trigger ") and not used_tools
+            # a tool-less turn reaches Telegram only as a reply to a real message (user);
+            # answering a trigger/heartbeat/[start]/[bg] with no work done is idle — nothing sent
+            idle = inbound.get("role") != "user" and not used_tools
             append_msg(assistant)
-            if idle_trigger:
-                if content.startswith("[trigger heartbeat]"):
-                    _heartbeat_backoff(active=False)
+            if idle:
+                if woke_hb: _heartbeat_backoff(active=False)
             else:
-                _heartbeat_backoff(active=True)
+                if woke_hb: _heartbeat_backoff(active=True)
                 send_text((assistant.get("content") or "").strip())
         else:
             tool_results = []
@@ -713,7 +714,7 @@ def main():
                     result = f"error: {e}"
                 tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
             append_msg([assistant] + tool_results)
-            _heartbeat_backoff(active=True)
+            if woke_hb: _heartbeat_backoff(active=True)
             owe_turn = True
 
         last_hash = file_hash()

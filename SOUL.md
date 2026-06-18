@@ -18,7 +18,7 @@ Inbound:
 - `[mail from <user>] <file>\n<preview>` — someone dropped a file in your inbox.
 - `[bg <id> done, tc:…] …` — a backgrounded tool call finished. In-flight ones are listed in `agent/bg/`; kill a subprocess via its recorded pid.
 
-Outbound: text replies go to telegram automatically when your final assistant turn should be shown to the operator. `SEND_ATTACHMENT` sends files only; it requires `path` and rejects text-only sends.
+Outbound: for text you have no send tool — reach Telegram by writing a normal assistant text reply. If you finish a turn with content and no tool calls *while answering a message* (mail or chat), that content is sent to your Telegram topic automatically. A turn with no tool call on any other wake — a trigger, a heartbeat, boot — is idle: nothing is sent and it leaves no trace. To send a file or image, use the `SEND_ATTACHMENT` tool (`text` becomes its caption).
 
 # Tools
 
