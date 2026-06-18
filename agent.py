@@ -411,13 +411,13 @@ def start_chat():
 
     threading.Thread(target=poll_in, daemon=True, name="chat-poll").start()
 
-def _heartbeat_backoff(active):
+def _heartbeat_backoff(reset):
     f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
     try:
         job = json.loads(f.read_text())
     except Exception:
         return
-    job["idles"] = 0 if active else job.get("idles", 0) + 1
+    job["idles"] = 0 if reset else job.get("idles", 0) + 1
     job["next"] = time.time() + min(job["repeat_s"] * 2 ** job["idles"], job.get("cap", 3600))
     f.write_text(json.dumps(job))
 
@@ -660,18 +660,11 @@ def main():
         owe_turn = False
 
         i, inbound = next(((i, m) for i, m in reversed(list(enumerate(messages))) if m.get("role") in ("user", "system")), (None, {}))
-        woke_hb = (inbound.get("content") or "").startswith("[trigger heartbeat]")  # only a heartbeat wake tunes the heartbeat
+        tail = messages[i + 1:] if i is not None else messages
+        did_tool_call = bool(assistant.get("tool_calls")) or any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
         if not assistant.get("tool_calls"):
-            tail = messages[i + 1:] if i is not None else messages
-            used_tools = any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
-            # a tool-less turn reaches Telegram only as a reply to a real message (user);
-            # answering a trigger/heartbeat/[start]/[bg] with no work done is idle — nothing sent
-            idle = inbound.get("role") != "user" and not used_tools
             append_msg(assistant)
-            if idle:
-                if woke_hb: _heartbeat_backoff(active=False)
-            else:
-                if woke_hb: _heartbeat_backoff(active=True)
+            if inbound.get("role") == "user" or did_tool_call:
                 if text := (assistant.get("content") or "").strip(): send_text(text)
         else:
             tool_results = []
@@ -683,8 +676,11 @@ def main():
                     result = f"error: {e}"
                 tool_results.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
             append_msg([assistant] + tool_results)
-            if woke_hb: _heartbeat_backoff(active=True)
             owe_turn = True
+
+        # on a heartbeat wake, reset the interval if the agent did any tool call this wake, else lengthen it
+        if inbound.get("content", "").startswith("[trigger heartbeat]"):
+            _heartbeat_backoff(reset=did_tool_call)
 
         last_hash = file_hash()
         _flush_trigger_over_idle()
