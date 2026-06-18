@@ -653,7 +653,9 @@ def main():
             system, life_tail, messages = build_system(), life_block(), load_messages()
 
         msg = llm_w_retry(
-            [{"role": "system", "content": system}] + messages + [{"role": "system", "content": life_tail}],
+            # the fixed user turn guarantees every request has ≥1 user message — GLM/Zhipu reject
+            # arrays with none (autonomous agents run on triggers/heartbeats, otherwise no user turn).
+            [{"role": "system", "content": system}] + [{"role": "user", "content": "Be Useful"}] + messages + [{"role": "system", "content": life_tail}],
             tools=TOOL_SCHEMAS)
         assistant = {"role": "assistant", "content": msg.get("content") or "",
                      **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
