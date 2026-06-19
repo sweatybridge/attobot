@@ -629,6 +629,7 @@ def assistant_msg(msg):
 
 def main():
     config_path = pathlib.Path(f"{AGENT_DIR}/config.json")
+    print(f"starting agent with config {config_path}...")
     if not config_path.exists():
         sys.exit(f"missing {config_path}. Run: python setup.py")
     if not pathlib.Path(f"{AGENT_DIR}/SOUL.md").exists():

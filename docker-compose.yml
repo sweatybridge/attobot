@@ -1,0 +1,34 @@
+# attobot + Ollama (host) — single-host deployment
+#
+# Prerequisites:
+#   1. Ollama installed and running on the host (default: http://host.docker.internal:11434)
+#   2. Pull a model: `ollama pull llama3.1:latest`
+#   3. Run python setup.py --subconscious and fill in your settings
+#   4. docker & docker-compose installed
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f attobot   # follow agent output
+#
+# To reconfigure:
+#   Edit agent/config.json, then: docker compose restart attobot
+
+services:
+  attobot:
+    build:
+      context: .
+    command:
+      - agent
+    volumes:
+      - ./agent:/attobot/agent   # persistent state (messages, config, triggers)
+    restart: unless-stopped
+
+  subconscious:
+    build:
+      context: .
+    command:
+      - subconscious
+    volumes:
+      - ./subconscious:/attobot/subconscious
+      - ./agent:/attobot/agent   # allow subconscious to manage agent state
+    restart: unless-stopped

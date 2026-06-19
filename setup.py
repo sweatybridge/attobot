@@ -67,6 +67,7 @@ p.add_argument("--thread", help='Telegram thread_id (forum topic).')
 p.add_argument("--api-key", dest="api_key", help='LLM provider API key (Moonshot, OpenAI, etc.)')
 p.add_argument("--subconscious", action="store_true", help="also install opt/subconscious as a sibling agent dir")
 p.add_argument("--systemd", action="store_true", help="also emit attobot.service + install instructions")
+p.add_argument("--config", default="config.json", help='Path to base config file')
 args = p.parse_args()
 
 self_dir = pathlib.Path(args.dir)
@@ -75,7 +76,8 @@ if config_path.exists():
     sys.exit(f"{config_path} already exists. Delete it to reconfigure.")
 self_dir.mkdir(parents=True, exist_ok=True)
 
-cfg = {}
+cfg_path = pathlib.Path(args.config)
+cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
 if args.token is not None:
     cfg["telegram_token"] = args.token
 if args.chat is not None:
@@ -116,7 +118,8 @@ if args.subconscious:
     if sub.exists():
         sys.exit(f"{sub} already exists. Delete it to reconfigure.")
     shutil.copytree(pathlib.Path(__file__).parent / "opt" / "subconscious", sub)
-    (sub / "config.json").write_text(json.dumps({"api_key": cfg["api_key"]}, indent=2))
+    sub_config = {k: v for k, v in cfg.items() if not k.startswith("telegram_")}
+    (sub / "config.json").write_text(json.dumps(sub_config, indent=2))
     print(f"wrote {sub}/ (run both: python agent.py {args.dir} subconscious)")
 
 if args.systemd:
