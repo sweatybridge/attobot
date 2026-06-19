@@ -2,8 +2,10 @@
 
 attobot is now a Postgres-resident agent harness. Agent state, turns, tool calls,
 triggers, blobs, and outbound messages live in PostgreSQL tables under the
-`attobot` schema. `pg_durable` owns the durable workflow execution, so a turn can
-survive database restarts and resume from its last checkpoint.
+`attobot` schema. Agents point at shared rows in `attobot.models`, so multiple
+agents can reuse the same model configuration. `pg_durable` owns the durable
+workflow execution, so a turn can survive database restarts and resume from its
+last checkpoint.
 
 The old filesystem loop is gone. `agent.py` is only a thin client for inserting
 messages and inspecting database state.
@@ -12,7 +14,7 @@ messages and inspecting database state.
 
 ```
 operator/client
-  -> attobot.append_user_message(...)
+  -> attobot.append_message(..., 'user', ...)
   -> attobot.start_turn(...)
   -> pg_durable workflow
        -> attobot.compose_llm_request(...)
@@ -45,7 +47,8 @@ docker compose up -d
 
 Fresh containers initialize `primary` and `subconscious` agents automatically in
 the Docker entrypoint. Set `ATTOBOT_API_KEY` before first boot to seed both
-agents with an LLM key:
+agents with an LLM key. Secrets are stored in agent-scoped `attobot.config`
+rows:
 
 ```bash
 ATTOBOT_API_KEY=sk-... docker compose up -d
@@ -71,6 +74,12 @@ $$,
 );
 ```
 
+To update only a secret:
+
+```sql
+SELECT attobot.set_config('primary', 'api_key', to_jsonb('sk-...'::text));
+```
+
 The `subconscious` agent is also seeded with a `primary-review` interval trigger
 that wakes it every 600 seconds when you run the trigger loop for that agent.
 
@@ -86,32 +95,39 @@ Read queued outbound messages:
 python agent.py outbox
 ```
 
-The default DSN is `postgresql://postgres:secret@localhost:5432/postgres`.
+The default DSN is `postgresql://postgres:secret@127.0.0.1:5432/postgres`.
 Override it with `--dsn` or `ATTOBOT_DSN`.
 
 ## Telegram
 
-Configure Telegram for an agent:
+For a clean database, configure and start the primary agent's durable Telegram
+inbox loop from the Docker entrypoint:
 
 ```bash
-python agent.py telegram-config --token 123:abc --chat-id -1001234567
+ATTOBOT_TELEGRAM_TOKEN=123:abc \
+ATTOBOT_TELEGRAM_CHAT_ID=-1001234567 \
+docker compose up -d
 ```
 
-For a forum topic, include `--thread-id 42`.
+For a forum topic, also set `ATTOBOT_TELEGRAM_THREAD_ID=42`. Override the
+poll schedule with `ATTOBOT_TELEGRAM_POLL_CRON`; the default is `* * * * *`.
 
-Start the durable Telegram ingress and egress loops:
-
-```bash
-python agent.py telegram-start
-```
+To update stored Telegram settings later, use `python agent.py telegram-config`.
+It stores the token and chat metadata as agent-scoped `attobot.config` rows.
 
 The inbox loop calls Telegram `getUpdates` through `pg_durable` and appends
 accepted messages as `[telegram <update_id>] ...` user messages. It accepts only
 the configured chat, and the configured topic when `telegram_thread_id` is set.
 
-The outbox loop drains pending `attobot.outbox` rows with channel `chat` or
-`telegram` through Telegram `sendMessage`. The `SEND_CHAT` tool still only queues
-messages; Telegram delivery is handled by the durable outbox loop.
+If you want Telegram delivery for outbox rows, start the durable outbox loop from
+SQL:
+
+```sql
+SELECT attobot.start_telegram_outbox_loop('primary');
+```
+
+The `SEND_CHAT` tool still only queues messages; Telegram delivery is handled by
+the durable outbox loop.
 
 ## Durable Loops
 
@@ -137,11 +153,12 @@ SELECT attobot.start_trigger_loop('primary');
 ## Tables
 
 - `attobot.agents`: one row per agent.
+- `attobot.models`: reusable model, endpoint, temperature, and reasoning configuration.
 - `attobot.config`: per-agent configuration and secrets.
 - `attobot.messages`: canonical conversation stream.
 - `attobot.tool_requests`: pending/running/completed tool calls.
 - `attobot.outbox`: outbound messages for chat relays or clients.
-- `attobot.blobs`: content-addressed large text storage.
+- `attobot.blobs`: content-addressed large content storage as external `bytea`.
 - `attobot.triggers`: interval triggers fired by a durable trigger loop.
 - `attobot.telegram_updates`: accepted Telegram updates for idempotency/audit.
 - `attobot.lifecycle`: append-only operational events.

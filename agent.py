@@ -9,7 +9,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 
-DEFAULT_DSN = "postgresql://postgres:secret@localhost:5432/postgres"
+DEFAULT_DSN = "postgresql://postgres:secret@127.0.0.1:5432/postgres"
 
 
 def connect(args):
@@ -20,7 +20,7 @@ def send(args):
     with connect(args) as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT attobot.append_user_message(%s, %s) AS message_id",
+                "SELECT attobot.append_message(%s, 'user', %s) AS message_id",
                 (args.agent, args.message),
             )
             message_id = cur.fetchone()["message_id"]
@@ -84,22 +84,6 @@ def telegram_config(args):
     print(f"configured telegram for {args.agent}")
 
 
-def telegram_start(args):
-    with connect(args) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT attobot.start_telegram_inbox_loop(%s, %s) AS inbox_instance",
-                (args.agent, args.poll_cron),
-            )
-            inbox_instance = cur.fetchone()["inbox_instance"]
-            cur.execute(
-                "SELECT attobot.start_telegram_outbox_loop(%s, %s) AS outbox_instance",
-                (args.agent, args.send_cron),
-            )
-            outbox_instance = cur.fetchone()["outbox_instance"]
-    print(f"telegram inbox {inbox_instance}; outbox {outbox_instance}")
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dsn")
@@ -125,11 +109,6 @@ def main():
     telegram_config_parser.add_argument("--thread-id")
     telegram_config_parser.add_argument("--api-base", default="https://api.telegram.org")
     telegram_config_parser.set_defaults(func=telegram_config)
-
-    telegram_start_parser = sub.add_parser("telegram-start")
-    telegram_start_parser.add_argument("--poll-cron", default="* * * * *")
-    telegram_start_parser.add_argument("--send-cron", default="* * * * *")
-    telegram_start_parser.set_defaults(func=telegram_start)
 
     args = parser.parse_args()
     try:

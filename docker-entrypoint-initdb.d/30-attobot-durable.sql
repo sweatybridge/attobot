@@ -1,3 +1,23 @@
+CREATE OR REPLACE FUNCTION attobot.finish_turn(p_agent_slug text, p_turn_id bigint DEFAULT NULL)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_agent_id bigint := attobot.agent_id(p_agent_slug);
+BEGIN
+  IF p_turn_id IS NOT NULL THEN
+    UPDATE attobot.turns
+    SET status = 'completed',
+        updated_at = now()
+    WHERE id = p_turn_id
+      AND agent_id = v_agent_id;
+  END IF;
+
+  PERFORM attobot.log_event(v_agent_id, 'turn.complete', '{}'::jsonb);
+  RETURN 'completed';
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION attobot.start_turn(p_agent_slug text DEFAULT 'primary')
 RETURNS text
 LANGUAGE plpgsql
@@ -14,15 +34,15 @@ BEGIN
   SELECT df.start(
     format('SELECT attobot.compose_llm_request(%L)::text AS body', p_agent_slug) |=> 'request'
     ~> df.http(
-      attobot.llm_url(p_agent_slug),
+      attobot._llm_url(p_agent_slug),
       'POST',
       '$request.body',
-      attobot.llm_headers(p_agent_slug),
+      attobot._llm_headers(p_agent_slug),
       120
     ) |=> 'http_response'
     ~> format('SELECT attobot.record_assistant_from_http(%L, $http_response::jsonb)::jsonb AS assistant', p_agent_slug)
     ~> df.if(
-      format('SELECT attobot.has_pending_tool_requests(%L)', p_agent_slug),
+      format('SELECT attobot._has_pending_tool_requests(%L)', p_agent_slug),
       format('SELECT attobot.run_pending_tool_requests(%L)::jsonb AS tool_results', p_agent_slug)
         ~> format('SELECT attobot.start_turn(%L) AS next_instance', p_agent_slug),
       format('SELECT attobot.finish_turn(%L, %s) AS done', p_agent_slug, v_turn_id)
@@ -59,7 +79,7 @@ BEGIN
   SELECT df.start(
     df.loop(
       df.wait_for_schedule(p_cron)
-      ~> format('SELECT attobot.append_system_message(%L, %L)::bigint AS message_id', p_agent_slug, '[trigger heartbeat] tick')
+      ~> format('SELECT attobot.append_message(%L, %L, %L)::bigint AS message_id', p_agent_slug, 'system', '[trigger heartbeat] tick')
       ~> format('SELECT attobot.start_turn(%L) AS durable_instance_id', p_agent_slug)
     ),
     format('attobot:%s:agent-loop', p_agent_slug)
@@ -116,8 +136,9 @@ BEGIN
     ORDER BY next_after, id
     FOR UPDATE
   LOOP
-    PERFORM attobot.append_system_message(
+    PERFORM attobot.append_message(
       p_agent_slug,
+      'system',
       format('[trigger %s] %s', v_trigger.name, v_trigger.message)
     );
 
@@ -176,10 +197,10 @@ BEGIN
       df.wait_for_schedule(p_cron)
       ~> format('SELECT attobot.telegram_get_updates_body(%L)::text AS body', p_agent_slug) |=> 'request'
       ~> df.http(
-        attobot.telegram_api_url(p_agent_slug, 'getUpdates'),
+        attobot._telegram_api_url(p_agent_slug, 'getUpdates'),
         'POST',
         '$request.body',
-        attobot.telegram_headers(),
+        attobot._telegram_headers(),
         30
       ) |=> 'http_response'
       ~> format('SELECT attobot.process_telegram_updates(%L, $http_response::jsonb)::jsonb AS result', p_agent_slug)
@@ -209,10 +230,10 @@ BEGIN
       ~> df.if(
         'SELECT $claim.has_outbox',
         df.http(
-          attobot.telegram_api_url(p_agent_slug, 'sendMessage'),
+          attobot._telegram_api_url(p_agent_slug, 'sendMessage'),
           'POST',
           '$claim.request_body',
-          attobot.telegram_headers(),
+          attobot._telegram_headers(),
           30
         ) |=> 'http_response'
           ~> format('SELECT attobot.record_telegram_send_result(%L, $claim.outbox_id, $http_response::jsonb)::jsonb AS result', p_agent_slug),

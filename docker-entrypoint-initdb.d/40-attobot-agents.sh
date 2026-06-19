@@ -6,7 +6,12 @@ psql -v ON_ERROR_STOP=1 \
   --dbname postgres \
   -v api_key="${ATTOBOT_API_KEY:-}" \
   -v model="${ATTOBOT_MODEL:-deepseek-v4-pro}" \
-  -v api_base="${ATTOBOT_API_BASE:-https://api.deepseek.com/v1}" <<'EOSQL'
+  -v api_base="${ATTOBOT_API_BASE:-https://api.deepseek.com/v1}" \
+  -v telegram_token="${ATTOBOT_TELEGRAM_TOKEN:-}" \
+  -v telegram_chat_id="${ATTOBOT_TELEGRAM_CHAT_ID:-}" \
+  -v telegram_thread_id="${ATTOBOT_TELEGRAM_THREAD_ID:-}" \
+  -v telegram_api_base="${ATTOBOT_TELEGRAM_API_BASE:-https://api.telegram.org}" \
+  -v telegram_poll_cron="${ATTOBOT_TELEGRAM_POLL_CRON:-* * * * *}" <<'EOSQL'
 SELECT attobot.ensure_agent(
   p_slug => 'primary',
   p_soul => $primary_soul$
@@ -55,4 +60,21 @@ SELECT attobot.install_interval_trigger(
   p_interval_seconds => 600,
   p_message => 'review the primary agent stream for actionable corrections'
 );
+
+SELECT attobot.configure_telegram(
+  p_agent_slug => 'primary',
+  p_token => :'telegram_token',
+  p_chat_id => :'telegram_chat_id',
+  p_thread_id => NULLIF(:'telegram_thread_id', ''),
+  p_api_base => COALESCE(NULLIF(:'telegram_api_base', ''), 'https://api.telegram.org')
+)
+WHERE NULLIF(:'telegram_token', '') IS NOT NULL
+  AND NULLIF(:'telegram_chat_id', '') IS NOT NULL;
+
+SELECT attobot.start_telegram_inbox_loop(
+  p_agent_slug => 'primary',
+  p_cron => COALESCE(NULLIF(:'telegram_poll_cron', ''), '* * * * *')
+)
+WHERE NULLIF(:'telegram_token', '') IS NOT NULL
+  AND NULLIF(:'telegram_chat_id', '') IS NOT NULL;
 EOSQL

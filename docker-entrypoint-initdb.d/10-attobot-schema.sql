@@ -1,14 +1,21 @@
 CREATE SCHEMA IF NOT EXISTS attobot;
 
-CREATE TABLE IF NOT EXISTS attobot.agents (
+CREATE TABLE IF NOT EXISTS attobot.models (
   id bigserial PRIMARY KEY,
-  slug text NOT NULL UNIQUE,
-  soul text NOT NULL DEFAULT '',
-  model text NOT NULL DEFAULT 'deepseek-v4-pro',
+  name text NOT NULL DEFAULT 'deepseek-v4-pro',
   api_base text NOT NULL DEFAULT 'https://api.deepseek.com/v1',
   temperature numeric NOT NULL DEFAULT 1.0,
   reasoning_effort text NOT NULL DEFAULT 'medium',
   context_tokens integer NOT NULL DEFAULT 1000000,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (name, api_base, temperature, reasoning_effort, context_tokens)
+);
+
+CREATE TABLE IF NOT EXISTS attobot.agents (
+  id bigserial PRIMARY KEY,
+  slug text NOT NULL UNIQUE,
+  soul text NOT NULL DEFAULT '',
+  model_id bigint NOT NULL REFERENCES attobot.models(id) ON DELETE RESTRICT,
   enabled boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -70,10 +77,12 @@ CREATE INDEX IF NOT EXISTS outbox_agent_status_idx ON attobot.outbox(agent_id, s
 CREATE TABLE IF NOT EXISTS attobot.blobs (
   agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
   hash text NOT NULL,
-  content text NOT NULL,
+  content bytea NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (agent_id, hash)
 );
+
+ALTER TABLE attobot.blobs ALTER COLUMN content SET STORAGE EXTERNAL;
 
 CREATE TABLE IF NOT EXISTS attobot.triggers (
   id bigserial PRIMARY KEY,
