@@ -5,3 +5,5 @@ __pycache__/
 agent/
 /subconscious/
 config.json
+claude-code-fork/
+agent.py.bak-attosys

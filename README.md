@@ -15,7 +15,7 @@ hash messages.jsonl
   llm(<soul> + <harness> + <memory> + <life-tail>, messages, tools)
   append assistant reply
   if tool_calls: run each via bg_run, append results
-  else: SEND_CHAT(content)
+  else: automatic telegram text reply
 ```
 
 That's `agent.py`. Channels, tools, and the backgrounding wrapper all live inline in the same file.
@@ -24,13 +24,13 @@ That's `agent.py`. Channels, tools, and the backgrounding wrapper all live inlin
 
 Three daemon threads append to `messages.jsonl`:
 
-- **telegram** — `start_chat()` long-polls `getUpdates`. Inbound text → `{role:user, content:"[telegram <id>] …"}`. Only the `chat_id`/`thread_id` locked in `config.json` is accepted. Optional: no `telegram_token` in config → no chat channel, `SEND_CHAT` returns "no chat configured"; the agent wakes on triggers/mail only.
-- **triggers** — `start_triggers()` scans `agent/triggers/*.json` every 30s; due ones append `{role:system, content:"[trigger <name>] …"}`. Three kinds: a **cron** — `{"next": <ts>, "repeat_s": <s?>, "message": "…"}` — fires on the clock (repeating ones reschedule, one-shots delete); a **watch** — `{"watch": "<path>", "repeat_s": <cooldown?>, "message": "…"}` — fires when the file's content changes; a **cmd** — `{"cmd": "<shell>", "repeat_s": <s?>}` — runs the command and fires with its stdout (clipped), no output = no fire. Combined with `watch`, the cmd is fed each appended byte exactly once on stdin (starting from install): every change is examined, nothing is ever skipped, and genuine machinery lines (`[trigger`/`[subconscious]` system messages — not e.g. an operator quoting one) are filtered out, so heuristics structurally can't self-loop or ping-pong. The trigger thread is the only writer of trigger files; its sole contract with the turn loop is the stream itself. Fires are appended to it, and the agent's replies read back from it are the verdicts: an unanswered fire holds its trigger (one in flight, state frozen, nothing lost — no trigger can flood the stream), and for triggers with `"backoff": <cap_s>` the reply judges whichever triggers woke that turn — `[IDLE]` doubles their interval toward the cap, anything else resets it to `repeat_s`; triggers that didn't fire keep their own schedule. Useless wakers quiet down on their own. The heartbeat is just a shipped backoff cron.
+- **telegram** — `start_chat()` long-polls `getUpdates`. Inbound text → `{role:user, content:"[telegram <id>] …"}`. Only the `chat_id`/`thread_id` locked in `config.json` is accepted. Optional: no `telegram_token` in config → no chat channel; the agent wakes on triggers/mail only.
+- **triggers** — `start_triggers()` scans `agent/triggers/*.json` every 30s; due ones append `{role:system, content:"[trigger <name>] …"}`. Three kinds: a **cron** — `{"next": <ts>, "repeat_s": <s?>, "message": "…"}` — fires on the clock (repeating ones reschedule, one-shots delete); a **watch** — `{"watch": "<path>", "repeat_s": <cooldown?>, "message": "…"}` — fires when the file's content changes; a **cmd** — `{"cmd": "<shell>", "repeat_s": <s?>}` — runs the command and fires with its stdout (clipped), no output = no fire. Combined with `watch`, the cmd runs when the file changes but receives no stdin; commands that need context should read files themselves. The trigger thread queues fires one at a time.
 - **mail** — `start_inbox()` polls `agent/mail_inbox/`. New files append `{role:system, content:"[mail from <unix-user>] <name>\n<preview>"}` and notify the operator via chat.
 
 ## Channel out
 
-`SEND_CHAT` writes back to telegram. There is no other output channel. Reply with no `tool_calls` → content goes to chat automatically.
+Text replies are sent to telegram automatically. `SEND_ATTACHMENT` sends files to telegram and rejects text-only sends.
 
 ## Tools
 
@@ -39,7 +39,7 @@ Declared in the `TOOLS` list in `agent.py`: `(NAME, fn, description, parameters)
 | name | what |
 |---|---|
 | `APPEND_MESSAGE` | inject a message into an agent's `messages.jsonl` (default own; `dir` targets a sibling agent, which wakes on it; also surfaced to the target's chat if it has one) |
-| `SEND_CHAT` | post to telegram |
+| `SEND_ATTACHMENT` | send a file to telegram |
 | `READ_FILE` | file → line-numbered text; images → multimodal content blocks (when `MULTIMODAL_SUPPORT=true`) |
 | `WRITE_FILE` / `EDIT_FILE` | filesystem writes; `EDIT_FILE` has optional `replace_all` |
 | `BASH` | run a shell command (returns Popen → `bg_run` can background it) |
