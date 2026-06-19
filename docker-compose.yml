@@ -10,6 +10,9 @@ services:
     environment:
       POSTGRES_PASSWORD: secret
       POSTGRES_DB: postgres
+      ATTOBOT_API_KEY: ${ATTOBOT_API_KEY:-}
+      ATTOBOT_MODEL: ${ATTOBOT_MODEL:-deepseek-v4-pro}
+      ATTOBOT_API_BASE: ${ATTOBOT_API_BASE:-https://api.deepseek.com/v1}
     ports:
       - "5432:5432"
     volumes:

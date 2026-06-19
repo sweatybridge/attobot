@@ -43,7 +43,17 @@ docker compose build
 docker compose up -d
 ```
 
-Initialize an agent and set its API key:
+Fresh containers initialize `primary` and `subconscious` agents automatically in
+the Docker entrypoint. Set `ATTOBOT_API_KEY` before first boot to seed both
+agents with an LLM key:
+
+```bash
+ATTOBOT_API_KEY=sk-... docker compose up -d
+```
+
+You can also override `ATTOBOT_MODEL` and `ATTOBOT_API_BASE`.
+
+To update an agent later:
 
 ```bash
 docker compose exec db psql -U postgres -d postgres
@@ -60,6 +70,9 @@ $$,
   p_api_key => 'sk-...'
 );
 ```
+
+The `subconscious` agent is also seeded with a `primary-review` interval trigger
+that wakes it every 600 seconds when you run the trigger loop for that agent.
 
 Send a message:
 
