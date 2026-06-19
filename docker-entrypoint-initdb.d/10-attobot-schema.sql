@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS attobot.messages (
 
 CREATE INDEX IF NOT EXISTS messages_agent_id_id_idx ON attobot.messages(agent_id, id);
 
+CREATE UNIQUE INDEX IF NOT EXISTS messages_telegram_update_agent_idx
+  ON attobot.messages(agent_id, ((payload #>> '{telegram_update,update_id}')))
+  WHERE payload #>> '{telegram_update,update_id}' IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS attobot.tool_requests (
   id bigserial PRIMARY KEY,
   agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
@@ -84,32 +88,6 @@ CREATE TABLE IF NOT EXISTS attobot.blobs (
 );
 
 ALTER TABLE attobot.blobs ALTER COLUMN content SET STORAGE EXTERNAL;
-
-CREATE TABLE IF NOT EXISTS attobot.triggers (
-  id bigserial PRIMARY KEY,
-  agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
-  name text NOT NULL,
-  interval_seconds integer NOT NULL CHECK (interval_seconds > 0),
-  message text NOT NULL,
-  enabled boolean NOT NULL DEFAULT true,
-  next_after timestamptz NOT NULL DEFAULT now(),
-  last_fired_at timestamptz,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (agent_id, name)
-);
-
-CREATE TABLE IF NOT EXISTS attobot.telegram_updates (
-  agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
-  update_id bigint NOT NULL,
-  payload jsonb NOT NULL,
-  message_id bigint REFERENCES attobot.messages(id) ON DELETE SET NULL,
-  received_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (agent_id, update_id)
-);
-
-CREATE INDEX IF NOT EXISTS telegram_updates_agent_received_idx
-  ON attobot.telegram_updates(agent_id, received_at DESC);
 
 CREATE TABLE IF NOT EXISTS attobot.turns (
   id bigserial PRIMARY KEY,

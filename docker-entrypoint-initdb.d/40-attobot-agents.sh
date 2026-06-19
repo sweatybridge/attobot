@@ -32,8 +32,8 @@ SELECT attobot.ensure_agent(
 You are the primary attobot agent.
 
 You run inside PostgreSQL. Your durable state is in the attobot schema:
-messages, tool requests, outbox rows, blobs, triggers, lifecycle events, and
-turn records. You do not own a filesystem harness.
+messages, tool requests, outbox rows, blobs, lifecycle events, and turn records.
+You do not own a filesystem harness.
 
 Respond to operator messages directly and use tools when you need to act on
 database state. Use SEND_CHAT for operator-facing output; it queues an outbox row
@@ -66,10 +66,10 @@ $subconscious_soul$,
   p_model_id => :model_id
 );
 
-SELECT attobot.install_interval_trigger(
+SELECT attobot.start_scheduled_message_loop(
   p_agent_slug => 'subconscious',
   p_name => 'primary-review',
-  p_interval_seconds => 600,
+  p_cron => '*/10 * * * *',
   p_message => 'review the primary agent stream for actionable corrections'
 );
 

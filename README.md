@@ -1,8 +1,8 @@
 # attobot
 
 attobot is now a Postgres-resident agent harness. Agent state, turns, tool calls,
-triggers, blobs, and outbound messages live in PostgreSQL tables under the
-`attobot` schema. Agents point at shared rows in `attobot.models`, so multiple
+blobs, and outbound messages live in PostgreSQL tables under the `attobot`
+schema. Agents point at shared rows in `attobot.models`, so multiple
 agents can reuse the same model configuration. `pg_durable` owns the durable
 workflow execution, so a turn can survive database restarts and resume from its
 last checkpoint.
@@ -95,8 +95,8 @@ To update only a secret:
 SELECT attobot.set_config('primary', 'api_key', to_jsonb('sk-...'::text));
 ```
 
-The `subconscious` agent is also seeded with a `primary-review` interval trigger
-that wakes it every 600 seconds when you run the trigger loop for that agent.
+The `subconscious` agent is also seeded with a `primary-review` durable schedule
+that wakes it every 10 minutes.
 
 Send a message:
 
@@ -143,17 +143,15 @@ by the outbox table trigger.
 
 ## Durable Loops
 
-Install an interval trigger that appends a system message and starts a turn:
+Start a durable schedule that appends a system message and starts a turn:
 
 ```sql
-SELECT attobot.install_interval_trigger(
+SELECT attobot.start_scheduled_message_loop(
   p_agent_slug => 'primary',
   p_name => 'heartbeat',
-  p_interval_seconds => 300,
+  p_cron => '*/5 * * * *',
   p_message => 'tick'
 );
-
-SELECT attobot.start_trigger_loop('primary');
 ```
 
 ## Tables
@@ -165,8 +163,6 @@ SELECT attobot.start_trigger_loop('primary');
 - `attobot.tool_requests`: pending/running/completed tool calls.
 - `attobot.outbox`: outbound messages for chat relays or clients.
 - `attobot.blobs`: content-addressed large content storage as external `bytea`.
-- `attobot.triggers`: interval triggers fired by a durable trigger loop.
-- `attobot.telegram_updates`: accepted Telegram updates for idempotency/audit.
 - `attobot.lifecycle`: append-only operational events.
 
 ## Built-In Tools

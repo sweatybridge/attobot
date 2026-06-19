@@ -66,78 +66,11 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.install_interval_trigger(
-  p_agent_slug text,
-  p_name text,
-  p_interval_seconds integer,
-  p_message text,
-  p_start_after timestamptz DEFAULT now()
-)
-RETURNS bigint
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_agent_id bigint := attobot.agent_id(p_agent_slug);
-  v_id bigint;
-BEGIN
-  INSERT INTO attobot.triggers(agent_id, name, interval_seconds, message, next_after)
-  VALUES (v_agent_id, p_name, p_interval_seconds, p_message, p_start_after)
-  ON CONFLICT (agent_id, name) DO UPDATE
-    SET interval_seconds = EXCLUDED.interval_seconds,
-        message = EXCLUDED.message,
-        next_after = EXCLUDED.next_after,
-        enabled = true,
-        updated_at = now()
-  RETURNING id INTO v_id;
-
-  RETURN v_id;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION attobot.fire_due_triggers(p_agent_slug text DEFAULT 'primary')
-RETURNS jsonb
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_agent_id bigint := attobot.agent_id(p_agent_slug);
-  v_trigger record;
-  v_fired jsonb := '[]'::jsonb;
-BEGIN
-  FOR v_trigger IN
-    SELECT *
-    FROM attobot.triggers
-    WHERE agent_id = v_agent_id
-      AND enabled
-      AND next_after <= now()
-    ORDER BY next_after, id
-    FOR UPDATE
-  LOOP
-    PERFORM attobot.append_message(
-      p_agent_slug,
-      'system',
-      format('[trigger %s] %s', v_trigger.name, v_trigger.message)
-    );
-
-    UPDATE attobot.triggers
-    SET last_fired_at = now(),
-        next_after = now() + make_interval(secs => v_trigger.interval_seconds),
-        updated_at = now()
-    WHERE id = v_trigger.id;
-
-    v_fired := v_fired || jsonb_build_array(v_trigger.name);
-  END LOOP;
-
-  IF jsonb_array_length(v_fired) > 0 THEN
-    PERFORM attobot.start_turn(p_agent_slug);
-  END IF;
-
-  RETURN jsonb_build_object('fired', v_fired);
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION attobot.start_trigger_loop(
+CREATE OR REPLACE FUNCTION attobot.start_scheduled_message_loop(
   p_agent_slug text DEFAULT 'primary',
-  p_cron text DEFAULT '* * * * *'
+  p_name text DEFAULT 'heartbeat',
+  p_cron text DEFAULT '* * * * *',
+  p_message text DEFAULT 'tick'
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -148,9 +81,15 @@ BEGIN
   SELECT df.start(
     df.loop(
       df.wait_for_schedule(p_cron)
-      ~> format('SELECT attobot.fire_due_triggers(%L)::jsonb AS fired', p_agent_slug)
+      ~> format(
+        'SELECT attobot.append_message(%L, %L, %L)::bigint AS message_id',
+        p_agent_slug,
+        'system',
+        format('[schedule %s] %s', p_name, p_message)
+      )
+      ~> format('SELECT attobot.start_turn(%L) AS durable_instance_id', p_agent_slug)
     ),
-    format('attobot:%s:trigger-loop', p_agent_slug)
+    format('attobot:%s:schedule:%s', p_agent_slug, p_name)
   )
   INTO v_instance;
 

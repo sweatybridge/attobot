@@ -94,7 +94,6 @@ DECLARE
   v_message_chat_id text;
   v_message_thread_id text;
   v_text text;
-  v_message_id bigint;
   v_seen boolean;
   v_accepted integer := 0;
   v_ignored integer := 0;
@@ -135,9 +134,9 @@ BEGIN
 
     SELECT EXISTS (
       SELECT 1
-      FROM attobot.telegram_updates
+      FROM attobot.messages
       WHERE agent_id = v_agent_id
-        AND update_id = v_update_id
+        AND payload #>> '{telegram_update,update_id}' = v_update_id::text
     )
     INTO v_seen;
 
@@ -145,16 +144,16 @@ BEGIN
       CONTINUE;
     END IF;
 
-    v_message_id := attobot.append_message(
-      p_agent_slug,
-      'user',
-      format('[telegram %s] %s', v_update_id, v_text),
-      jsonb_build_object('telegram_update', v_update)
-    );
-
-    INSERT INTO attobot.telegram_updates(agent_id, update_id, payload, message_id)
-    VALUES (v_agent_id, v_update_id, v_update, v_message_id)
-    ON CONFLICT (agent_id, update_id) DO NOTHING;
+    BEGIN
+      PERFORM attobot.append_message(
+        p_agent_slug,
+        'user',
+        format('[telegram %s] %s', v_update_id, v_text),
+        jsonb_build_object('telegram_update', v_update)
+      );
+    EXCEPTION WHEN unique_violation THEN
+      CONTINUE;
+    END;
 
     v_accepted := v_accepted + 1;
   END LOOP;
