@@ -60,7 +60,7 @@ CREATE TABLE IF NOT EXISTS attobot.outbox (
   channel text NOT NULL DEFAULT 'chat',
   body jsonb NOT NULL,
   status text NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending', 'sent', 'failed')),
+    CHECK (status IN ('pending', 'sending', 'sent', 'failed')),
   created_at timestamptz NOT NULL DEFAULT now(),
   sent_at timestamptz
 );
@@ -88,6 +88,18 @@ CREATE TABLE IF NOT EXISTS attobot.triggers (
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (agent_id, name)
 );
+
+CREATE TABLE IF NOT EXISTS attobot.telegram_updates (
+  agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
+  update_id bigint NOT NULL,
+  payload jsonb NOT NULL,
+  message_id bigint REFERENCES attobot.messages(id) ON DELETE SET NULL,
+  received_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, update_id)
+);
+
+CREATE INDEX IF NOT EXISTS telegram_updates_agent_received_idx
+  ON attobot.telegram_updates(agent_id, received_at DESC);
 
 CREATE TABLE IF NOT EXISTS attobot.turns (
   id bigserial PRIMARY KEY,

@@ -160,3 +160,69 @@ BEGIN
   RETURN v_instance;
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION attobot.start_telegram_inbox_loop(
+  p_agent_slug text DEFAULT 'primary',
+  p_cron text DEFAULT '* * * * *'
+)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_instance text;
+BEGIN
+  SELECT df.start(
+    df.loop(
+      df.wait_for_schedule(p_cron)
+      ~> format('SELECT attobot.telegram_get_updates_body(%L)::text AS body', p_agent_slug) |=> 'request'
+      ~> df.http(
+        attobot.telegram_api_url(p_agent_slug, 'getUpdates'),
+        'POST',
+        '$request.body',
+        attobot.telegram_headers(),
+        30
+      ) |=> 'http_response'
+      ~> format('SELECT attobot.process_telegram_updates(%L, $http_response::jsonb)::jsonb AS result', p_agent_slug)
+    ),
+    format('attobot:%s:telegram-inbox', p_agent_slug)
+  )
+  INTO v_instance;
+
+  RETURN v_instance;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION attobot.start_telegram_outbox_loop(
+  p_agent_slug text DEFAULT 'primary',
+  p_cron text DEFAULT '* * * * *'
+)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_instance text;
+BEGIN
+  SELECT df.start(
+    df.loop(
+      df.wait_for_schedule(p_cron)
+      ~> format('SELECT * FROM attobot.telegram_claim_outbox(%L)', p_agent_slug) |=> 'claim'
+      ~> df.if(
+        'SELECT $claim.has_outbox',
+        df.http(
+          attobot.telegram_api_url(p_agent_slug, 'sendMessage'),
+          'POST',
+          '$claim.request_body',
+          attobot.telegram_headers(),
+          30
+        ) |=> 'http_response'
+          ~> format('SELECT attobot.record_telegram_send_result(%L, $claim.outbox_id, $http_response::jsonb)::jsonb AS result', p_agent_slug),
+        'SELECT jsonb_build_object(''sent'', false, ''reason'', ''empty'') AS result'
+      )
+    ),
+    format('attobot:%s:telegram-outbox', p_agent_slug)
+  )
+  INTO v_instance;
+
+  RETURN v_instance;
+END;
+$$;

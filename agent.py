@@ -74,6 +74,32 @@ def messages(args):
         print(f"{row['id']}\t{row['created_at']}\t{row['role']}{tool}\t{content}")
 
 
+def telegram_config(args):
+    with connect(args) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT attobot.configure_telegram(%s, %s, %s, %s, %s)",
+                (args.agent, args.token, args.chat_id, args.thread_id, args.api_base),
+            )
+    print(f"configured telegram for {args.agent}")
+
+
+def telegram_start(args):
+    with connect(args) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT attobot.start_telegram_inbox_loop(%s, %s) AS inbox_instance",
+                (args.agent, args.poll_cron),
+            )
+            inbox_instance = cur.fetchone()["inbox_instance"]
+            cur.execute(
+                "SELECT attobot.start_telegram_outbox_loop(%s, %s) AS outbox_instance",
+                (args.agent, args.send_cron),
+            )
+            outbox_instance = cur.fetchone()["outbox_instance"]
+    print(f"telegram inbox {inbox_instance}; outbox {outbox_instance}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dsn")
@@ -92,6 +118,18 @@ def main():
     messages_parser = sub.add_parser("messages")
     messages_parser.add_argument("--limit", type=int, default=40)
     messages_parser.set_defaults(func=messages)
+
+    telegram_config_parser = sub.add_parser("telegram-config")
+    telegram_config_parser.add_argument("--token", required=True)
+    telegram_config_parser.add_argument("--chat-id", required=True)
+    telegram_config_parser.add_argument("--thread-id")
+    telegram_config_parser.add_argument("--api-base", default="https://api.telegram.org")
+    telegram_config_parser.set_defaults(func=telegram_config)
+
+    telegram_start_parser = sub.add_parser("telegram-start")
+    telegram_start_parser.add_argument("--poll-cron", default="* * * * *")
+    telegram_start_parser.add_argument("--send-cron", default="* * * * *")
+    telegram_start_parser.set_defaults(func=telegram_start)
 
     args = parser.parse_args()
     try:

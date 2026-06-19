@@ -30,6 +30,8 @@ The durable turn workflow is SQL:
 - Tool calls are stored in `attobot.tool_requests`.
 - Database-native tools are executed by `attobot.run_pending_tool_requests`.
 - User-visible replies are queued in `attobot.outbox`.
+- Optional Telegram loops use `df.http` to poll `getUpdates` into
+  `attobot.messages` and deliver `attobot.outbox` rows with `sendMessage`.
 
 ## Run
 
@@ -74,6 +76,30 @@ python agent.py outbox
 The default DSN is `postgresql://postgres:secret@localhost:5432/postgres`.
 Override it with `--dsn` or `ATTOBOT_DSN`.
 
+## Telegram
+
+Configure Telegram for an agent:
+
+```bash
+python agent.py telegram-config --token 123:abc --chat-id -1001234567
+```
+
+For a forum topic, include `--thread-id 42`.
+
+Start the durable Telegram ingress and egress loops:
+
+```bash
+python agent.py telegram-start
+```
+
+The inbox loop calls Telegram `getUpdates` through `pg_durable` and appends
+accepted messages as `[telegram <update_id>] ...` user messages. It accepts only
+the configured chat, and the configured topic when `telegram_thread_id` is set.
+
+The outbox loop drains pending `attobot.outbox` rows with channel `chat` or
+`telegram` through Telegram `sendMessage`. The `SEND_CHAT` tool still only queues
+messages; Telegram delivery is handled by the durable outbox loop.
+
 ## Durable Loops
 
 Start a cron wake loop with `pg_durable`:
@@ -104,6 +130,7 @@ SELECT attobot.start_trigger_loop('primary');
 - `attobot.outbox`: outbound messages for chat relays or clients.
 - `attobot.blobs`: content-addressed large text storage.
 - `attobot.triggers`: interval triggers fired by a durable trigger loop.
+- `attobot.telegram_updates`: accepted Telegram updates for idempotency/audit.
 - `attobot.lifecycle`: append-only operational events.
 
 ## Built-In Tools
