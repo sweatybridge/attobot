@@ -54,15 +54,29 @@ rows:
 ATTOBOT_API_KEY=sk-... docker compose up -d
 ```
 
-You can also override `ATTOBOT_MODEL` and `ATTOBOT_API_BASE`.
+You can also override the shared model with `ATTOBOT_MODEL`,
+`ATTOBOT_API_BASE`, `ATTOBOT_TEMPERATURE`, `ATTOBOT_REASONING_EFFORT`,
+`ATTOBOT_CONTEXT_TOKENS`, and `ATTOBOT_MULTIMODAL_SUPPORT`. The entrypoint
+configures that model before creating agents, then assigns both seeded agents to
+the configured model row.
 
-To update an agent later:
+To create a new agent, configure a model first and pass its id:
 
 ```bash
 docker compose exec db psql -U postgres -d postgres
 ```
 
 ```sql
+WITH model AS (
+  SELECT attobot.ensure_model(
+    p_model => 'deepseek-v4-pro',
+    p_api_base => 'https://api.deepseek.com/v1',
+    p_temperature => 1.0,
+    p_reasoning_effort => 'medium',
+    p_context_tokens => 1000000,
+    p_multimodal_support => false
+  ) AS id
+)
 SELECT attobot.ensure_agent(
   p_slug => 'primary',
   p_soul => $$
@@ -70,7 +84,8 @@ You are a persistent agent running inside PostgreSQL.
 Be direct. Use tools when you need to act on stored state.
 Queue operator-facing messages with SEND_CHAT.
 $$,
-  p_api_key => 'sk-...'
+  p_api_key => 'sk-...',
+  p_model_id => (SELECT id FROM model)
 );
 ```
 
@@ -119,23 +134,14 @@ The inbox loop calls Telegram `getUpdates` through `pg_durable` and appends
 accepted messages as `[telegram <update_id>] ...` user messages. It accepts only
 the configured chat, and the configured topic when `telegram_thread_id` is set.
 
-If you want Telegram delivery for outbox rows, start the durable outbox loop from
-SQL:
+When Telegram is configured, pending `chat` or `telegram` rows inserted into
+`attobot.outbox` automatically fire a PostgreSQL trigger that starts a one-shot
+durable `sendMessage` workflow for that row.
 
-```sql
-SELECT attobot.start_telegram_outbox_loop('primary');
-```
-
-The `SEND_CHAT` tool still only queues messages; Telegram delivery is handled by
-the durable outbox loop.
+The `SEND_CHAT` tool still only queues messages; Telegram delivery is scheduled
+by the outbox table trigger.
 
 ## Durable Loops
-
-Start a cron wake loop with `pg_durable`:
-
-```sql
-SELECT attobot.start_agent_loop('primary', '*/5 * * * *');
-```
 
 Install an interval trigger that appends a system message and starts a turn:
 
@@ -153,7 +159,7 @@ SELECT attobot.start_trigger_loop('primary');
 ## Tables
 
 - `attobot.agents`: one row per agent.
-- `attobot.models`: reusable model, endpoint, temperature, and reasoning configuration.
+- `attobot.models`: reusable model, endpoint, temperature, reasoning, context, and modality configuration.
 - `attobot.config`: per-agent configuration and secrets.
 - `attobot.messages`: canonical conversation stream.
 - `attobot.tool_requests`: pending/running/completed tool calls.
@@ -187,8 +193,8 @@ SELECT * FROM ins
 ## Docker Image
 
 The image uses `postgres:18-trixie` as its base and installs
-`pg-durable-postgresql-18_0.2.2-1_amd64.deb` from the
-`sweatybridge/pg_durable` `v0.2.2` GitHub release. The Dockerfile verifies the
+`pg-durable-postgresql-18_0.2.3-1_amd64.deb` from the
+`sweatybridge/pg_durable` `v0.2.3` GitHub release. The Dockerfile verifies the
 published SHA256 digest before installing the package.
 
 `shared_preload_libraries = 'pg_durable'` is written into the base sample config

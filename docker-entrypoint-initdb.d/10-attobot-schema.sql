@@ -7,8 +7,9 @@ CREATE TABLE IF NOT EXISTS attobot.models (
   temperature numeric NOT NULL DEFAULT 1.0,
   reasoning_effort text NOT NULL DEFAULT 'medium',
   context_tokens integer NOT NULL DEFAULT 1000000,
+  multimodal_support boolean NOT NULL DEFAULT false,
   updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (name, api_base, temperature, reasoning_effort, context_tokens)
+  UNIQUE (name, api_base, temperature, reasoning_effort, context_tokens, multimodal_support)
 );
 
 CREATE TABLE IF NOT EXISTS attobot.agents (

@@ -7,11 +7,25 @@ psql -v ON_ERROR_STOP=1 \
   -v api_key="${ATTOBOT_API_KEY:-}" \
   -v model="${ATTOBOT_MODEL:-deepseek-v4-pro}" \
   -v api_base="${ATTOBOT_API_BASE:-https://api.deepseek.com/v1}" \
+  -v temperature="${ATTOBOT_TEMPERATURE:-1.0}" \
+  -v reasoning_effort="${ATTOBOT_REASONING_EFFORT:-medium}" \
+  -v context_tokens="${ATTOBOT_CONTEXT_TOKENS:-1000000}" \
+  -v multimodal_support="${ATTOBOT_MULTIMODAL_SUPPORT:-false}" \
   -v telegram_token="${ATTOBOT_TELEGRAM_TOKEN:-}" \
   -v telegram_chat_id="${ATTOBOT_TELEGRAM_CHAT_ID:-}" \
   -v telegram_thread_id="${ATTOBOT_TELEGRAM_THREAD_ID:-}" \
   -v telegram_api_base="${ATTOBOT_TELEGRAM_API_BASE:-https://api.telegram.org}" \
   -v telegram_poll_cron="${ATTOBOT_TELEGRAM_POLL_CRON:-* * * * *}" <<'EOSQL'
+SELECT attobot.ensure_model(
+  p_model => COALESCE(NULLIF(:'model', ''), 'deepseek-v4-pro'),
+  p_api_base => COALESCE(NULLIF(:'api_base', ''), 'https://api.deepseek.com/v1'),
+  p_temperature => COALESCE(NULLIF(:'temperature', ''), '1.0')::numeric,
+  p_reasoning_effort => COALESCE(NULLIF(:'reasoning_effort', ''), 'medium'),
+  p_context_tokens => COALESCE(NULLIF(:'context_tokens', ''), '1000000')::integer,
+  p_multimodal_support => COALESCE(NULLIF(:'multimodal_support', ''), 'false')::boolean
+) AS model_id
+\gset
+
 SELECT attobot.ensure_agent(
   p_slug => 'primary',
   p_soul => $primary_soul$
@@ -28,8 +42,7 @@ that a delivery loop can send. Keep durable notes in database tables or blobs.
 When there is nothing useful to do, stay idle. Be direct, factual, and concise.
 $primary_soul$,
   p_api_key => NULLIF(:'api_key', ''),
-  p_model => COALESCE(NULLIF(:'model', ''), 'deepseek-v4-pro'),
-  p_api_base => COALESCE(NULLIF(:'api_base', ''), 'https://api.deepseek.com/v1')
+  p_model_id => :model_id
 );
 
 SELECT attobot.ensure_agent(
@@ -50,8 +63,7 @@ nothing actionable, stay idle.
 Never overwrite the primary's state directly except by appending a review note.
 $subconscious_soul$,
   p_api_key => NULLIF(:'api_key', ''),
-  p_model => COALESCE(NULLIF(:'model', ''), 'deepseek-v4-pro'),
-  p_api_base => COALESCE(NULLIF(:'api_base', ''), 'https://api.deepseek.com/v1')
+  p_model_id => :model_id
 );
 
 SELECT attobot.install_interval_trigger(

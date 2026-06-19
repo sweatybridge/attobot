@@ -66,30 +66,6 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.start_agent_loop(
-  p_agent_slug text DEFAULT 'primary',
-  p_cron text DEFAULT '*/5 * * * *'
-)
-RETURNS text
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_instance text;
-BEGIN
-  SELECT df.start(
-    df.loop(
-      df.wait_for_schedule(p_cron)
-      ~> format('SELECT attobot.append_message(%L, %L, %L)::bigint AS message_id', p_agent_slug, 'system', '[trigger heartbeat] tick')
-      ~> format('SELECT attobot.start_turn(%L) AS durable_instance_id', p_agent_slug)
-    ),
-    format('attobot:%s:agent-loop', p_agent_slug)
-  )
-  INTO v_instance;
-
-  RETURN v_instance;
-END;
-$$;
-
 CREATE OR REPLACE FUNCTION attobot.install_interval_trigger(
   p_agent_slug text,
   p_name text,
@@ -213,9 +189,9 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.start_telegram_outbox_loop(
+CREATE OR REPLACE FUNCTION attobot.start_telegram_outbox_send(
   p_agent_slug text DEFAULT 'primary',
-  p_cron text DEFAULT '* * * * *'
+  p_outbox_id bigint DEFAULT NULL
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -223,27 +199,84 @@ AS $$
 DECLARE
   v_instance text;
 BEGIN
+  IF p_outbox_id IS NULL THEN
+    RAISE EXCEPTION 'p_outbox_id is required';
+  END IF;
+
   SELECT df.start(
-    df.loop(
-      df.wait_for_schedule(p_cron)
-      ~> format('SELECT * FROM attobot.telegram_claim_outbox(%L)', p_agent_slug) |=> 'claim'
-      ~> df.if(
-        'SELECT $claim.has_outbox',
-        df.http(
-          attobot._telegram_api_url(p_agent_slug, 'sendMessage'),
-          'POST',
-          '$claim.request_body',
-          attobot._telegram_headers(),
-          30
-        ) |=> 'http_response'
-          ~> format('SELECT attobot.record_telegram_send_result(%L, $claim.outbox_id, $http_response::jsonb)::jsonb AS result', p_agent_slug),
-        'SELECT jsonb_build_object(''sent'', false, ''reason'', ''empty'') AS result'
-      )
+    format('SELECT * FROM attobot._telegram_claim_outbox(%L, %s)', p_agent_slug, p_outbox_id) |=> 'claim'
+    ~> df.if(
+      'SELECT $claim.has_outbox',
+      df.http(
+        attobot._telegram_api_url(p_agent_slug, 'sendMessage'),
+        'POST',
+        '$claim.request_body',
+        attobot._telegram_headers(),
+        30
+      ) |=> 'http_response'
+        ~> format('SELECT attobot.record_telegram_send_result(%L, $claim.outbox_id, $http_response::jsonb)::jsonb AS result', p_agent_slug),
+      'SELECT jsonb_build_object(''sent'', false, ''reason'', coalesce($claim.reason, ''empty'')) AS result'
     ),
-    format('attobot:%s:telegram-outbox', p_agent_slug)
+    format('attobot:%s:telegram-outbox:%s:%s', p_agent_slug, p_outbox_id, txid_current())
   )
   INTO v_instance;
 
   RETURN v_instance;
 END;
 $$;
+
+CREATE OR REPLACE FUNCTION attobot._outbox_trigger_telegram_send()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_agent_slug text;
+  v_instance text;
+BEGIN
+  IF NEW.status <> 'pending'
+     OR NEW.channel NOT IN ('chat', 'telegram')
+     OR coalesce(attobot._config_text(NEW.agent_id, 'telegram_token'), '') = ''
+     OR coalesce(attobot._config_text(NEW.agent_id, 'telegram_chat_id'), '') = '' THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+     AND OLD.status IS NOT DISTINCT FROM NEW.status
+     AND OLD.channel IS NOT DISTINCT FROM NEW.channel THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT slug INTO v_agent_slug
+  FROM attobot.agents
+  WHERE id = NEW.agent_id;
+
+  IF v_agent_slug IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  BEGIN
+    v_instance := attobot.start_telegram_outbox_send(v_agent_slug, NEW.id);
+
+    PERFORM attobot.log_event(
+      NEW.agent_id,
+      'telegram.outbox.trigger',
+      jsonb_build_object('outbox_id', NEW.id, 'durable_instance_id', v_instance)
+    );
+  EXCEPTION WHEN others THEN
+    PERFORM attobot.log_event(
+      NEW.agent_id,
+      'telegram.outbox.trigger.error',
+      jsonb_build_object('outbox_id', NEW.id, 'error', SQLERRM)
+    );
+  END;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS outbox_telegram_send_trigger ON attobot.outbox;
+
+CREATE TRIGGER outbox_telegram_send_trigger
+AFTER INSERT OR UPDATE OF status, channel ON attobot.outbox
+FOR EACH ROW
+EXECUTE FUNCTION attobot._outbox_trigger_telegram_send();

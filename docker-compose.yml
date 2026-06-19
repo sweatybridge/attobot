@@ -2,17 +2,15 @@ services:
   db:
     build:
       context: .
-      args:
-        PG_DURABLE_REPO: sweatybridge/pg_durable
-        PG_DURABLE_VERSION: "0.2.2"
-        PG_DURABLE_SHA256: 78ff0dc6804608ba7b7fa88849188f2f5c2ddc266d8aaf690c51e15bf26dbe91
-        PG_MAJOR: "18"
     environment:
-      POSTGRES_PASSWORD: secret
-      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD: postgres
       ATTOBOT_API_KEY: ${ATTOBOT_API_KEY:-}
       ATTOBOT_MODEL: ${ATTOBOT_MODEL:-deepseek-v4-pro}
       ATTOBOT_API_BASE: ${ATTOBOT_API_BASE:-https://api.deepseek.com/v1}
+      ATTOBOT_TEMPERATURE: ${ATTOBOT_TEMPERATURE:-1.0}
+      ATTOBOT_REASONING_EFFORT: ${ATTOBOT_REASONING_EFFORT:-medium}
+      ATTOBOT_CONTEXT_TOKENS: ${ATTOBOT_CONTEXT_TOKENS:-1000000}
+      ATTOBOT_MULTIMODAL_SUPPORT: ${ATTOBOT_MULTIMODAL_SUPPORT:-false}
       ATTOBOT_TELEGRAM_TOKEN: ${ATTOBOT_TELEGRAM_TOKEN:-}
       ATTOBOT_TELEGRAM_CHAT_ID: ${ATTOBOT_TELEGRAM_CHAT_ID:-}
       ATTOBOT_TELEGRAM_THREAD_ID: ${ATTOBOT_TELEGRAM_THREAD_ID:-}
@@ -21,7 +19,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - attobot_pgdata:/var/lib/postgresql/data
+      - attobot_pgdata:/var/lib/postgresql
 
 volumes:
   attobot_pgdata:

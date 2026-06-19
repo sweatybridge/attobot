@@ -181,7 +181,10 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.telegram_claim_outbox(p_agent_slug text)
+CREATE OR REPLACE FUNCTION attobot._telegram_claim_outbox(
+  p_agent_slug text,
+  p_outbox_id bigint DEFAULT NULL
+)
 RETURNS TABLE(outbox_id bigint, has_outbox boolean, request_body text, reason text)
 LANGUAGE plpgsql
 AS $$
@@ -208,6 +211,7 @@ BEGIN
   WHERE agent_id = v_agent_id
     AND status = 'pending'
     AND channel IN ('chat', 'telegram')
+    AND (p_outbox_id IS NULL OR id = p_outbox_id)
   ORDER BY id
   LIMIT 1
   FOR UPDATE SKIP LOCKED;

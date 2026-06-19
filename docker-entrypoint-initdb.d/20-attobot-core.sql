@@ -27,25 +27,59 @@ AS $$
   RETURNING id;
 $$;
 
+CREATE OR REPLACE FUNCTION attobot.ensure_model(
+  p_model text DEFAULT 'deepseek-v4-pro',
+  p_api_base text DEFAULT 'https://api.deepseek.com/v1',
+  p_temperature numeric DEFAULT 1.0,
+  p_reasoning_effort text DEFAULT 'medium',
+  p_context_tokens integer DEFAULT 1000000,
+  p_multimodal_support boolean DEFAULT false
+)
+RETURNS bigint
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_model_id bigint;
+BEGIN
+  INSERT INTO attobot.models(name, api_base, temperature, reasoning_effort, context_tokens, multimodal_support)
+  VALUES (
+    COALESCE(NULLIF(p_model, ''), 'deepseek-v4-pro'),
+    COALESCE(NULLIF(p_api_base, ''), 'https://api.deepseek.com/v1'),
+    COALESCE(p_temperature, 1.0),
+    COALESCE(p_reasoning_effort, 'medium'),
+    COALESCE(p_context_tokens, 1000000),
+    COALESCE(p_multimodal_support, false)
+  )
+  ON CONFLICT (name, api_base, temperature, reasoning_effort, context_tokens, multimodal_support) DO UPDATE
+    SET updated_at = now()
+  RETURNING id INTO v_model_id;
+
+  RETURN v_model_id;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION attobot.ensure_agent(
   p_slug text DEFAULT 'primary',
   p_soul text DEFAULT '',
   p_api_key text DEFAULT NULL,
-  p_model text DEFAULT 'deepseek-v4-pro',
-  p_api_base text DEFAULT 'https://api.deepseek.com/v1'
+  p_model_id bigint DEFAULT NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql
 AS $$
 DECLARE
   v_id bigint;
-  v_model_id bigint;
+  v_model_id bigint := p_model_id;
 BEGIN
-  INSERT INTO attobot.models(name, api_base)
-  VALUES (p_model, p_api_base)
-  ON CONFLICT (name, api_base, temperature, reasoning_effort, context_tokens) DO UPDATE
-    SET updated_at = now()
-  RETURNING id INTO v_model_id;
+  IF v_model_id IS NULL THEN
+    SELECT model_id INTO v_model_id
+    FROM attobot.agents
+    WHERE slug = p_slug;
+  END IF;
+
+  IF v_model_id IS NULL THEN
+    RAISE EXCEPTION 'agent % requires p_model_id; configure a model with attobot.ensure_model first', p_slug;
+  END IF;
 
   INSERT INTO attobot.agents(slug, soul, model_id)
   VALUES (p_slug, p_soul, v_model_id)
