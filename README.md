@@ -1,205 +1,138 @@
 # attobot
 
-A persistent agent in a single `agent.py`.
+attobot is now a Postgres-resident agent harness. Agent state, turns, tool calls,
+triggers, blobs, and outbound messages live in PostgreSQL tables under the
+`attobot` schema. `pg_durable` owns the durable workflow execution, so a turn can
+survive database restarts and resume from its last checkpoint.
 
-One agent = one working directory (in production, one unix user's `$HOME`) + one process running `agent.py`. All agent state lives in `./agent/`.
-The process is a loop that re-runs the LLM every time `messages.jsonl` changes.
+The old filesystem loop is gone. `agent.py` is only a thin client for inserting
+messages and inspecting database state.
 
-## The loop
-
-```
-hash messages.jsonl
-  if unchanged: sleep
-  build system prompt + sum chars
-  if over budget: stash_messages
-  llm(<soul> + <harness> + <memory> + <life-tail>, messages, tools)
-  append assistant reply
-  if tool_calls: run each via bg_run, append results
-  else: SEND_CHAT(content)
-```
-
-That's `agent.py`. Channels, tools, and the backgrounding wrapper all live inline in the same file.
-
-## Channels in
-
-Three daemon threads append to `messages.jsonl`:
-
-- **telegram** — `start_chat()` long-polls `getUpdates`. Inbound text → `{role:user, content:"[telegram <id>] …"}`. Only the `chat_id`/`thread_id` locked in `config.json` is accepted. Optional: no `telegram_token` in config → no chat channel, `SEND_CHAT` returns "no chat configured"; the agent wakes on triggers/mail only.
-- **triggers** — `start_triggers()` scans `agent/triggers/*.json` every 30s; due ones append `{role:system, content:"[trigger <name>] …"}`. Three kinds: a **cron** — `{"next": <ts>, "repeat_s": <s?>, "message": "…"}` — fires on the clock (repeating ones reschedule, one-shots delete); a **watch** — `{"watch": "<path>", "repeat_s": <cooldown?>, "message": "…"}` — fires when the file's content changes; a **cmd** — `{"cmd": "<shell>", "repeat_s": <s?>}` — runs the command and fires with its stdout (clipped), no output = no fire. Combined with `watch`, the cmd is fed each appended byte exactly once on stdin (starting from install): every change is examined, nothing is ever skipped, and genuine machinery lines (`[trigger`/`[subconscious]` system messages — not e.g. an operator quoting one) are filtered out, so heuristics structurally can't self-loop or ping-pong. The trigger thread is the only writer of trigger files; its sole contract with the turn loop is the stream itself. Fires are appended to it, and the agent's replies read back from it are the verdicts: an unanswered fire holds its trigger (one in flight, state frozen, nothing lost — no trigger can flood the stream), and for triggers with `"backoff": <cap_s>` the reply judges whichever triggers woke that turn — `[IDLE]` doubles their interval toward the cap, anything else resets it to `repeat_s`; triggers that didn't fire keep their own schedule. Useless wakers quiet down on their own. The heartbeat is just a shipped backoff cron.
-- **mail** — `start_inbox()` polls `agent/mail_inbox/`. New files append `{role:system, content:"[mail from <unix-user>] <name>\n<preview>"}` and notify the operator via chat.
-
-## Channel out
-
-`SEND_CHAT` writes back to telegram. There is no other output channel. Reply with no `tool_calls` → content goes to chat automatically.
-
-## Tools
-
-Declared in the `TOOLS` list in `agent.py`: `(NAME, fn, description, parameters)` per entry.
-
-| name | what |
-|---|---|
-| `APPEND_MESSAGE` | inject a message into an agent's `messages.jsonl` (default own; `dir` targets a sibling agent, which wakes on it; also surfaced to the target's chat if it has one) |
-| `SEND_CHAT` | post to telegram |
-| `READ_FILE` | file → line-numbered text; images → multimodal content blocks (when `MULTIMODAL_SUPPORT=true`) |
-| `WRITE_FILE` / `EDIT_FILE` | filesystem writes; `EDIT_FILE` has optional `replace_all` |
-| `BASH` | run a shell command (returns Popen → `bg_run` can background it) |
-| `SEARCH` / `WEB_FETCH` | DuckDuckGo + plain HTML scrape |
-| `STASH` | content-addressed save to `agent/blobs/<hash>`, returns `[stash <hash>]` |
-
-A tool returning a `subprocess.Popen` (or anything with `.pid` + `.communicate`) gets handled by `bg_run`.
-
-Tool results longer than `tool_output_limit` (5000 chars) are auto-clipped to `<head>\n... N chars truncated, [stash <hash>] ...\n<tail>`. The agent recovers the full content with `READ_FILE agent/blobs/<hash>`.
-
-## Backgrounding
-
-`bg_run` runs the tool in a thread with `tool_timeout` (30s). Finishes in time → inline (post-clip) result. Otherwise:
-
-- registers `agent/bg/<id>.json` (with pid if known)
-- returns `[backgrounded bg/<id> (pid …)]` to the assistant immediately
-- spawns an emitter thread that appends `[bg <id> done, tc:…] <result>` when the work finishes (and removes the json)
-
-Kill a backgrounded subprocess by killing its pid (recorded in the json and the placeholder); the emitter then reports `[bg <id> done] (exit -15)`.
-
-## State
+## Architecture
 
 ```
-SOUL.md                       # the prompt template (copied into agent/ by setup.py)
-agent.py                      # the harness, included verbatim in the system prompt
-opt/
-  tools/<name>.py             # optional capability tools (see Optional add-ons)
-  providers/<name>.py         # alternative LLM providers
-  subconscious/               # reviewer agent skeleton (soul + seeded trigger), copied out beside agent/
-agent/
-  SOUL.md                     # this agent's soul (copy of the template)
-  MEMORY.md                   # memory index: one pointer line per memory
-  memory/<name>.md            # memory bodies, read on demand via the index
-  LIFE.md                     # append-only event log; tail goes into system prompt
-  messages.jsonl              # canonical conversation, one JSON message per line
-  config.json                 # telegram token/chat, api key, overrides
-  tg_poll.offset              # telegram update_id cursor
-  triggers/<name>.json        # crons (clock) and watches (file change)
-  triggers/heartbeat.json     # auto-created at boot, 225s tick (backs off when idle)
-  mail_inbox/                 # drop files here
-  bg/<id>.json                # in-flight background work
-  tools/<name>.py             # opt-in tools (copied from opt/tools/ at first boot)
-  providers/<name>.py         # opt-in provider (copied from opt/providers/ at first boot)
-  blobs/<hash>                # content-addressed store
+operator/client
+  -> attobot.append_user_message(...)
+  -> attobot.start_turn(...)
+  -> pg_durable workflow
+       -> attobot.compose_llm_request(...)
+       -> df.http(... /chat/completions ...)
+       -> attobot.record_assistant_from_http(...)
+       -> attobot.run_pending_tool_requests(...)
+       -> attobot.start_turn(...) while tool calls remain
+  -> attobot.outbox
 ```
 
-## System prompt
+The durable turn workflow is SQL:
 
-Built fresh every turn:
-
-```
-<soul>      agent/SOUL.md
-<harness>   agent.py source
-<memory>    MEMORY.md (middle-elided if > MEMORY_LIMIT)
-<life>      last life_tail lines of LIFE.md, prefixed with [N bytes earlier]
-```
-
-The agent sees its own harness. Modify `agent.py` and the agent's self-model updates next turn.
-
-## Memory pressure
-
-- Memory is two-tier: `MEMORY.md` is an always-in-context index (one pointer line per memory), bodies live in `agent/memory/` and are read on demand. `MEMORY.md > MEMORY_LIMIT` (10000) → middle is elided with a warning telling the agent to move detail into `agent/memory/` files.
-- System prompt + serialized messages, divided by 4 chars/token, > `context_tokens * 0.8` → `stash_messages` runs automatically; the middle half of `messages.jsonl` goes to a blob, replaced by a single system message holding `[stash <hash>]` plus an LLM summary. The agent can `READ_FILE agent/blobs/<hash>` to recover.
-
-The 4-chars-per-token heuristic over-counts base64 image content — safe direction.
-
-## Optional add-ons
-
-Anything under `opt/` is opt-in via the `opt` field in `config.json` (a list of paths relative to `opt/`, no `.py` suffix):
-
-```json
-"opt": ["tools/ocr_image", "providers/anthropic"]
-```
-
-Each entry copies `opt/<path>.py` → `agent/<path>.py` at first boot. From then on, the agent owns its copy.
-
-**Tools** in `agent/tools/` auto-register at startup. Built-in:
-- `ocr_image` — RapidOCR + spatial ASCII layout, for text-only LLMs. Auto-included when `multimodal_support=false`. Requires `rapidocr-onnxruntime` + `opencv-python`.
-
-**Providers** swap `_chat_fn`. Set `provider: "anthropic"` (auto-includes `providers/anthropic`) to use it. Built-in:
-- `anthropic` — native `/v1/messages` translation. Reads `api_key` and `model` from `config.json` like the default provider.
-
-## Subconscious
-
-A second attobot that reviews the first. Same harness, different soul (`opt/subconscious/` — an agent-dir skeleton: soul + a pre-seeded watch job), no chat. It runs in the same unix user as the primary — it needs direct read/write into `agent/` — unlike peer agents, which get a user each.
-
-```bash
-python setup.py --subconscious ...   # copies opt/subconscious/ out beside agent/, reuses the api_key
-python agent.py agent subconscious   # one command, one process per dir
-```
-
-For an existing install: `cp -r opt/subconscious . && echo '{"api_key": "sk-..."}' > subconscious/config.json`.
-
-It wakes when the primary's stream changes (a pre-seeded watch trigger on `agent/messages.jsonl`, 600s cooldown) or on its own heartbeat, reads `agent/messages.jsonl` / `agent/LIFE.md` since its last review marker, and acts two ways: `APPEND_MESSAGE` — a `[subconscious] …` system message injected into the primary's stream (the tool serializes, so the stream can't be corrupted) and surfaced to the operator's chat — for nudges and proposed lessons (the primary folds accepted lessons into `MEMORY.md` itself, in its own words); and for mistakes that keep recurring, `subc-*` cmd triggers installed in `agent/triggers/` — compiled heuristics that grep the stream and inject a warning with no LLM in the loop. Every heuristic fire is greppable by name, so the subconscious reviews its own heuristics' precision and retires bad ones. It writes nothing else of the primary's.
+- `df.http` calls an OpenAI-compatible `/chat/completions` endpoint.
+- Assistant messages are stored in `attobot.messages`.
+- Tool calls are stored in `attobot.tool_requests`.
+- Database-native tools are executed by `attobot.run_pending_tool_requests`.
+- User-visible replies are queued in `attobot.outbox`.
 
 ## Run
 
-```
-pip install -r requirements.txt
-python setup.py                            # prompts for token, auto-discovers chat_id, prompts for api_key
-python agent.py
-```
-
-`setup.py` accepts CLI args for non-interactive use (e.g. an HR-style agent spawning new agents):
-
-```
-python setup.py --token 123:abc --chat -1001234567 --api-key sk-... [--thread 42] [--systemd]
-```
-
-Required config (`agent/config.json`) is created by `setup.py`. It validates `GET /getMe` and refuses to proceed if the bot's privacy mode is on or `can_join_groups` is off.
-
-## Deploy
-
-One agent per unix user: give the agent its own user, clone this repo into their `$HOME`, run `setup.py` and `agent.py` from there. The agent owns its copy of the harness; editing it affects no other agent.
-
-On macOS or for quick testing, just run `python agent.py` (use `tmux` to keep it alive across logout).
-
-On Linux, run `setup.py --systemd` as the dedicated user to emit a systemd unit + install instructions:
+Build the Postgres 18 image with `pg_durable` installed from the
+`sweatybridge/pg_durable` GitHub release Debian package:
 
 ```bash
-python setup.py --systemd
-# wrote agent/config.json
-# wrote attobot.service
-#
-# Install (user service, no sudo):
-#   mkdir -p ~/.config/systemd/user
-#   cp attobot.service ~/.config/systemd/user/
-#   systemctl --user daemon-reload
-#   loginctl enable-linger $USER          # so it survives logout
-#   systemctl --user enable --now attobot
-#   journalctl --user -u attobot -f
+docker compose build
+docker compose up -d
 ```
 
-Default: `deepseek-v4-pro` via `https://api.deepseek.com/v1`. Override `model` / `api_base` in `config.json` to point at any OpenAI-compatible endpoint, or set `provider: "anthropic"` to switch the request shape.
+Initialize an agent and set its API key:
 
-`python agent.py [agent_dir ...]` — the arg is the agent state folder (default `./agent`); same optional arg on `setup.py`. It must hold `config.json` and `SOUL.md` (`setup.py` creates both). Extra dirs each get their own process (`python agent.py agent subconscious` runs the pair; ctrl-C kills both).
-
-`agent/config.json` fields (only `api_key` is required — omit `telegram_token` for a chat-less agent; the rest fall back to sensible defaults baked into `agent.py`):
-
-```jsonc
-{
-  "telegram_token": "...",         // optional — omit for no chat channel
-  "telegram_chat_id": "...",       // required if telegram_token is set
-  "telegram_thread_id": "...",     // optional, forum supergroup topic
-  "api_key": "...",                // required, LLM provider key
-  "model": "deepseek-v4-pro",
-  "api_base": "https://api.deepseek.com/v1",
-  "temperature": 1.0,
-  "reasoning_effort": "medium",
-  "context_tokens": 1000000,
-  "multimodal_support": false,
-  "provider": "",                  // "" = openai-compat default; "anthropic" loads opt/providers/anthropic
-  "opt": []                        // additional opt/ entries to copy in
-}
+```bash
+docker compose exec db psql -U postgres -d postgres
 ```
 
-Tunables with defaults in `CFG` (rarely worth changing, override in `config.json`): `life_tail`, `memory_limit`, `tool_timeout`, `trigger_tick`, `inbox_tick`, `inbox_preview`, `chat_msg_max`, `tool_output_limit`. `AGENT_DIR` / `BLOB_DIR` are in-source constants.
+```sql
+SELECT attobot.ensure_agent(
+  p_slug => 'primary',
+  p_soul => $$
+You are a persistent agent running inside PostgreSQL.
+Be direct. Use tools when you need to act on stored state.
+Queue operator-facing messages with SEND_CHAT.
+$$,
+  p_api_key => 'sk-...'
+);
+```
 
-## Principles
+Send a message:
 
-1. **The agent is a loop.** One process, one file watch, one LLM call per change.
-2. **The bus is the filesystem.** Channels in, channels out, scheduled jobs, background work, memory — all files. No daemon, no queue, no IPC.
-3. **Opinionated cuts code.** Telegram is the chat. One operator, one chat. Default is DeepSeek V4 Pro via DeepSeek, but anything OpenAI-shape works out of the box and other shapes live in `opt/providers/`. No abstractions for things that aren't pluralized.
+```bash
+python agent.py send "Introduce yourself"
+```
+
+Read queued outbound messages:
+
+```bash
+python agent.py outbox
+```
+
+The default DSN is `postgresql://postgres:secret@localhost:5432/postgres`.
+Override it with `--dsn` or `ATTOBOT_DSN`.
+
+## Durable Loops
+
+Start a cron wake loop with `pg_durable`:
+
+```sql
+SELECT attobot.start_agent_loop('primary', '*/5 * * * *');
+```
+
+Install an interval trigger that appends a system message and starts a turn:
+
+```sql
+SELECT attobot.install_interval_trigger(
+  p_agent_slug => 'primary',
+  p_name => 'heartbeat',
+  p_interval_seconds => 300,
+  p_message => 'tick'
+);
+
+SELECT attobot.start_trigger_loop('primary');
+```
+
+## Tables
+
+- `attobot.agents`: one row per agent.
+- `attobot.config`: per-agent configuration and secrets.
+- `attobot.messages`: canonical conversation stream.
+- `attobot.tool_requests`: pending/running/completed tool calls.
+- `attobot.outbox`: outbound messages for chat relays or clients.
+- `attobot.blobs`: content-addressed large text storage.
+- `attobot.triggers`: interval triggers fired by a durable trigger loop.
+- `attobot.lifecycle`: append-only operational events.
+
+## Built-In Tools
+
+The LLM sees these database-native tools:
+
+- `SQL`: run a single SQL query that returns rows.
+- `SEND_CHAT`: queue an operator-facing message in `attobot.outbox`.
+- `APPEND_MESSAGE`: append a message to an agent stream.
+- `STASH`: save large text into `attobot.blobs`.
+- `READ_BLOB`: read stashed content by hash.
+
+`SQL` intentionally accepts only one semicolon-free query and wraps it as a
+subquery. For writes, use a data-modifying CTE with `RETURNING`, for example:
+
+```sql
+WITH ins AS (
+  INSERT INTO some_table(value) VALUES ('x')
+  RETURNING *
+)
+SELECT * FROM ins
+```
+
+## Docker Image
+
+The image uses `postgres:18-trixie` as its base and installs
+`pg-durable-postgresql-18_0.2.2-1_amd64.deb` from the
+`sweatybridge/pg_durable` `v0.2.2` GitHub release. The Dockerfile verifies the
+published SHA256 digest before installing the package.
+
+`shared_preload_libraries = 'pg_durable'` is written into the base sample config
+so new clusters load the background worker before init SQL runs.
