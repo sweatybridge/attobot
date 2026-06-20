@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal agent."""
-import base64, collections, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, requests, shutil, subprocess, sys, threading, time
+import base64, collections, fcntl, hashlib, importlib.util, json, mimetypes, os, pathlib, pwd, re, requests, shutil, subprocess, sys, threading, time
 sys.modules.setdefault("agent", sys.modules[__name__])
 
 AGENT_DIR = sys.argv[1] if len(sys.argv) > 1 else "agent"
@@ -28,6 +28,13 @@ CFG = { # defaults
 
 os.makedirs(BLOB_DIR, exist_ok=True)
 os.makedirs(f"{AGENT_DIR}/memory", exist_ok=True)
+
+SYS_MSG = re.compile(r"<system-message>.*</system-message>", re.DOTALL)
+
+def _unwrap_sys_msg(content):
+    if SYS_MSG.fullmatch(content):
+        return content[len("<system-message>"):-len("</system-message>")]
+    return content
 
 def life(event, agent_dir=AGENT_DIR):
     if not isinstance(event, str):
@@ -124,13 +131,11 @@ def llm_w_retry(messages, tools=None):
         try:
             return llm(messages, tools)
         except Exception as e:
-            append_msg({"role": "system", "content": f"[llm retry in {delay}s] {e}"})
+            append_msg({"role": "user", "content": f"<system-message>[llm retry in {delay}s] {e}</system-message>"})
             time.sleep(delay)
             delay = min(delay * 2, 900)
 
-_TG_MEDIA = {ext: (f"send{kind}", kind.lower())
-             for kind, exts in {"Photo": "jpg jpeg png gif webp", "Video": "mp4 mov webm",
-                                "Voice": "ogg", "Audio": "mp3 m4a wav"}.items() for ext in exts.split()}
+_TG_MEDIA = {ext: (f"send{kind}", kind.lower()) for kind, exts in {"Photo": "jpg jpeg png gif webp", "Video": "mp4 mov webm", "Voice": "ogg", "Audio": "mp3 m4a wav"}.items() for ext in exts.split()}
 
 def _tg_send(endpoint, payload, files=None, cfg=None):
     cfg = cfg or CFG
@@ -245,7 +250,6 @@ def stash_messages(args):
         e += 1
     if s >= e:
         return "nothing safe to stash"
-    start, end = s + 1, e
 
     target = "\n".join(lines[s:e])
     try:
@@ -257,18 +261,17 @@ def stash_messages(args):
     except Exception as exc:
         summary = f"(summary failed: {exc})"
     marker = stash(target)
-    placeholder = json.dumps({"role": "system", "content": f"<{end - start + 1} lines stashed to {marker}>\nsummary: {summary}"})
+    count = e - s
+    placeholder = json.dumps({"role": "user", "content": f"<system-message>\n{count} lines stashed to {marker}. \nsummary: {summary}</system-message>"})
 
     with open(path, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         content = f.read()
         if target not in content:
             return "stash failed because target range no longer in file (file was modified)"
-        new_content = content.replace(target, placeholder, 1)
-        f.seek(0)
-        f.truncate()
-        f.write(new_content)
-    return f"{end - start + 1} lines stashed to {marker}"
+        f.seek(0); f.truncate()
+        f.write(content.replace(target, placeholder, 1))
+    return f"{count} lines stashed to {marker}"
 
 TOOLS = [
     ("SEND_ATTACHMENT", send_attachment, "Send a file to your Telegram topic (photo for images, voice for .ogg, video for .mp4, audio for .mp3/.m4a/.wav, document otherwise). `text` is an optional caption (capped at 1024 chars). For a plain text message, do NOT use this — just write a normal assistant reply.",
@@ -345,7 +348,7 @@ def bg_run(name, args, tool_call_id, tool_fn):
 
     def emit():
         t.join()
-        append_msg({"role": "system", "content": f"[bg {bg_id} done, tc:{tool_call_id}] {holder['result']}"})
+        append_msg({"role": "user", "content": f"<system-message>[bg {bg_id} done, tc:{tool_call_id}] {holder['result']}</system-message>"})
         try: json_path.unlink()
         except Exception: pass
 
@@ -414,7 +417,7 @@ def start_chat():
 _trigger_queue = collections.deque()
 _trigger_queue_lock = threading.Lock()
 
-def _flush_trigger_over_idle():  # release one queued trigger if the agent's last turn is an assistant turn, replaces idle turns
+def _flush_trigger_over_idle():
     path = f"{AGENT_DIR}/messages.jsonl"
     try:
         with open(path, "r+") as f:
@@ -427,7 +430,7 @@ def _flush_trigger_over_idle():  # release one queued trigger if the agent's las
                 if not _trigger_queue:
                     return
                 m = _trigger_queue.popleft()
-            if len(lines) >= 2 and _msg(lines[-2]).get("role") == "system":
+            if len(lines) >= 2 and _unwrap_sys_msg(_msg(lines[-2]).get("content") or "").startswith("[trigger "):
                 lines = lines[:-2]
             lines.append(json.dumps(m))
             f.seek(0); f.truncate()
@@ -442,10 +445,6 @@ def start_triggers():
     heartbeat = triggers_dir / "heartbeat.json"
     if not heartbeat.exists():
         heartbeat.write_text(json.dumps({"next": time.time() + 225, "repeat_s": 225, "cap": 3600, "message": "tick"}))
-    if os.path.basename(os.path.abspath(AGENT_DIR)) == "subconscious":
-        self_stash = triggers_dir / "self-stash.json"
-        if not self_stash.exists():
-            self_stash.write_text(json.dumps({"next": time.time() + 1800, "repeat_s": 1800, "message": "STASH_MESSAGE: all"}))
 
     def loop():
         while True:
@@ -480,7 +479,7 @@ def start_triggers():
                     if f.stem.startswith("subconscious-"):  # subc has no channel of its own; surface its triggers to Telegram via the primary
                         send_text(content)
                     with _trigger_queue_lock:
-                        _trigger_queue.append({"role": "system", "content": content})
+                        _trigger_queue.append({"role": "user", "content": f"<system-message>{content}</system-message>"})
                     if one_shot:
                         f.unlink()
             except Exception as e:
@@ -522,6 +521,7 @@ def start_inbox():
     threading.Thread(target=watch, daemon=True, name="inbox-poll").start()
 
 def _stash_directive_arg(content):
+    content = _unwrap_sys_msg(content)
     marker = "STASH_MESSAGE:"
     if marker not in content:
         return None
@@ -536,17 +536,15 @@ def _exec_stash_directive(arg):
     with open(path, "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         msgs = [json.loads(ln) for ln in f.read().splitlines()]
-        kept = [m for m in msgs if not (m.get("role") == "system" and _stash_directive_arg(m.get("content") or "") is not None)]
+        kept = [m for m in msgs if not (m.get("role") == "user" and _stash_directive_arg(m.get("content") or "") is not None)]
         f.seek(0); f.truncate()
         f.write("".join(json.dumps(m) + "\n" for m in kept))
         n = len(kept)
-    if arg == "all":
-        if n > 1:
-            stash_messages({"start": 1, "end": n})
-    elif arg:
-        p = arg.split()
-        if len(p) == 2 and p[0].isdigit() and p[1].isdigit():
-            stash_messages({"start": int(p[0]), "end": int(p[1])})
+    p = arg.split() if arg else []
+    if arg == "all" and n > 1:
+        stash_messages({"start": 1, "end": n})
+    elif len(p) == 2 and p[0].isdigit() and p[1].isdigit():
+        stash_messages({"start": int(p[0]), "end": int(p[1])})
     else:
         stash_messages({})
     life(f"[stash directive] {arg or 'default'}")
@@ -612,12 +610,12 @@ def main():
         start_chat()
     start_triggers()
     start_inbox()
-    append_msg({"role": "system", "content": f"[start] multimodal_support={CFG['multimodal_support']} provider={CFG['provider'] or 'openai_compat'}"})
+    append_msg({"role": "user", "content": f"<system-message>[start] multimodal_support={CFG['multimodal_support']} provider={CFG['provider'] or 'openai_compat'}</system-message>"})
 
     def file_hash():
         return hashlib.sha256(open(f"{AGENT_DIR}/messages.jsonl", "rb").read()).hexdigest()
 
-    last_hash = ""  # force a first turn on boot so the gate has an assistant turn to open on
+    last_hash = ""  # force a first turn on startup
     owe_turn = False
     while True:
         if not owe_turn and file_hash() == last_hash:
@@ -626,7 +624,7 @@ def main():
 
         directive = None
         for m in load_messages():
-            if m.get("role") != "system":
+            if m.get("role") != "user":
                 continue
             directive = _stash_directive_arg(m.get("content") or "")
             if directive is not None:
@@ -639,23 +637,23 @@ def main():
 
         system, life_tail, messages = build_system(), life_block(), load_messages()
         if len(system) + len(life_tail) + sum(len(json.dumps(m)) for m in messages) > (CFG["context_tokens"] * 4 * 0.8): # ≈4 chars/token, 20% buffer
-            append_msg({"role": "system", "content": f"[stash_messages] {stash_messages({})}"})
+            append_msg({"role": "user", "content": f"<system-message>[stash_messages] {stash_messages({})}</system-message>"})
             system, life_tail, messages = build_system(), life_block(), load_messages()
 
         msg = llm_w_retry(
             # Ensure ≥1 user message
-            [{"role": "system", "content": system}] + [{"role": "user", "content": "Be Useful"}] + messages + [{"role": "system", "content": life_tail}],
+            [{"role": "system", "content": system}] + [{"role": "user", "content": "Be Useful"}] + messages + [{"role": "user", "content": f"<system-message>{life_tail}</system-message>"}],
             tools=TOOL_SCHEMAS)
         assistant = {"role": "assistant", "content": msg.get("content") or "",
                      **{k: msg[k] for k in ("reasoning_content", "tool_calls") if msg.get(k)}}
         owe_turn = False
 
-        i, inbound = next(((i, m) for i, m in reversed(list(enumerate(messages))) if m.get("role") in ("user", "system")), (None, {}))
+        i, inbound = next(((i, m) for i, m in reversed(list(enumerate(messages))) if m.get("role") == "user"), (None, {}))
         tail = messages[i + 1:] if i is not None else messages
         did_tool_call = bool(assistant.get("tool_calls")) or any(m.get("role") == "tool" or m.get("tool_calls") for m in tail)
         if not assistant.get("tool_calls"):
             append_msg(assistant)
-            if inbound.get("role") == "user" or did_tool_call:
+            if not SYS_MSG.fullmatch(inbound.get("content") or "") or did_tool_call:
                 if text := (assistant.get("content") or "").strip(): send_text(text)
         else:
             tool_results = []
@@ -670,21 +668,16 @@ def main():
             owe_turn = True
 
         # Tool activity resets heartbeat cadence; idle heartbeat turns back off.
-        if did_tool_call:
+        if did_tool_call or _unwrap_sys_msg(inbound.get("content", "")).startswith("[trigger heartbeat]"):
             f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
             try:
                 job = json.loads(f.read_text())
-                job["idles"] = 0
-                job["next"] = time.time() + job["repeat_s"]
-                f.write_text(json.dumps(job))
-            except Exception:
-                pass
-        elif inbound.get("content", "").startswith("[trigger heartbeat]"):
-            f = pathlib.Path(f"{AGENT_DIR}/triggers/heartbeat.json")
-            try:
-                job = json.loads(f.read_text())
-                job["idles"] = job.get("idles", 0) + 1
-                job["next"] = time.time() + min(job["repeat_s"] * 2 ** job["idles"], job.get("cap", 3600))
+                if did_tool_call:
+                    job["idles"] = 0
+                    job["next"] = time.time() + job["repeat_s"]
+                else:
+                    job["idles"] = job.get("idles", 0) + 1
+                    job["next"] = time.time() + min(job["repeat_s"] * 2 ** job["idles"], job.get("cap", 3600))
                 f.write_text(json.dumps(job))
             except Exception:
                 pass
