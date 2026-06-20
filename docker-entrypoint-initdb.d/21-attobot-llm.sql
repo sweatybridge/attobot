@@ -27,6 +27,36 @@ AS $$
     jsonb_build_object(
       'type', 'function',
       'function', jsonb_build_object(
+        'name', 'SEARCH',
+        'description', 'Search the public web and return a JSON list of result titles, URLs, and snippets.',
+        'parameters', jsonb_build_object(
+          'type', 'object',
+          'properties', jsonb_build_object(
+            'query', jsonb_build_object('type', 'string'),
+            'limit', jsonb_build_object('type', 'integer')
+          ),
+          'required', jsonb_build_array('query')
+        )
+      )
+    ),
+    jsonb_build_object(
+      'type', 'function',
+      'function', jsonb_build_object(
+        'name', 'WEBFETCH',
+        'description', 'Fetch an HTTP or HTTPS URL and return status, content type, effective URL, and a truncated text body.',
+        'parameters', jsonb_build_object(
+          'type', 'object',
+          'properties', jsonb_build_object(
+            'url', jsonb_build_object('type', 'string'),
+            'max_bytes', jsonb_build_object('type', 'integer')
+          ),
+          'required', jsonb_build_array('url')
+        )
+      )
+    ),
+    jsonb_build_object(
+      'type', 'function',
+      'function', jsonb_build_object(
         'name', 'SQL',
         'description', 'Run one semicolon-free SQL query inside PostgreSQL. The query must return rows. For writes, use a data-modifying CTE with RETURNING.',
         'parameters', jsonb_build_object(
@@ -41,12 +71,17 @@ AS $$
     jsonb_build_object(
       'type', 'function',
       'function', jsonb_build_object(
-        'name', 'SEND_CHAT',
-        'description', 'Queue text for the operator in attobot.outbox.',
+        'name', 'SEND_ATTACHMENT',
+        'description', 'Send blob content as a Telegram document attachment. Use WRITE_BLOB first, then pass the returned hash.',
         'parameters', jsonb_build_object(
           'type', 'object',
-          'properties', jsonb_build_object('text', jsonb_build_object('type', 'string')),
-          'required', jsonb_build_array('text')
+          'properties', jsonb_build_object(
+            'hash', jsonb_build_object('type', 'string'),
+            'filename', jsonb_build_object('type', 'string'),
+            'caption', jsonb_build_object('type', 'string'),
+            'mime_type', jsonb_build_object('type', 'string')
+          ),
+          'required', jsonb_build_array('hash')
         )
       )
     ),
@@ -69,12 +104,15 @@ AS $$
     jsonb_build_object(
       'type', 'function',
       'function', jsonb_build_object(
-        'name', 'STASH',
-        'description', 'Save large text in attobot.blobs and return a stash marker.',
+        'name', 'WRITE_BLOB',
+        'description', 'Write data to attobot.blobs. The content is decoded using encoding: base64, hex, escape, or a PostgreSQL text encoding such as UTF8, LATIN1, or WIN1252.',
         'parameters', jsonb_build_object(
           'type', 'object',
-          'properties', jsonb_build_object('content', jsonb_build_object('type', 'string')),
-          'required', jsonb_build_array('content')
+          'properties', jsonb_build_object(
+            'content', jsonb_build_object('type', 'string'),
+            'encoding', jsonb_build_object('type', 'string')
+          ),
+          'required', jsonb_build_array('content', 'encoding')
         )
       )
     ),
@@ -82,10 +120,13 @@ AS $$
       'type', 'function',
       'function', jsonb_build_object(
         'name', 'READ_BLOB',
-        'description', 'Read stashed text by hash.',
+        'description', 'Read blob data by hash. The result is encoded using encoding: base64, hex, escape, or a PostgreSQL text encoding such as UTF8.',
         'parameters', jsonb_build_object(
           'type', 'object',
-          'properties', jsonb_build_object('hash', jsonb_build_object('type', 'string')),
+          'properties', jsonb_build_object(
+            'hash', jsonb_build_object('type', 'string'),
+            'encoding', jsonb_build_object('type', 'string')
+          ),
           'required', jsonb_build_array('hash')
         )
       )
@@ -107,9 +148,12 @@ BEGIN
 
 <harness>
 You run inside PostgreSQL. Your canonical state is attobot.messages.
-Use tool calls when you need to act. Queue final operator-facing text with SEND_CHAT.
-Do not claim that external delivery happened; SEND_CHAT only writes attobot.outbox.
-Use SQL for database work. Use STASH for large content.
+Use tool calls when you need to act. Final assistant text with no tool calls is
+queued automatically in attobot.outbox.
+Do not claim that external delivery happened; attobot.outbox is only a delivery
+queue.
+Use SEARCH for web discovery, WEBFETCH to read a URL, SQL for database work,
+and WRITE_BLOB for large or binary content.
 </harness>',
     v_agent.soul
   );
@@ -217,7 +261,8 @@ $$;
 
 CREATE OR REPLACE FUNCTION attobot.record_assistant_from_http(
   p_agent_slug text,
-  p_http_response jsonb
+  p_http_response jsonb,
+  p_turn_id bigint DEFAULT NULL
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -230,8 +275,10 @@ DECLARE
   v_message jsonb;
   v_tool_calls jsonb;
   v_message_id bigint;
+  v_outbox_id bigint;
   v_content text;
   v_call jsonb;
+  v_payload jsonb;
   v_count integer := 0;
 BEGIN
   v_status := attobot._http_status(p_http_response);
@@ -261,35 +308,42 @@ BEGIN
   END IF;
 
   v_content := coalesce(v_message->>'content', '');
-  v_tool_calls := coalesce(v_message->'tool_calls', '[]'::jsonb);
+  v_tool_calls := CASE
+    WHEN jsonb_typeof(v_message->'tool_calls') = 'array' THEN v_message->'tool_calls'
+    ELSE '[]'::jsonb
+  END;
+
+  FOR v_call IN SELECT value FROM jsonb_array_elements(v_tool_calls)
+  LOOP
+    v_count := v_count + 1;
+  END LOOP;
+
+  v_payload := jsonb_build_object('raw', v_message, 'tool_calls', v_tool_calls);
+  IF v_count > 0 AND p_turn_id IS NOT NULL THEN
+    v_payload := v_payload || jsonb_build_object(
+      'turn_id', p_turn_id,
+      'tool_signal_name', format('attobot:%s:turn:%s:tools', p_agent_slug, p_turn_id)
+    );
+  END IF;
 
   v_message_id := attobot.append_message(
     p_agent_slug,
     'assistant',
     v_content,
-    jsonb_build_object('raw', v_message, 'tool_calls', v_tool_calls)
+    v_payload
   );
 
-  FOR v_call IN SELECT value FROM jsonb_array_elements(v_tool_calls)
-  LOOP
-    INSERT INTO attobot.tool_requests(
-      agent_id,
-      message_id,
-      tool_call_id,
-      name,
-      arguments
-    )
-    VALUES (
-      v_agent_id,
-      v_message_id,
-      v_call->>'id',
-      v_call #>> '{function,name}',
-      attobot._try_jsonb(v_call #>> '{function,arguments}')
-    )
-    ON CONFLICT (agent_id, tool_call_id) DO NOTHING;
-    v_count := v_count + 1;
-  END LOOP;
+  IF v_count = 0 AND v_content <> '' THEN
+    INSERT INTO attobot.outbox(agent_id, channel, body)
+    VALUES (v_agent_id, 'chat', jsonb_build_object('text', v_content))
+    RETURNING id INTO v_outbox_id;
+  END IF;
 
-  RETURN jsonb_build_object('message_id', v_message_id, 'tool_calls', v_count, 'error', false);
+  RETURN jsonb_strip_nulls(jsonb_build_object(
+    'message_id', v_message_id,
+    'tool_calls', v_count,
+    'outbox_id', v_outbox_id,
+    'error', false
+  ));
 END;
 $$;

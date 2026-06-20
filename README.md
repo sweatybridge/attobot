@@ -20,8 +20,9 @@ operator/client
        -> attobot.compose_llm_request(...)
        -> df.http(... /chat/completions ...)
        -> attobot.record_assistant_from_http(...)
-       -> attobot.run_pending_tool_requests(...)
-       -> attobot.start_turn(...) while tool calls remain
+       -> attobot.start_tool_signal_executor(...)
+       -> df.wait_for_signal(... tool results ...)
+       -> attobot.start_turn(...) after successful tool results
   -> attobot.outbox
 ```
 
@@ -29,11 +30,16 @@ The durable turn workflow is SQL:
 
 - `df.http` calls an OpenAI-compatible `/chat/completions` endpoint.
 - Assistant messages are stored in `attobot.messages`.
-- Tool calls are stored in `attobot.tool_requests`.
-- Database-native tools are executed by `attobot.run_pending_tool_requests`.
-- User-visible replies are queued in `attobot.outbox`.
+- Tool calls are stored on assistant message payloads.
+- Database-native tools run in child durable workflows that signal the parent
+  turn with `df.wait_for_signal`.
+- Tool signal timeouts write timeout tool messages and cancel stale tool
+  executor work as cleanup.
+- Assistant replies with no tool calls are queued in `attobot.outbox`.
+- The `SEND_ATTACHMENT` tool queues stored blobs as Telegram document attachments.
 - Optional Telegram loops use `df.http` to poll `getUpdates` into
-  `attobot.messages` and deliver `attobot.outbox` rows with `sendMessage`.
+  `attobot.messages` and deliver `attobot.outbox` rows with `sendMessage` or
+  `sendDocument`.
 
 ## Run
 
@@ -85,7 +91,7 @@ SELECT attobot.ensure_agent(
   p_soul => $$
 You are a persistent agent running inside PostgreSQL.
 Be direct. Use tools when you need to act on stored state.
-Queue operator-facing messages with SEND_CHAT.
+Reply directly when no tool action is needed.
 $$,
   p_api_key => 'sk-...',
   p_model_id => (SELECT id FROM model)
@@ -146,12 +152,13 @@ The inbox loop calls Telegram `getUpdates` through `pg_durable` and appends
 accepted messages as `[telegram <update_id>] ...` user messages. It accepts only
 the configured chat, and the configured topic when `telegram_thread_id` is set.
 
-When Telegram is configured, pending `chat` or `telegram` rows inserted into
+When Telegram is configured, pending `chat`, `telegram`, or
+`telegram_attachment` rows inserted into
 `attobot.outbox` automatically fire a PostgreSQL trigger that starts a one-shot
-durable `sendMessage` workflow for that row.
+durable Telegram send workflow for that row.
 
-The `SEND_CHAT` tool still only queues messages; Telegram delivery is scheduled
-by the outbox table trigger.
+Attachment delivery exports the blob to a temporary file inside the Postgres
+container, then uploads it with Telegram `sendDocument` using `curl`.
 
 ## Durable Loops
 
@@ -172,20 +179,41 @@ SELECT attobot.ensure_scheduled_message_loop(
 - `attobot.models`: reusable model, endpoint, temperature, reasoning, context, and modality configuration.
 - `attobot.config`: per-agent configuration and secrets.
 - `attobot.messages`: canonical conversation stream.
-- `attobot.tool_requests`: pending/running/completed tool calls.
 - `attobot.outbox`: outbound messages for chat relays or clients.
 - `attobot.blobs`: content-addressed large content storage as external `bytea`.
-- `attobot.lifecycle`: append-only operational events.
+- `attobot.lifecycle`: append-only operational events, including turn start,
+  durable instance, completion, and tool-signal records.
 
 ## Built-In Tools
 
 The LLM sees these database-native tools:
 
+- `SEARCH`: search the public web and return result titles, URLs, and snippets.
+- `WEBFETCH`: fetch a public HTTP(S) URL and return status, content type, effective URL, and a truncated text body.
 - `SQL`: run a single SQL query that returns rows.
-- `SEND_CHAT`: queue an operator-facing message in `attobot.outbox`.
+- `SEND_ATTACHMENT`: send a stored blob as a Telegram document attachment.
 - `APPEND_MESSAGE`: append a message to an agent stream.
-- `STASH`: save large text into `attobot.blobs`.
-- `READ_BLOB`: read stashed content by hash.
+- `WRITE_BLOB`: write large or binary content into `attobot.blobs` using an explicit encoding.
+- `READ_BLOB`: read blob content by hash as `UTF8` text, `base64`, `hex`, `escape`, or another PostgreSQL text encoding.
+
+Tool calls are not queued in a separate request table. The parent turn stores
+tool calls on the assistant message, starts a child durable tool workflow, and
+waits on `df.wait_for_signal`. The child workflow writes `tool` messages and
+signals the parent turn. `SEARCH` and `WEBFETCH` use `df.http`; `SEARCH` queries
+Bing's HTML endpoint and returns up to 10 parsed results. `WEBFETCH` is limited
+to public `http` and `https` URLs and blocks obvious local/private hosts. If the
+parent wait times out, attobot writes timeout tool responses so the next LLM
+request has a valid tool-message sequence, and cancels stale tool executor work
+to free resources.
+
+`WRITE_BLOB` accepts `content` plus `encoding`. Use `base64`, `hex`, or `escape`
+for raw binary data; use PostgreSQL text encodings such as `UTF8`, `LATIN1`, or
+`WIN1252` when the content should be converted from text into bytes. It returns
+a JSON object with the blob hash, byte count, and marker.
+
+`SEND_ATTACHMENT` accepts a blob `hash`, plus optional `filename`, `caption`, and
+`mime_type`. It queues a `telegram_attachment` outbox row; the Telegram outbox
+workflow uploads the stored blob bytes as the document body.
 
 `SQL` intentionally accepts only one semicolon-free query and wraps it as a
 subquery. For writes, use a data-modifying CTE with `RETURNING`, for example:

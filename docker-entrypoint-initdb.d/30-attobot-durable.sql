@@ -5,15 +5,11 @@ AS $$
 DECLARE
   v_agent_id bigint := attobot.agent_id(p_agent_slug);
 BEGIN
-  IF p_turn_id IS NOT NULL THEN
-    UPDATE attobot.turns
-    SET status = 'completed',
-        updated_at = now()
-    WHERE id = p_turn_id
-      AND agent_id = v_agent_id;
-  END IF;
-
-  PERFORM attobot.log_event(v_agent_id, 'turn.complete', '{}'::jsonb);
+  PERFORM attobot.log_event(
+    v_agent_id,
+    'turn.complete',
+    jsonb_strip_nulls(jsonb_build_object('turn_id', p_turn_id))
+  );
   RETURN 'completed';
 END;
 $$;
@@ -27,9 +23,12 @@ DECLARE
   v_instance text;
   v_turn_id bigint;
 BEGIN
-  INSERT INTO attobot.turns(agent_id, status)
-  VALUES (v_agent_id, 'started')
-  RETURNING id INTO v_turn_id;
+  SELECT attobot.log_event(
+    v_agent_id,
+    'turn.start',
+    jsonb_build_object('status', 'started')
+  )
+  INTO v_turn_id;
 
   SELECT df.start(
     format('SELECT attobot.compose_llm_request(%L)::text AS body', p_agent_slug) |=> 'request'
@@ -40,10 +39,13 @@ BEGIN
       attobot._llm_headers(p_agent_slug),
       120
     ) |=> 'http_response'
-    ~> format('SELECT attobot.record_assistant_from_http(%L, $http_response::jsonb)::jsonb AS assistant', p_agent_slug)
+    ~> format('SELECT attobot.record_assistant_from_http(%L, $http_response::jsonb, %s)::jsonb AS assistant', p_agent_slug, v_turn_id)
     ~> df.if(
-      format('SELECT attobot._has_pending_tool_requests(%L)', p_agent_slug),
-      format('SELECT attobot.run_pending_tool_requests(%L)::jsonb AS tool_results', p_agent_slug)
+      'SELECT ($assistant.tool_calls)::integer > 0',
+      format('SELECT attobot.start_tool_signal_executor(%L, ($assistant.message_id)::bigint, %s) AS tool_executor', p_agent_slug, v_turn_id)
+        ~> (df.wait_for_signal(attobot.tool_signal_name(p_agent_slug, v_turn_id), 900) |=> 'tool_signal')
+        ~> format('SELECT attobot.record_tool_signal(%L, %s, $tool_signal::jsonb)::jsonb AS tool_signal_result', p_agent_slug, v_turn_id)
+        ~> format('SELECT attobot.finish_turn(%L, %s) AS done', p_agent_slug, v_turn_id)
         ~> format('SELECT attobot.start_turn(%L) AS next_instance', p_agent_slug),
       format('SELECT attobot.finish_turn(%L, %s) AS done', p_agent_slug, v_turn_id)
     ),
@@ -51,14 +53,9 @@ BEGIN
   )
   INTO v_instance;
 
-  UPDATE attobot.turns
-  SET durable_instance_id = v_instance,
-      updated_at = now()
-  WHERE id = v_turn_id;
-
   PERFORM attobot.log_event(
     v_agent_id,
-    'turn.start',
+    'turn.instance',
     jsonb_build_object('turn_id', v_turn_id, 'durable_instance_id', v_instance)
   );
 
@@ -177,16 +174,23 @@ BEGIN
   SELECT df.start(
     format('SELECT * FROM attobot._telegram_claim_outbox(%L, %s)', p_agent_slug, p_outbox_id) |=> 'claim'
     ~> df.if(
-      'SELECT $claim.has_outbox',
-      df.http(
-        attobot._telegram_api_url(p_agent_slug, 'sendMessage'),
-        'POST',
-        '$claim.request_body',
-        attobot._telegram_headers(),
-        30
-      ) |=> 'http_response'
-        ~> format('SELECT attobot.record_telegram_send_result(%L, $claim.outbox_id, $http_response::jsonb)::jsonb AS result', p_agent_slug),
-      'SELECT jsonb_build_object(''sent'', false, ''reason'', coalesce($claim.reason, ''empty'')) AS result'
+      format(
+        'SELECT $claim.has_outbox AND EXISTS (SELECT 1 FROM attobot.outbox WHERE id = $claim.outbox_id AND channel = %L)',
+        'telegram_attachment'
+      ),
+      format('SELECT attobot.send_telegram_attachment_outbox(%L, $claim.outbox_id)::jsonb AS result', p_agent_slug),
+      df.if(
+        'SELECT $claim.has_outbox',
+        df.http(
+          attobot._telegram_api_url(p_agent_slug, 'sendMessage'),
+          'POST',
+          '$claim.request_body',
+          attobot._telegram_headers(),
+          30
+        ) |=> 'http_response'
+          ~> format('SELECT attobot.record_telegram_send_result(%L, $claim.outbox_id, $http_response::jsonb)::jsonb AS result', p_agent_slug),
+        'SELECT jsonb_build_object(''sent'', false, ''reason'', coalesce($claim.reason, ''empty'')) AS result'
+      )
     ),
     format('attobot:%s:telegram-outbox:%s:%s', p_agent_slug, p_outbox_id, txid_current())
   )
@@ -205,7 +209,7 @@ DECLARE
   v_instance text;
 BEGIN
   IF NEW.status <> 'pending'
-     OR NEW.channel NOT IN ('chat', 'telegram')
+     OR NEW.channel NOT IN ('chat', 'telegram', 'telegram_attachment')
      OR coalesce(attobot._config_text(NEW.agent_id, 'telegram_token'), '') = ''
      OR coalesce(attobot._config_text(NEW.agent_id, 'telegram_chat_id'), '') = '' THEN
     RETURN NEW;

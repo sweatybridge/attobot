@@ -47,24 +47,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_telegram_update_agent_idx
   ON attobot.messages(agent_id, ((payload #>> '{telegram_update,update_id}')))
   WHERE payload #>> '{telegram_update,update_id}' IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS attobot.tool_requests (
-  id bigserial PRIMARY KEY,
-  agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
-  message_id bigint REFERENCES attobot.messages(id) ON DELETE SET NULL,
-  tool_call_id text NOT NULL,
-  name text NOT NULL,
-  arguments jsonb NOT NULL DEFAULT '{}'::jsonb,
-  status text NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending', 'running', 'completed', 'failed')),
-  result text,
-  error text,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now(),
-  UNIQUE (agent_id, tool_call_id)
-);
-
-CREATE INDEX IF NOT EXISTS tool_requests_agent_status_idx
-  ON attobot.tool_requests(agent_id, status, id);
+CREATE UNIQUE INDEX IF NOT EXISTS messages_tool_call_agent_idx
+  ON attobot.messages(agent_id, tool_call_id)
+  WHERE role = 'tool' AND tool_call_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS attobot.outbox (
   id bigserial PRIMARY KEY,
@@ -88,16 +73,6 @@ CREATE TABLE IF NOT EXISTS attobot.blobs (
 );
 
 ALTER TABLE attobot.blobs ALTER COLUMN content SET STORAGE EXTERNAL;
-
-CREATE TABLE IF NOT EXISTS attobot.turns (
-  id bigserial PRIMARY KEY,
-  agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
-  durable_instance_id text,
-  status text NOT NULL DEFAULT 'started'
-    CHECK (status IN ('started', 'completed', 'failed')),
-  created_at timestamptz NOT NULL DEFAULT now(),
-  updated_at timestamptz NOT NULL DEFAULT now()
-);
 
 CREATE TABLE IF NOT EXISTS attobot.lifecycle (
   id bigserial PRIMARY KEY,

@@ -192,3 +192,36 @@ IMMUTABLE
 AS $$
   SELECT attobot._try_jsonb(coalesce(p_http_response->>'body', ''));
 $$;
+
+CREATE OR REPLACE FUNCTION attobot._shell_quote(p_text text)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+BEGIN
+  RETURN '''' || replace(coalesce(p_text, ''), '''', '''"''"''') || '''';
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION attobot._program_output(p_command text)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_output text;
+BEGIN
+  CREATE TEMP TABLE IF NOT EXISTS attobot_program_output(
+    seq bigserial,
+    line text
+  ) ON COMMIT DROP;
+
+  TRUNCATE attobot_program_output RESTART IDENTITY;
+  EXECUTE format('COPY attobot_program_output(line) FROM PROGRAM %L', p_command);
+
+  SELECT string_agg(line, E'\n' ORDER BY seq)
+  INTO v_output
+  FROM attobot_program_output;
+
+  RETURN coalesce(v_output, '');
+END;
+$$;

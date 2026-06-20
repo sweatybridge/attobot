@@ -209,7 +209,7 @@ BEGIN
   FROM attobot.outbox
   WHERE agent_id = v_agent_id
     AND status = 'pending'
-    AND channel IN ('chat', 'telegram')
+    AND channel IN ('chat', 'telegram', 'telegram_attachment')
     AND (p_outbox_id IS NULL OR id = p_outbox_id)
   ORDER BY id
   LIMIT 1
@@ -220,6 +220,20 @@ BEGIN
     has_outbox := false;
     request_body := NULL;
     reason := 'empty';
+    RETURN NEXT;
+    RETURN;
+  END IF;
+
+  IF v_outbox.channel = 'telegram_attachment' THEN
+    UPDATE attobot.outbox
+    SET status = 'sending',
+        body = body || jsonb_build_object('telegram_claimed_at', now())
+    WHERE id = v_outbox.id;
+
+    outbox_id := v_outbox.id;
+    has_outbox := true;
+    request_body := NULL;
+    reason := NULL;
     RETURN NEXT;
     RETURN;
   END IF;
@@ -241,6 +255,204 @@ BEGIN
   request_body := v_request::text;
   reason := NULL;
   RETURN NEXT;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION attobot._telegram_attachment_filename(
+  p_filename text,
+  p_hash text
+)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+  v_filename text := coalesce(nullif(btrim(p_filename), ''), 'blob-' || p_hash || '.bin');
+BEGIN
+  v_filename := regexp_replace(v_filename, '[^A-Za-z0-9._-]+', '_', 'g');
+  v_filename := left(v_filename, 160);
+
+  IF v_filename = '' OR v_filename IN ('.', '..') THEN
+    v_filename := 'blob-' || p_hash || '.bin';
+  END IF;
+
+  IF left(v_filename, 1) = '.' THEN
+    v_filename := 'blob-' || p_hash || v_filename;
+  END IF;
+
+  RETURN v_filename;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION attobot.send_telegram_attachment_outbox(
+  p_agent_slug text,
+  p_outbox_id bigint
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_agent_id bigint := attobot.agent_id(p_agent_slug);
+  v_outbox attobot.outbox%ROWTYPE;
+  v_blob_hash text;
+  v_content bytea;
+  v_filename text;
+  v_mime_type text;
+  v_caption text;
+  v_chat_id text := attobot._config_text(v_agent_id, 'telegram_chat_id');
+  v_thread_id text := attobot._config_text(v_agent_id, 'telegram_thread_id');
+  v_url text := attobot._telegram_api_url(p_agent_slug, 'sendDocument');
+  v_oid oid;
+  v_path text;
+  v_command text;
+  v_output text;
+  v_status integer := 0;
+  v_response_text text := '';
+  v_result jsonb;
+BEGIN
+  SELECT *
+  INTO v_outbox
+  FROM attobot.outbox
+  WHERE id = p_outbox_id
+    AND agent_id = v_agent_id
+    AND channel = 'telegram_attachment'
+    AND status IN ('pending', 'sending')
+  FOR UPDATE;
+
+  IF v_outbox.id IS NULL THEN
+    RETURN jsonb_build_object('sent', false, 'outbox_id', p_outbox_id, 'reason', 'attachment outbox not found');
+  END IF;
+
+  v_blob_hash := v_outbox.body->>'blob_hash';
+  SELECT content
+  INTO v_content
+  FROM attobot.blobs
+  WHERE agent_id = v_agent_id
+    AND hash = v_blob_hash;
+
+  IF v_content IS NULL THEN
+    UPDATE attobot.outbox
+    SET status = 'failed',
+        body = body || jsonb_build_object('telegram_error', 'blob not found')
+    WHERE id = v_outbox.id;
+
+    PERFORM attobot.log_event(
+      v_agent_id,
+      'telegram.send.error',
+      jsonb_build_object('outbox_id', v_outbox.id, 'error', 'blob not found', 'blob_hash', v_blob_hash)
+    );
+
+    RETURN jsonb_build_object('sent', false, 'outbox_id', v_outbox.id, 'reason', 'blob not found');
+  END IF;
+
+  v_filename := attobot._telegram_attachment_filename(v_outbox.body->>'filename', v_blob_hash);
+  v_mime_type := coalesce(nullif(btrim(v_outbox.body->>'mime_type'), ''), 'application/octet-stream');
+  IF v_mime_type !~ '^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$' THEN
+    v_mime_type := 'application/octet-stream';
+  END IF;
+  v_caption := left(coalesce(v_outbox.body->>'caption', ''), 1024);
+
+  PERFORM attobot._program_output('mkdir -p /tmp/attobot-telegram');
+
+  v_oid := lo_from_bytea(0, v_content);
+  v_path := '/tmp/attobot-telegram/' || v_outbox.id || '-' || v_filename;
+  PERFORM lo_export(v_oid, v_path);
+
+  v_command :=
+    'curl --silent --show-error --request POST --write-out ' || attobot._shell_quote(E'\n%{http_code}') ||
+    ' ' || attobot._shell_quote(v_url) ||
+    ' --form-string ' || attobot._shell_quote('chat_id=' || v_chat_id) ||
+    CASE WHEN v_thread_id IS NOT NULL AND v_thread_id <> ''
+      THEN ' --form-string ' || attobot._shell_quote('message_thread_id=' || v_thread_id)
+      ELSE ''
+    END ||
+    CASE WHEN v_caption <> ''
+      THEN ' --form-string ' || attobot._shell_quote('caption=' || v_caption)
+      ELSE ''
+    END ||
+    ' --form ' || attobot._shell_quote('document=@' || v_path || ';filename=' || v_filename || ';type=' || v_mime_type);
+
+  BEGIN
+    v_output := attobot._program_output(v_command);
+    v_status := coalesce(nullif(substring(v_output from '([0-9]{3})\s*$'), '')::integer, 0);
+    v_response_text := regexp_replace(v_output, E'\n[0-9]{3}\\s*$', '');
+    v_result := attobot.record_telegram_send_result(
+      p_agent_slug,
+      v_outbox.id,
+      jsonb_build_object('status', v_status, 'body', v_response_text)
+    );
+  EXCEPTION WHEN others THEN
+    UPDATE attobot.outbox
+    SET status = 'failed',
+        body = body || jsonb_build_object('telegram_error', SQLERRM)
+    WHERE id = v_outbox.id;
+
+    PERFORM attobot.log_event(
+      v_agent_id,
+      'telegram.send.error',
+      jsonb_build_object('outbox_id', v_outbox.id, 'error', SQLERRM)
+    );
+
+    v_result := jsonb_build_object(
+      'sent', false,
+      'outbox_id', v_outbox.id,
+      'status', 0,
+      'error', SQLERRM
+    );
+  END;
+
+  BEGIN
+    IF v_oid IS NOT NULL THEN
+      PERFORM lo_unlink(v_oid);
+    END IF;
+  EXCEPTION WHEN others THEN
+    NULL;
+  END;
+
+  BEGIN
+    PERFORM attobot._program_output('rm -f -- ' || attobot._shell_quote(v_path));
+  EXCEPTION WHEN others THEN
+    NULL;
+  END;
+
+  RETURN v_result;
+
+EXCEPTION WHEN others THEN
+  BEGIN
+    IF v_oid IS NOT NULL THEN
+      PERFORM lo_unlink(v_oid);
+    END IF;
+  EXCEPTION WHEN others THEN
+    NULL;
+  END;
+
+  BEGIN
+    IF v_path IS NOT NULL THEN
+      PERFORM attobot._program_output('rm -f -- ' || attobot._shell_quote(v_path));
+    END IF;
+  EXCEPTION WHEN others THEN
+    NULL;
+  END;
+
+  IF v_outbox.id IS NOT NULL THEN
+    UPDATE attobot.outbox
+    SET status = 'failed',
+        body = body || jsonb_build_object('telegram_error', SQLERRM)
+    WHERE id = v_outbox.id;
+  END IF;
+
+  PERFORM attobot.log_event(
+    v_agent_id,
+    'telegram.send.error',
+    jsonb_build_object('outbox_id', p_outbox_id, 'error', SQLERRM)
+  );
+
+  RETURN jsonb_build_object(
+    'sent', false,
+    'outbox_id', p_outbox_id,
+    'status', 0,
+    'error', SQLERRM
+  );
 END;
 $$;
 
