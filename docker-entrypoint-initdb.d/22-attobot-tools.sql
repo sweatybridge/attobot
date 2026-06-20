@@ -1,5 +1,3 @@
-DROP FUNCTION IF EXISTS attobot.cancel_tool_signal_turn(text, bigint, jsonb);
-
 CREATE OR REPLACE FUNCTION attobot.tool_signal_name(
   p_agent_slug text,
   p_turn_id bigint

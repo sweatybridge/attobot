@@ -134,6 +134,29 @@ AS $$
   );
 $$;
 
+CREATE OR REPLACE FUNCTION attobot._memory_prompt(p_agent_id bigint)
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT coalesce(
+    string_agg(
+      format(
+        '- memory_id=%s source_message_ids=[%s]: %s',
+        id,
+        array_to_string(source_message_ids, ','),
+        content
+      ),
+      E'\n'
+      ORDER BY id
+    ),
+    ''
+  )
+  FROM attobot.memory
+  WHERE agent_id = p_agent_id
+    AND enabled;
+$$;
+
 CREATE OR REPLACE FUNCTION attobot._system_prompt(p_agent_id bigint)
 RETURNS text
 LANGUAGE plpgsql
@@ -141,10 +164,13 @@ STABLE
 AS $$
 DECLARE
   v_agent attobot.agents%ROWTYPE;
+  v_memory text;
 BEGIN
   SELECT * INTO v_agent FROM attobot.agents WHERE id = p_agent_id;
+  v_memory := attobot._memory_prompt(p_agent_id);
+
   RETURN format(
-    '<soul>%s</soul>
+    '<soul>%s</soul>%s
 
 <harness>
 You run inside PostgreSQL. Your canonical state is attobot.messages.
@@ -155,7 +181,11 @@ queue.
 Use SEARCH for web discovery, WEBFETCH to read a URL, SQL for database work,
 and WRITE_BLOB for large or binary content.
 </harness>',
-    v_agent.soul
+    v_agent.soul,
+    CASE
+      WHEN v_memory = '' THEN ''
+      ELSE E'\n\n<memory>\n' || v_memory || E'\n</memory>'
+    END
   );
 END;
 $$;

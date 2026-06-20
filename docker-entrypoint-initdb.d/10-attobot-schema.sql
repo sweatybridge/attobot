@@ -51,6 +51,23 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_tool_call_agent_idx
   ON attobot.messages(agent_id, tool_call_id)
   WHERE role = 'tool' AND tool_call_id IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS attobot.memory (
+  id bigserial PRIMARY KEY,
+  agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
+  content text NOT NULL,
+  source_message_ids bigint[] NOT NULL,
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  enabled boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (btrim(content) <> ''),
+  CHECK (cardinality(source_message_ids) > 0),
+  CHECK (array_position(source_message_ids, NULL) IS NULL)
+);
+
+CREATE INDEX IF NOT EXISTS memory_agent_enabled_id_idx
+  ON attobot.memory(agent_id, enabled, id);
+
 CREATE TABLE IF NOT EXISTS attobot.outbox (
   id bigserial PRIMARY KEY,
   agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,

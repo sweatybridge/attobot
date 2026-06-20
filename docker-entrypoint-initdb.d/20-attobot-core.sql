@@ -162,6 +162,37 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION attobot._validate_memory_source_messages()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_missing bigint[];
+BEGIN
+  SELECT array_agg(source_id ORDER BY source_id)
+  INTO v_missing
+  FROM unnest(NEW.source_message_ids) AS source_id
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM attobot.messages
+    WHERE id = source_id
+      AND agent_id = NEW.agent_id
+  );
+
+  IF v_missing IS NOT NULL THEN
+    RAISE EXCEPTION 'memory source_message_ids must reference messages for the same agent: %', v_missing;
+  END IF;
+
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE TRIGGER memory_validate_source_messages_trigger
+BEFORE INSERT OR UPDATE OF agent_id, content, source_message_ids, payload, enabled ON attobot.memory
+FOR EACH ROW
+EXECUTE FUNCTION attobot._validate_memory_source_messages();
+
 CREATE OR REPLACE FUNCTION attobot._try_jsonb(p_text text)
 RETURNS jsonb
 LANGUAGE plpgsql
