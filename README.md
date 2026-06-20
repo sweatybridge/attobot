@@ -1,11 +1,11 @@
 # attobot
 
-attobot is now a Postgres-resident agent harness. Agent state, turns, tool calls,
-blobs, and outbound messages live in PostgreSQL tables under the `attobot`
-schema. Agents point at shared rows in `attobot.models`, so multiple
-agents can reuse the same model configuration. `pg_durable` owns the durable
-workflow execution, so a turn can survive database restarts and resume from its
-last checkpoint.
+attobot is now a Postgres-resident agent harness. Agent state, turns, tool
+calls, and outbound messages live in PostgreSQL tables under the `attobot`
+schema; tool-owned blob storage lives under `attotools`. Agents point at shared
+rows in `attobot.models`, so multiple agents can reuse the same model
+configuration. `pg_durable` owns the durable workflow execution, so a turn can
+survive database restarts and resume from its last checkpoint.
 
 The old filesystem loop is gone. `agent.py` is only a thin client for inserting
 messages and inspecting database state.
@@ -20,7 +20,7 @@ operator/client
        -> attobot.compose_llm_request(...)
        -> df.http(... /chat/completions ...)
        -> attobot.record_assistant_from_http(...)
-       -> attobot.start_tool_signal_executor(...)
+       -> attotools.start_tool_signal_executor(...)
        -> df.wait_for_signal(... tool results ...)
        -> attobot.start_turn(...) after successful tool results
   -> attobot.outbox
@@ -182,7 +182,7 @@ SELECT attobot.ensure_scheduled_message_loop(
 - `attobot.memory`: agent-scoped durable memories forwarded to the LLM; each
   row stores `source_message_ids` for the messages it was constructed from.
 - `attobot.outbox`: outbound messages for chat relays or clients.
-- `attobot.blobs`: content-addressed large content storage as external `bytea`.
+- `attotools.blobs`: content-addressed large content storage as external `bytea`.
 - `attobot.lifecycle`: append-only operational events, including turn start,
   durable instance, completion, and tool-signal records.
 
@@ -195,7 +195,7 @@ The LLM sees these database-native tools:
 - `SQL`: run a single SQL query that returns rows.
 - `SEND_ATTACHMENT`: send a stored blob as a Telegram document attachment.
 - `APPEND_MESSAGE`: append a message to an agent stream.
-- `WRITE_BLOB`: write large or binary content into `attobot.blobs` using an explicit encoding.
+- `WRITE_BLOB`: write large or binary content into `attotools.blobs` using an explicit encoding.
 - `READ_BLOB`: read blob content by hash as `UTF8` text, `base64`, `hex`, `escape`, or another PostgreSQL text encoding.
 
 Tool calls are not queued in a separate request table. The parent turn stores

@@ -326,7 +326,7 @@ BEGIN
   v_blob_hash := v_outbox.body->>'blob_hash';
   SELECT content
   INTO v_content
-  FROM attobot.blobs
+  FROM attotools.blobs
   WHERE agent_id = v_agent_id
     AND hash = v_blob_hash;
 

@@ -1,4 +1,4 @@
-CREATE OR REPLACE FUNCTION attobot.tool_signal_name(
+CREATE OR REPLACE FUNCTION attotools.tool_signal_name(
   p_agent_slug text,
   p_turn_id bigint
 )
@@ -9,7 +9,7 @@ AS $$
   SELECT format('attobot:%s:turn:%s:tools', p_agent_slug, p_turn_id);
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._append_tool_message(
+CREATE OR REPLACE FUNCTION attotools._append_tool_message(
   p_agent_id bigint,
   p_tool_call_id text,
   p_result text
@@ -26,7 +26,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._tool_send_attachment(
+CREATE OR REPLACE FUNCTION attotools._tool_send_attachment(
   p_agent_id bigint,
   p_args jsonb
 )
@@ -43,7 +43,7 @@ BEGIN
 
   IF NOT EXISTS (
     SELECT 1
-    FROM attobot.blobs
+    FROM attotools.blobs
     WHERE agent_id = p_agent_id
       AND hash = v_hash
   ) THEN
@@ -71,7 +71,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._tool_append_message(
+CREATE OR REPLACE FUNCTION attotools._tool_append_message(
   p_args jsonb,
   p_agent_slug text
 )
@@ -88,7 +88,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._blob_decode_content(
+CREATE OR REPLACE FUNCTION attotools._blob_decode_content(
   p_content text,
   p_encoding text
 )
@@ -117,7 +117,7 @@ EXCEPTION WHEN others THEN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._blob_encode_content(
+CREATE OR REPLACE FUNCTION attotools._blob_encode_content(
   p_content bytea,
   p_encoding text DEFAULT 'UTF8'
 )
@@ -147,7 +147,7 @@ EXCEPTION WHEN others THEN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._tool_write_blob(
+CREATE OR REPLACE FUNCTION attotools._tool_write_blob(
   p_agent_id bigint,
   p_args jsonb
 )
@@ -158,13 +158,13 @@ DECLARE
   v_bytes bytea;
   v_hash text;
 BEGIN
-  v_bytes := attobot._blob_decode_content(
+  v_bytes := attotools._blob_decode_content(
     p_args->>'content',
     p_args->>'encoding'
   );
   v_hash := left(md5(v_bytes), 12);
 
-  INSERT INTO attobot.blobs(agent_id, hash, content)
+  INSERT INTO attotools.blobs(agent_id, hash, content)
   VALUES (p_agent_id, v_hash, v_bytes)
   ON CONFLICT (agent_id, hash) DO NOTHING;
 
@@ -176,7 +176,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._tool_read_blob(
+CREATE OR REPLACE FUNCTION attotools._tool_read_blob(
   p_agent_id bigint,
   p_args jsonb
 )
@@ -187,7 +187,7 @@ DECLARE
   v_content bytea;
 BEGIN
   SELECT content INTO v_content
-  FROM attobot.blobs
+  FROM attotools.blobs
   WHERE agent_id = p_agent_id
     AND hash = p_args->>'hash';
 
@@ -195,14 +195,14 @@ BEGIN
     RETURN 'error: blob not found';
   END IF;
 
-  RETURN attobot._blob_encode_content(
+  RETURN attotools._blob_encode_content(
     v_content,
     coalesce(p_args->>'encoding', 'UTF8')
   );
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._url_decode(p_text text)
+CREATE OR REPLACE FUNCTION attotools._url_decode(p_text text)
 RETURNS text
 LANGUAGE plpgsql
 IMMUTABLE
@@ -233,7 +233,7 @@ EXCEPTION WHEN others THEN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._url_encode(p_text text)
+CREATE OR REPLACE FUNCTION attotools._url_encode(p_text text)
 RETURNS text
 LANGUAGE plpgsql
 IMMUTABLE
@@ -269,7 +269,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._html_text(p_html text)
+CREATE OR REPLACE FUNCTION attotools._html_text(p_html text)
 RETURNS text
 LANGUAGE plpgsql
 IMMUTABLE
@@ -289,7 +289,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._search_result_url(p_href text)
+CREATE OR REPLACE FUNCTION attotools._search_result_url(p_href text)
 RETURNS text
 LANGUAGE plpgsql
 IMMUTABLE
@@ -303,7 +303,7 @@ BEGIN
   v_href := replace(v_href, '&amp;', '&');
   v_uddg := substring(v_href from '[?&]uddg=([^&]+)');
   IF v_uddg IS NOT NULL THEN
-    RETURN attobot._url_decode(v_uddg);
+    RETURN attotools._url_decode(v_uddg);
   END IF;
 
   v_bing_u := substring(v_href from '[?&]u=([^&]+)');
@@ -324,7 +324,7 @@ EXCEPTION WHEN others THEN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._http_url_allowed(p_url text)
+CREATE OR REPLACE FUNCTION attotools._http_url_allowed(p_url text)
 RETURNS boolean
 LANGUAGE plpgsql
 IMMUTABLE
@@ -358,7 +358,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._search_results_from_html(
+CREATE OR REPLACE FUNCTION attotools._search_results_from_html(
   p_query text,
   p_limit integer,
   p_html text
@@ -388,10 +388,10 @@ BEGIN
       CONTINUE;
     END IF;
 
-    v_url := attobot._search_result_url(substring(v_h2 from 'href="([^"]+)"'));
-    v_title := attobot._html_text(v_h2);
+    v_url := attotools._search_result_url(substring(v_h2 from 'href="([^"]+)"'));
+    v_title := attotools._html_text(v_h2);
     v_caption := substring(v_block from '<div class="b_caption"><p[^>]*>.*</p>');
-    v_snippet := attobot._html_text(coalesce(v_caption, ''));
+    v_snippet := attotools._html_text(coalesce(v_caption, ''));
 
     IF v_url = '' OR v_title = '' THEN
       CONTINUE;
@@ -415,7 +415,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._start_turn_if_configured(p_agent_slug text)
+CREATE OR REPLACE FUNCTION attotools._start_turn_if_configured(p_agent_slug text)
 RETURNS text
 LANGUAGE plpgsql
 AS $$
@@ -430,7 +430,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._tool_sql(p_args jsonb)
+CREATE OR REPLACE FUNCTION attotools._tool_sql(p_args jsonb)
 RETURNS text
 LANGUAGE plpgsql
 AS $$
@@ -459,7 +459,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._execute_sync_tool_call(
+CREATE OR REPLACE FUNCTION attotools._execute_sync_tool_call(
   p_agent_slug text,
   p_message_id bigint,
   p_tool_call_id text,
@@ -476,11 +476,11 @@ BEGIN
   v_result := CASE p_name
     WHEN 'SEARCH' THEN coalesce(p_args->>'error', 'error: SEARCH requires query')
     WHEN 'WEBFETCH' THEN coalesce(p_args->>'error', 'error: WEBFETCH requires a public http(s) URL')
-    WHEN 'SEND_ATTACHMENT' THEN attobot._tool_send_attachment(v_agent_id, p_args)
-    WHEN 'APPEND_MESSAGE' THEN attobot._tool_append_message(p_args, p_agent_slug)
-    WHEN 'WRITE_BLOB' THEN attobot._tool_write_blob(v_agent_id, p_args)
-    WHEN 'READ_BLOB' THEN attobot._tool_read_blob(v_agent_id, p_args)
-    WHEN 'SQL' THEN attobot._tool_sql(p_args)
+    WHEN 'SEND_ATTACHMENT' THEN attotools._tool_send_attachment(v_agent_id, p_args)
+    WHEN 'APPEND_MESSAGE' THEN attotools._tool_append_message(p_args, p_agent_slug)
+    WHEN 'WRITE_BLOB' THEN attotools._tool_write_blob(v_agent_id, p_args)
+    WHEN 'READ_BLOB' THEN attotools._tool_read_blob(v_agent_id, p_args)
+    WHEN 'SQL' THEN attotools._tool_sql(p_args)
     ELSE NULL
   END;
 
@@ -488,17 +488,17 @@ BEGIN
     RAISE EXCEPTION 'unknown synchronous tool: %', p_name;
   END IF;
 
-  PERFORM attobot._append_tool_message(v_agent_id, p_tool_call_id, v_result);
+  PERFORM attotools._append_tool_message(v_agent_id, p_tool_call_id, v_result);
   RETURN v_result;
 
 EXCEPTION WHEN others THEN
   v_result := 'error: ' || SQLERRM;
-  PERFORM attobot._append_tool_message(v_agent_id, p_tool_call_id, v_result);
+  PERFORM attotools._append_tool_message(v_agent_id, p_tool_call_id, v_result);
   RETURN v_result;
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._complete_webfetch_tool_from_http(
+CREATE OR REPLACE FUNCTION attotools._complete_webfetch_tool_from_http(
   p_agent_slug text,
   p_message_id bigint,
   p_tool_call_id text,
@@ -529,12 +529,12 @@ BEGIN
     'body', v_body
   );
 
-  PERFORM attobot._append_tool_message(v_agent_id, p_tool_call_id, v_result::text);
+  PERFORM attotools._append_tool_message(v_agent_id, p_tool_call_id, v_result::text);
   RETURN jsonb_build_object('completed', true, 'tool_call_id', p_tool_call_id);
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._complete_search_tool_from_http(
+CREATE OR REPLACE FUNCTION attotools._complete_search_tool_from_http(
   p_agent_slug text,
   p_message_id bigint,
   p_tool_call_id text,
@@ -550,7 +550,7 @@ DECLARE
   v_result jsonb;
 BEGIN
   v_limit := least(greatest(coalesce((p_args->>'limit')::integer, 5), 1), 10);
-  v_result := attobot._search_results_from_html(
+  v_result := attotools._search_results_from_html(
     p_args->>'query',
     v_limit,
     coalesce(p_http_response->>'body', '')
@@ -558,12 +558,12 @@ BEGIN
     'status', coalesce((p_http_response->>'status')::integer, 0)
   );
 
-  PERFORM attobot._append_tool_message(v_agent_id, p_tool_call_id, v_result::text);
+  PERFORM attotools._append_tool_message(v_agent_id, p_tool_call_id, v_result::text);
   RETURN jsonb_build_object('completed', true, 'tool_call_id', p_tool_call_id);
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._turn_durable_instance_id(p_turn_id bigint)
+CREATE OR REPLACE FUNCTION attotools._turn_durable_instance_id(p_turn_id bigint)
 RETURNS text
 LANGUAGE sql
 STABLE
@@ -576,7 +576,7 @@ AS $$
   LIMIT 1;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._wait_until_turn_signal_ready(
+CREATE OR REPLACE FUNCTION attotools._wait_until_turn_signal_ready(
   p_turn_id bigint,
   p_signal_name text,
   p_timeout_seconds integer DEFAULT 30
@@ -589,7 +589,7 @@ DECLARE
   v_deadline timestamptz := clock_timestamp() + make_interval(secs => p_timeout_seconds);
 BEGIN
   LOOP
-    v_instance_id := attobot._turn_durable_instance_id(p_turn_id);
+    v_instance_id := attotools._turn_durable_instance_id(p_turn_id);
 
     IF v_instance_id IS NOT NULL AND EXISTS (
       SELECT 1
@@ -610,7 +610,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._signal_turn_tools(
+CREATE OR REPLACE FUNCTION attotools._signal_turn_tools(
   p_turn_id bigint,
   p_signal_name text,
   p_message_id bigint
@@ -623,7 +623,7 @@ DECLARE
   v_tool_count integer;
   v_signal_result text;
 BEGIN
-  v_instance_id := attobot._turn_durable_instance_id(p_turn_id);
+  v_instance_id := attotools._turn_durable_instance_id(p_turn_id);
 
   IF v_instance_id IS NULL THEN
     RAISE EXCEPTION 'turn % has no durable_instance_id', p_turn_id;
@@ -663,7 +663,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.compose_tool_signal_future(
+CREATE OR REPLACE FUNCTION attotools.compose_tool_signal_future(
   p_agent_slug text,
   p_message_id bigint,
   p_turn_id bigint
@@ -673,7 +673,7 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   v_message attobot.messages%ROWTYPE;
-  v_signal_name text := attobot.tool_signal_name(p_agent_slug, p_turn_id);
+  v_signal_name text := attotools.tool_signal_name(p_agent_slug, p_turn_id);
   v_future text;
   v_step text;
   v_call jsonb;
@@ -696,7 +696,7 @@ BEGIN
   END IF;
 
   v_future := format(
-    'SELECT attobot._wait_until_turn_signal_ready(%s, %L, 30) AS signal_ready',
+    'SELECT attotools._wait_until_turn_signal_ready(%s, %L, 30) AS signal_ready',
     p_turn_id,
     v_signal_name
   );
@@ -710,7 +710,7 @@ BEGIN
 
     IF v_name = 'WEBFETCH' THEN
       v_url := btrim(coalesce(v_args->>'url', ''));
-      IF attobot._http_url_allowed(v_url) THEN
+      IF attotools._http_url_allowed(v_url) THEN
         v_alias := format('http_%s', v_index);
         v_step :=
           df.http(
@@ -724,7 +724,7 @@ BEGIN
             30
           ) |=> v_alias
           ~> format(
-            'SELECT attobot._complete_webfetch_tool_from_http(%L, %s, %L, %L::jsonb, $%s::jsonb)::jsonb AS tool_%s',
+            'SELECT attotools._complete_webfetch_tool_from_http(%L, %s, %L, %L::jsonb, $%s::jsonb)::jsonb AS tool_%s',
             p_agent_slug,
             p_message_id,
             v_tool_call_id,
@@ -734,7 +734,7 @@ BEGIN
           );
       ELSE
         v_step := format(
-          'SELECT attobot._execute_sync_tool_call(%L, %s, %L, %L, %L::jsonb)::text AS tool_%s',
+          'SELECT attotools._execute_sync_tool_call(%L, %s, %L, %L, %L::jsonb)::text AS tool_%s',
           p_agent_slug,
           p_message_id,
           v_tool_call_id,
@@ -746,7 +746,7 @@ BEGIN
     ELSIF v_name = 'SEARCH' THEN
       IF btrim(coalesce(v_args->>'query', '')) = '' THEN
         v_step := format(
-          'SELECT attobot._execute_sync_tool_call(%L, %s, %L, %L, %L::jsonb)::text AS tool_%s',
+          'SELECT attotools._execute_sync_tool_call(%L, %s, %L, %L, %L::jsonb)::text AS tool_%s',
           p_agent_slug,
           p_message_id,
           v_tool_call_id,
@@ -756,7 +756,7 @@ BEGIN
         );
       ELSE
         v_alias := format('http_%s', v_index);
-        v_url := 'https://www.bing.com/search?q=' || attobot._url_encode(v_args->>'query');
+        v_url := 'https://www.bing.com/search?q=' || attotools._url_encode(v_args->>'query');
         v_step :=
           df.http(
             v_url,
@@ -769,7 +769,7 @@ BEGIN
             30
           ) |=> v_alias
           ~> format(
-            'SELECT attobot._complete_search_tool_from_http(%L, %s, %L, %L::jsonb, $%s::jsonb)::jsonb AS tool_%s',
+            'SELECT attotools._complete_search_tool_from_http(%L, %s, %L, %L::jsonb, $%s::jsonb)::jsonb AS tool_%s',
             p_agent_slug,
             p_message_id,
             v_tool_call_id,
@@ -780,7 +780,7 @@ BEGIN
       END IF;
     ELSE
       v_step := format(
-        'SELECT attobot._execute_sync_tool_call(%L, %s, %L, %L, %L::jsonb)::text AS tool_%s',
+        'SELECT attotools._execute_sync_tool_call(%L, %s, %L, %L, %L::jsonb)::text AS tool_%s',
         p_agent_slug,
         p_message_id,
         v_tool_call_id,
@@ -794,7 +794,7 @@ BEGIN
   END LOOP;
 
   v_future := v_future ~> format(
-    'SELECT attobot._signal_turn_tools(%s, %L, %s)::jsonb AS signal',
+    'SELECT attotools._signal_turn_tools(%s, %L, %s)::jsonb AS signal',
     p_turn_id,
     v_signal_name,
     p_message_id
@@ -804,7 +804,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.start_tool_signal_executor(
+CREATE OR REPLACE FUNCTION attotools.start_tool_signal_executor(
   p_agent_slug text,
   p_message_id bigint,
   p_turn_id bigint
@@ -816,7 +816,7 @@ DECLARE
   v_instance text;
 BEGIN
   SELECT df.start(
-    attobot.compose_tool_signal_future(p_agent_slug, p_message_id, p_turn_id),
+    attotools.compose_tool_signal_future(p_agent_slug, p_message_id, p_turn_id),
     format('attobot:%s:tools:%s:%s', p_agent_slug, p_message_id, txid_current())
   )
   INTO v_instance;
@@ -829,7 +829,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.record_tool_signal(
+CREATE OR REPLACE FUNCTION attotools.record_tool_signal(
   p_agent_slug text,
   p_turn_id bigint,
   p_signal jsonb
@@ -869,7 +869,7 @@ BEGIN
 
     FOR v_call IN SELECT value FROM jsonb_array_elements(coalesce(v_message.payload->'tool_calls', '[]'::jsonb))
     LOOP
-      PERFORM attobot._append_tool_message(v_agent_id, v_call->>'id', 'error: timed out waiting for tool signal');
+      PERFORM attotools._append_tool_message(v_agent_id, v_call->>'id', 'error: timed out waiting for tool signal');
       v_timeout_tool_results := v_timeout_tool_results + 1;
     END LOOP;
   END IF;

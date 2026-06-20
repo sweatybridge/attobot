@@ -18,7 +18,7 @@ AS $$
   );
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._tool_schemas()
+CREATE OR REPLACE FUNCTION attotools._tool_schemas()
 RETURNS jsonb
 LANGUAGE sql
 STABLE
@@ -105,7 +105,7 @@ AS $$
       'type', 'function',
       'function', jsonb_build_object(
         'name', 'WRITE_BLOB',
-        'description', 'Write data to attobot.blobs. The content is decoded using encoding: base64, hex, escape, or a PostgreSQL text encoding such as UTF8, LATIN1, or WIN1252.',
+        'description', 'Write data to attotools.blobs. The content is decoded using encoding: base64, hex, escape, or a PostgreSQL text encoding such as UTF8, LATIN1, or WIN1252.',
         'parameters', jsonb_build_object(
           'type', 'object',
           'properties', jsonb_build_object(
@@ -235,7 +235,7 @@ BEGIN
         'role', 'system',
         'content', attobot._system_prompt(v_agent.id)
       )) || coalesce(v_messages, '[]'::jsonb),
-    'tools', attobot._tool_schemas()
+    'tools', attotools._tool_schemas()
   );
 
   IF v_model.reasoning_effort <> '' THEN
