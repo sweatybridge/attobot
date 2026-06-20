@@ -127,7 +127,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION attobot.ensure_telegram_inbox_loop(
   p_agent_slug text DEFAULT 'primary',
-  p_cron text DEFAULT '* * * * *'
+  p_timeout integer DEFAULT 60
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -139,14 +139,13 @@ BEGIN
   SELECT attobot._start_durable_loop_once(
     v_label,
     df.loop(
-      df.wait_for_schedule(p_cron)
-      ~> format('SELECT attobot.telegram_get_updates_body(%L)::text AS body', p_agent_slug) |=> 'request'
+      format('SELECT attobot.telegram_get_updates_body(%L, %s)::text AS body', p_agent_slug, p_timeout) |=> 'request'
       ~> df.http(
         attobot._telegram_api_url(p_agent_slug, 'getUpdates'),
         'POST',
         '$request.body',
         attobot._telegram_headers(),
-        90
+        p_timeout + 10
       ) |=> 'http_response'
       ~> format('SELECT attobot.process_telegram_updates(%L, $http_response::jsonb)::jsonb AS result', p_agent_slug)
     )

@@ -140,7 +140,7 @@ docker compose up -d
 ```
 
 For a forum topic, also set `ATTOBOT_TELEGRAM_THREAD_ID=42`. Override the
-poll schedule with `ATTOBOT_TELEGRAM_POLL_CRON`; the default is `* * * * *`.
+poll timeout with `ATTOBOT_TELEGRAM_POLL_TIMEOUT`; the default is `60` seconds.
 If you add or change Telegram settings after the stack is already running,
 rerun `docker compose run --rm agent-init` so the seed SQL updates the stored
 configuration and ensures the inbox loop exists.

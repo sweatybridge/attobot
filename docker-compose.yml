@@ -43,7 +43,7 @@ services:
       - --set=telegram_chat_id=${ATTOBOT_TELEGRAM_CHAT_ID:-}
       - --set=telegram_thread_id=${ATTOBOT_TELEGRAM_THREAD_ID:-}
       - --set=telegram_api_base=${ATTOBOT_TELEGRAM_API_BASE:-https://api.telegram.org}
-      - --set=telegram_poll_cron=${ATTOBOT_TELEGRAM_POLL_CRON:-* * * * *}
+      - --set=telegram_poll_timeout=${ATTOBOT_TELEGRAM_POLL_TIMEOUT:-60}
       - --file=/attobot/agents.sql
 
 volumes:

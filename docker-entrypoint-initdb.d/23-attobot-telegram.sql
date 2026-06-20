@@ -56,7 +56,7 @@ AS $$
   SELECT jsonb_build_object('Content-Type', 'application/json');
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.telegram_get_updates_body(p_agent_slug text)
+CREATE OR REPLACE FUNCTION attobot.telegram_get_updates_body(p_agent_slug text, p_timeout integer)
 RETURNS jsonb
 LANGUAGE plpgsql
 STABLE
@@ -68,7 +68,7 @@ BEGIN
   v_offset := coalesce(attobot._config_text(v_agent_id, 'telegram_update_offset', '0')::bigint, 0);
   RETURN jsonb_build_object(
     'offset', v_offset,
-    'timeout', 60,
+    'timeout', p_timeout,
     'allowed_updates', jsonb_build_array('message')
   );
 END;

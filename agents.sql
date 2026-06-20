@@ -71,7 +71,7 @@ WHERE NULLIF(:'telegram_token', '') IS NOT NULL
 
 SELECT attobot.ensure_telegram_inbox_loop(
   p_agent_slug => 'primary',
-  p_cron => COALESCE(NULLIF(:'telegram_poll_cron', ''), '* * * * *')
+  p_timeout => COALESCE(NULLIF(:'telegram_poll_timeout', ''), '60')::integer
 )
 WHERE NULLIF(:'telegram_token', '') IS NOT NULL
   AND NULLIF(:'telegram_chat_id', '') IS NOT NULL;
