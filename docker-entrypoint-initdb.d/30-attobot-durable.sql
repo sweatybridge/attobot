@@ -66,7 +66,37 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.start_scheduled_message_loop(
+CREATE OR REPLACE FUNCTION attobot._start_durable_loop_once(
+  p_label text,
+  p_future text
+)
+RETURNS text
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_instance text;
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtextextended('attobot:durable-loop:' || p_label, 0));
+
+  SELECT id INTO v_instance
+  FROM df.instances
+  WHERE label = p_label
+    AND status IN ('pending', 'running')
+  ORDER BY created_at DESC
+  LIMIT 1;
+
+  IF v_instance IS NOT NULL THEN
+    RETURN v_instance;
+  END IF;
+
+  SELECT df.start(p_future, p_label)
+  INTO v_instance;
+
+  RETURN v_instance;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION attobot.ensure_scheduled_message_loop(
   p_agent_slug text DEFAULT 'primary',
   p_name text DEFAULT 'heartbeat',
   p_cron text DEFAULT '* * * * *',
@@ -77,8 +107,10 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   v_instance text;
+  v_label text := format('attobot:%s:schedule:%s', p_agent_slug, p_name);
 BEGIN
-  SELECT df.start(
+  SELECT attobot._start_durable_loop_once(
+    v_label,
     df.loop(
       df.wait_for_schedule(p_cron)
       ~> format(
@@ -88,8 +120,7 @@ BEGIN
         format('[schedule %s] %s', p_name, p_message)
       )
       ~> format('SELECT attobot.start_turn(%L) AS durable_instance_id', p_agent_slug)
-    ),
-    format('attobot:%s:schedule:%s', p_agent_slug, p_name)
+    )
   )
   INTO v_instance;
 
@@ -97,7 +128,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.start_telegram_inbox_loop(
+CREATE OR REPLACE FUNCTION attobot.ensure_telegram_inbox_loop(
   p_agent_slug text DEFAULT 'primary',
   p_cron text DEFAULT '* * * * *'
 )
@@ -106,8 +137,10 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   v_instance text;
+  v_label text := format('attobot:%s:telegram-inbox', p_agent_slug);
 BEGIN
-  SELECT df.start(
+  SELECT attobot._start_durable_loop_once(
+    v_label,
     df.loop(
       df.wait_for_schedule(p_cron)
       ~> format('SELECT attobot.telegram_get_updates_body(%L)::text AS body', p_agent_slug) |=> 'request'
@@ -116,11 +149,10 @@ BEGIN
         'POST',
         '$request.body',
         attobot._telegram_headers(),
-        30
+        90
       ) |=> 'http_response'
       ~> format('SELECT attobot.process_telegram_updates(%L, $http_response::jsonb)::jsonb AS result', p_agent_slug)
-    ),
-    format('attobot:%s:telegram-inbox', p_agent_slug)
+    )
   )
   INTO v_instance;
 
@@ -213,9 +245,7 @@ BEGIN
 END;
 $$;
 
-DROP TRIGGER IF EXISTS outbox_telegram_send_trigger ON attobot.outbox;
-
-CREATE TRIGGER outbox_telegram_send_trigger
+CREATE OR REPLACE TRIGGER outbox_telegram_send_trigger
 AFTER INSERT OR UPDATE OF status, channel ON attobot.outbox
 FOR EACH ROW
 EXECUTE FUNCTION attobot._outbox_trigger_telegram_send();

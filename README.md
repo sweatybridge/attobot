@@ -45,10 +45,12 @@ docker compose build
 docker compose up -d
 ```
 
-Fresh containers initialize `primary` and `subconscious` agents automatically in
-the Docker entrypoint. Set `ATTOBOT_API_KEY` before first boot to seed both
-agents with an LLM key. Secrets are stored in agent-scoped `attobot.config`
-rows:
+Fresh containers initialize the database schema in the Docker entrypoint. After
+Postgres passes its healthcheck, the one-shot `agent-init` service runs `psql`
+against the `harness` service and loads the mounted `agents.sql` seed file. That
+job creates the `primary` and `subconscious` agents. Set `ATTOBOT_API_KEY`
+before first boot, or rerun `agent-init` later, to seed both agents with an LLM
+key. Secrets are stored in agent-scoped `attobot.config` rows:
 
 ```bash
 ATTOBOT_API_KEY=sk-... docker compose up -d
@@ -56,14 +58,15 @@ ATTOBOT_API_KEY=sk-... docker compose up -d
 
 You can also override the shared model with `ATTOBOT_MODEL`,
 `ATTOBOT_API_BASE`, `ATTOBOT_TEMPERATURE`, `ATTOBOT_REASONING_EFFORT`,
-`ATTOBOT_CONTEXT_TOKENS`, and `ATTOBOT_MULTIMODAL_SUPPORT`. The entrypoint
-configures that model before creating agents, then assigns both seeded agents to
+`ATTOBOT_CONTEXT_TOKENS`, and `ATTOBOT_MULTIMODAL_SUPPORT`. Compose passes
+these values to `psql` as variables for the seed SQL. The `agent-init` job
+configures the model before creating agents, then assigns both seeded agents to
 the configured model row.
 
 To create a new agent, configure a model first and pass its id:
 
 ```bash
-docker compose exec db psql -U postgres -d postgres
+docker compose exec harness psql -U postgres -d postgres
 ```
 
 ```sql
@@ -98,6 +101,12 @@ SELECT attobot.set_config('primary', 'api_key', to_jsonb('sk-...'::text));
 The `subconscious` agent is also seeded with a `primary-review` durable schedule
 that wakes it every 10 minutes.
 
+To run the agent seed job again after changing environment values:
+
+```bash
+docker compose run --rm agent-init
+```
+
 Send a message:
 
 ```bash
@@ -110,13 +119,13 @@ Read queued outbound messages:
 python agent.py outbox
 ```
 
-The default DSN is `postgresql://postgres:secret@127.0.0.1:5432/postgres`.
+The default DSN is `postgresql://postgres:postgres@127.0.0.1:5432/postgres`.
 Override it with `--dsn` or `ATTOBOT_DSN`.
 
 ## Telegram
 
 For a clean database, configure and start the primary agent's durable Telegram
-inbox loop from the Docker entrypoint:
+inbox loop from the `agent-init` job:
 
 ```bash
 ATTOBOT_TELEGRAM_TOKEN=123:abc \
@@ -126,6 +135,9 @@ docker compose up -d
 
 For a forum topic, also set `ATTOBOT_TELEGRAM_THREAD_ID=42`. Override the
 poll schedule with `ATTOBOT_TELEGRAM_POLL_CRON`; the default is `* * * * *`.
+If you add or change Telegram settings after the stack is already running,
+rerun `docker compose run --rm agent-init` so the seed SQL updates the stored
+configuration and ensures the inbox loop exists.
 
 To update stored Telegram settings later, use `python agent.py telegram-config`.
 It stores the token and chat metadata as agent-scoped `attobot.config` rows.
@@ -146,7 +158,7 @@ by the outbox table trigger.
 Start a durable schedule that appends a system message and starts a turn:
 
 ```sql
-SELECT attobot.start_scheduled_message_loop(
+SELECT attobot.ensure_scheduled_message_loop(
   p_agent_slug => 'primary',
   p_name => 'heartbeat',
   p_cron => '*/5 * * * *',
@@ -195,3 +207,7 @@ published SHA256 digest before installing the package.
 
 `shared_preload_libraries = 'pg_durable'` is written into the base sample config
 so new clusters load the background worker before init SQL runs.
+
+The `harness` service uses this image. The `agent-init` service uses the stock
+Postgres client image, mounts `agents.sql` read-only, waits for `harness` to be
+healthy, and runs `psql --single-transaction --set=... --file=/attobot/agents.sql`.

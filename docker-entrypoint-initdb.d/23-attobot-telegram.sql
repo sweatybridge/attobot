@@ -68,7 +68,7 @@ BEGIN
   v_offset := coalesce(attobot._config_text(v_agent_id, 'telegram_update_offset', '0')::bigint, 0);
   RETURN jsonb_build_object(
     'offset', v_offset,
-    'timeout', 0,
+    'timeout', 60,
     'allowed_updates', jsonb_build_array('message')
   );
 END;

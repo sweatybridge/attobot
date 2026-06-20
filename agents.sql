@@ -1,21 +1,3 @@
-#!/usr/bin/env bash
-set -e
-
-psql -v ON_ERROR_STOP=1 \
-  --username "$POSTGRES_USER" \
-  --dbname postgres \
-  -v api_key="${ATTOBOT_API_KEY:-}" \
-  -v model="${ATTOBOT_MODEL:-deepseek-v4-pro}" \
-  -v api_base="${ATTOBOT_API_BASE:-https://api.deepseek.com/v1}" \
-  -v temperature="${ATTOBOT_TEMPERATURE:-1.0}" \
-  -v reasoning_effort="${ATTOBOT_REASONING_EFFORT:-medium}" \
-  -v context_tokens="${ATTOBOT_CONTEXT_TOKENS:-1000000}" \
-  -v multimodal_support="${ATTOBOT_MULTIMODAL_SUPPORT:-false}" \
-  -v telegram_token="${ATTOBOT_TELEGRAM_TOKEN:-}" \
-  -v telegram_chat_id="${ATTOBOT_TELEGRAM_CHAT_ID:-}" \
-  -v telegram_thread_id="${ATTOBOT_TELEGRAM_THREAD_ID:-}" \
-  -v telegram_api_base="${ATTOBOT_TELEGRAM_API_BASE:-https://api.telegram.org}" \
-  -v telegram_poll_cron="${ATTOBOT_TELEGRAM_POLL_CRON:-* * * * *}" <<'EOSQL'
 SELECT attobot.ensure_model(
   p_model => COALESCE(NULLIF(:'model', ''), 'deepseek-v4-pro'),
   p_api_base => COALESCE(NULLIF(:'api_base', ''), 'https://api.deepseek.com/v1'),
@@ -66,7 +48,7 @@ $subconscious_soul$,
   p_model_id => :model_id
 );
 
-SELECT attobot.start_scheduled_message_loop(
+SELECT attobot.ensure_scheduled_message_loop(
   p_agent_slug => 'subconscious',
   p_name => 'primary-review',
   p_cron => '*/10 * * * *',
@@ -83,10 +65,9 @@ SELECT attobot.configure_telegram(
 WHERE NULLIF(:'telegram_token', '') IS NOT NULL
   AND NULLIF(:'telegram_chat_id', '') IS NOT NULL;
 
-SELECT attobot.start_telegram_inbox_loop(
+SELECT attobot.ensure_telegram_inbox_loop(
   p_agent_slug => 'primary',
   p_cron => COALESCE(NULLIF(:'telegram_poll_cron', ''), '* * * * *')
 )
 WHERE NULLIF(:'telegram_token', '') IS NOT NULL
   AND NULLIF(:'telegram_chat_id', '') IS NOT NULL;
-EOSQL

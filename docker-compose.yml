@@ -1,25 +1,50 @@
 services:
-  db:
+  harness:
     build:
       context: .
     environment:
-      POSTGRES_PASSWORD: postgres
-      ATTOBOT_API_KEY: ${ATTOBOT_API_KEY:-}
-      ATTOBOT_MODEL: ${ATTOBOT_MODEL:-deepseek-v4-pro}
-      ATTOBOT_API_BASE: ${ATTOBOT_API_BASE:-https://api.deepseek.com/v1}
-      ATTOBOT_TEMPERATURE: ${ATTOBOT_TEMPERATURE:-1.0}
-      ATTOBOT_REASONING_EFFORT: ${ATTOBOT_REASONING_EFFORT:-medium}
-      ATTOBOT_CONTEXT_TOKENS: ${ATTOBOT_CONTEXT_TOKENS:-1000000}
-      ATTOBOT_MULTIMODAL_SUPPORT: ${ATTOBOT_MULTIMODAL_SUPPORT:-false}
-      ATTOBOT_TELEGRAM_TOKEN: ${ATTOBOT_TELEGRAM_TOKEN:-}
-      ATTOBOT_TELEGRAM_CHAT_ID: ${ATTOBOT_TELEGRAM_CHAT_ID:-}
-      ATTOBOT_TELEGRAM_THREAD_ID: ${ATTOBOT_TELEGRAM_THREAD_ID:-}
-      ATTOBOT_TELEGRAM_API_BASE: ${ATTOBOT_TELEGRAM_API_BASE:-https://api.telegram.org}
-      ATTOBOT_TELEGRAM_POLL_CRON: ${ATTOBOT_TELEGRAM_POLL_CRON:-* * * * *}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
     ports:
       - "5432:5432"
     volumes:
       - attobot_pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  agent-init:
+    image: postgres:18-trixie
+    depends_on:
+      harness:
+        condition: service_healthy
+    restart: no
+    environment:
+      PGHOST: harness
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - ./agents.sql:/attobot/agents.sql:ro
+    command:
+      - psql
+      - --no-psqlrc
+      - --single-transaction
+      - --set=ON_ERROR_STOP=1
+      - --set=api_key=${ATTOBOT_API_KEY:-}
+      - --set=model=${ATTOBOT_MODEL:-deepseek-v4-pro}
+      - --set=api_base=${ATTOBOT_API_BASE:-https://api.deepseek.com/v1}
+      - --set=temperature=${ATTOBOT_TEMPERATURE:-1.0}
+      - --set=reasoning_effort=${ATTOBOT_REASONING_EFFORT:-medium}
+      - --set=context_tokens=${ATTOBOT_CONTEXT_TOKENS:-1000000}
+      - --set=multimodal_support=${ATTOBOT_MULTIMODAL_SUPPORT:-false}
+      - --set=telegram_token=${ATTOBOT_TELEGRAM_TOKEN:-}
+      - --set=telegram_chat_id=${ATTOBOT_TELEGRAM_CHAT_ID:-}
+      - --set=telegram_thread_id=${ATTOBOT_TELEGRAM_THREAD_ID:-}
+      - --set=telegram_api_base=${ATTOBOT_TELEGRAM_API_BASE:-https://api.telegram.org}
+      - --set=telegram_poll_cron=${ATTOBOT_TELEGRAM_POLL_CRON:-* * * * *}
+      - --file=/attobot/agents.sql
 
 volumes:
   attobot_pgdata:
