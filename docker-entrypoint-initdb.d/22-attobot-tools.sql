@@ -415,21 +415,6 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attotools._start_turn_if_configured(p_agent_slug text)
-RETURNS text
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_agent_id bigint := attobot.agent_id(p_agent_slug);
-BEGIN
-  IF coalesce(attobot._config_text(v_agent_id, 'api_key'), '') = '' THEN
-    RETURN 'skipped: missing api_key';
-  END IF;
-
-  RETURN attobot.start_turn(p_agent_slug);
-END;
-$$;
-
 CREATE OR REPLACE FUNCTION attotools._tool_sql(p_args jsonb)
 RETURNS text
 LANGUAGE plpgsql
