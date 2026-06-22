@@ -438,6 +438,39 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA attotools
   TO attobot_agent_primary, attobot_agent_subconscious, attobot_service;
 
 -- ============================================================================
+-- DURABLE FRAMEWORK ACCESS (pg_durable)
+--   pg_durable.enable_superuser_instances is OFF (default), so durable instances
+--   may NOT be owned by a superuser. The workflow-starting functions in
+--   30-attobot-durable.sql are SECURITY DEFINER owned by attobot_service, so
+--   every df.start submits as attobot_service (a non-superuser). Grant df usage
+--   to the roles that run workflows, and make service a member of the user
+--   tiers so attotools._tool_sql_as_user can SET ROLE to the requesting user's
+--   tier from inside a service-owned instance.
+--   (attobot_anonymous / attobot_authenticated are intentionally NOT granted df
+--    access: end users interact through the agent, not by submitting durable
+--    workflows themselves.)
+-- ============================================================================
+SELECT df.grant_usage('attobot_service', include_http => true);
+SELECT df.grant_usage('attobot_admin',    include_http => true);
+SELECT df.grant_usage('attobot_agent_primary');
+SELECT df.grant_usage('attobot_agent_subconscious');
+
+-- The durable worker connects as the submitted role to execute instance SQL,
+-- so attobot_service must be LOGIN. It stays a non-superuser, so
+-- enable_superuser_instances=off is satisfied; and because instance sessions
+-- now have session_user = attobot_service, RESET ROLE in _tool_sql_as_user
+-- restores to service (not a superuser) — no privilege escalation.
+ALTER ROLE attobot_service LOGIN;
+
+GRANT attobot_anonymous TO attobot_service;
+GRANT attobot_authenticated TO attobot_service;
+
+-- Hand the SECURITY DEFINER workflow starters to service so they submit as it.
+ALTER FUNCTION attobot._start_durable_loop_once(text, text) OWNER TO attobot_service;
+ALTER FUNCTION attobot.start_turn(text, bigint) OWNER TO attobot_service;
+ALTER FUNCTION attobot.start_telegram_outbox_send(text, bigint) OWNER TO attobot_service;
+
+-- ============================================================================
 -- CONTEXT HELPER  (sets the ABAC session attributes; see design §10.2)
 --   Uses the 3-argument built-in set_config(name, value, is_local).
 --   Role switching is performed by the connection layer / intake loop after

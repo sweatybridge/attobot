@@ -246,7 +246,7 @@ message that originates the tool call — no change to the tool-signal machinery
 `attotools._tool_sql_as_user` when a requesting user is present:
 
 ```sql
-EXECUTE format('SET ROLE %I', p_role);            -- superuser → user tier; RLS now binds
+EXECUTE format('SET ROLE %I', p_role);            -- service → user tier; RLS now binds
 PERFORM set_config('attobot.current_agent_id',    p_agent_id::text, true);
 PERFORM set_config('attobot.current_telegram_user_id', p_telegram_user_id, true);
 PERFORM set_config('attobot.current_telegram_chat_id', p_telegram_chat_id, true);
@@ -281,20 +281,34 @@ policy is validated directly.
 
 ## 11. Enforcement status
 
-| Path | Enforced? | How |
-|---|---|---|
-| Agent SQL tool on a user-requested turn | **Yes (active)** | `SET ROLE` to user tier + GUCs in `_tool_sql_as_user`. |
-| Agent SQL tool on a scheduled turn | N/A (framework scope) | Falls back to `_tool_sql` as the framework. |
-| Roles / RLS / grants | **Defined** | `40-attobot-rbac.sql`; binding for any non-superuser principal. |
-| Agent's own context-build (`compose_llm_request`, append, outbox) | Framework scope | Runs as the trusted superuser; reads its whole conversation. |
+Durable instances no longer run as the superuser. `pg_durable.enable_superuser_instances`
+is OFF (default), and the workflow-starting functions (`_start_durable_loop_once`,
+`start_turn`, `start_telegram_outbox_send`) are `SECURITY DEFINER` owned by
+`attobot_service`, so every `df.start` submits as that non-superuser role. The
+pg_durable worker connects as `attobot_service` (hence it is `LOGIN`) to execute
+instance SQL, so **all durable execution — the agent's own context-build included
+— runs as `attobot_service`** with RLS enforced (service holds bypass policies,
+so its own operations are unrestricted).
 
-**Future hardening (not this PR):** run the `pg_durable` `worker_role` and the
-agent's own operations under least-privilege principals (`attobot_service`,
-`attobot_agent_primary`) instead of `postgres`. This requires reconfiguring
-pg_durable and converting secret-reading helpers (`_llm_headers`,
-`_telegram_api_url`) to `SECURITY DEFINER` so they still resolve `api_key` /
-`telegram_token`. It is independent of — and not required for — the
-user-scoping goal above.
+| Path | Runs as | Bounded by |
+|---|---|---|
+| Agent SQL tool on a user-requested turn | requesting user's tier (`SET ROLE` in `_tool_sql_as_user`) | user RLS — can't see other users' data or secrets |
+| Agent SQL tool on a scheduled turn | `attobot_service` | service bypass (full agent scope) |
+| Agent's own context-build (`compose_llm_request`, append, outbox) | `attobot_service` | service bypass (the agent's own conversation) |
+| pg_durable background worker | `postgres` (superuser) | required by pg_durable — `worker_role` must be superuser |
+
+`df.grant_usage` is granted to the system roles (`service`, `admin` with HTTP;
+`agent_primary`, `agent_subconscious` basic). `attobot_service` is a member of
+the user tiers so `_tool_sql_as_user` can `SET ROLE` down to them; and because
+instance sessions have `session_user = attobot_service`, `RESET ROLE` restores to
+`service` (never escalates to a superuser). End-user tiers
+(`attobot_anonymous`/`attobot_authenticated`) are intentionally **not** granted df
+access — they interact via the agent.
+
+**Why `worker_role` stays superuser:** pg_durable requires the background worker
+to be a superuser to manage all instances; this is the framework's design and is
+unrelated to per-user isolation, which is enforced at the instance / SQL-tool
+boundary above.
 
 ---
 

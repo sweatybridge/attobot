@@ -20,6 +20,8 @@ CREATE OR REPLACE FUNCTION attobot.start_turn(
 )
 RETURNS text
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = attobot, attotools, pg_temp
 AS $$
 DECLARE
   v_agent_id bigint := attobot.agent_id(p_agent_slug);
@@ -72,6 +74,8 @@ CREATE OR REPLACE FUNCTION attobot._start_durable_loop_once(
 )
 RETURNS text
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = attobot, attotools, pg_temp
 AS $$
 DECLARE
   v_instance text;
@@ -165,6 +169,8 @@ CREATE OR REPLACE FUNCTION attobot.start_telegram_outbox_send(
 )
 RETURNS text
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = attobot, attotools, pg_temp
 AS $$
 DECLARE
   v_instance text;
