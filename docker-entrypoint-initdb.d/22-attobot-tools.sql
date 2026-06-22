@@ -444,6 +444,60 @@ BEGIN
 END;
 $$;
 
+-- Run the SQL tool query under the requesting user's RLS scope. The caller
+-- (the durable framework) is the superuser; we SET ROLE down to the user's tier
+-- so row-level security binds for the inner query, then RESET ROLE before
+-- returning so the caller's subsequent bookkeeping stays privileged. SECURITY
+-- INVOKER is required: SET ROLE is forbidden inside SECURITY DEFINER functions.
+CREATE OR REPLACE FUNCTION attotools._tool_sql_as_user(
+  p_args jsonb,
+  p_role text,
+  p_agent_id bigint,
+  p_telegram_user_id text,
+  p_telegram_chat_id text
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = attobot, attotools, pg_temp
+AS $$
+DECLARE
+  v_query text;
+  v_rows jsonb;
+  v_err text;
+BEGIN
+  v_query := btrim(coalesce(p_args->>'query', ''));
+  IF v_query = '' THEN
+    RAISE EXCEPTION 'SQL tool requires query';
+  END IF;
+  IF position(';' IN v_query) > 0 THEN
+    RAISE EXCEPTION 'SQL tool accepts one semicolon-free query';
+  END IF;
+
+  EXECUTE format('SET ROLE %I', p_role);
+  PERFORM set_config('attobot.current_agent_id', p_agent_id::text, true);
+  PERFORM set_config('attobot.current_telegram_user_id', p_telegram_user_id, true);
+  PERFORM set_config('attobot.current_telegram_chat_id', coalesce(p_telegram_chat_id, ''), true);
+  BEGIN
+    EXECUTE format(
+      'SELECT coalesce(jsonb_agg(to_jsonb(q)), ''[]''::jsonb) FROM (%s) AS q',
+      v_query
+    )
+    INTO v_rows;
+  EXCEPTION WHEN OTHERS THEN
+    v_err := SQLERRM;
+    EXECUTE 'RESET ROLE';        -- never leak the dropped role on error
+    RAISE EXCEPTION '%', v_err;
+  END;
+  EXECUTE 'RESET ROLE';
+
+  RETURN jsonb_pretty(jsonb_build_object(
+    'rows', coalesce(v_rows, '[]'::jsonb),
+    'row_count', jsonb_array_length(coalesce(v_rows, '[]'::jsonb))
+  ));
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION attotools._execute_sync_tool_call(
   p_agent_slug text,
   p_message_id bigint,
@@ -457,17 +511,40 @@ AS $$
 DECLARE
   v_agent_id bigint := attobot.agent_id(p_agent_slug);
   v_result text;
+  v_req_user_id bigint;
+  v_role text;
+  v_ext_id text;
+  v_chat_id text;
 BEGIN
-  v_result := CASE p_name
-    WHEN 'SEARCH' THEN coalesce(p_args->>'error', 'error: SEARCH requires query')
-    WHEN 'WEBFETCH' THEN coalesce(p_args->>'error', 'error: WEBFETCH requires a public http(s) URL')
-    WHEN 'SEND_ATTACHMENT' THEN attotools._tool_send_attachment(v_agent_id, p_args)
-    WHEN 'APPEND_MESSAGE' THEN attotools._tool_append_message(p_args, p_agent_slug)
-    WHEN 'WRITE_BLOB' THEN attotools._tool_write_blob(v_agent_id, p_args)
-    WHEN 'READ_BLOB' THEN attotools._tool_read_blob(v_agent_id, p_args)
-    WHEN 'SQL' THEN attotools._tool_sql(p_args)
-    ELSE NULL
-  END;
+  IF p_name = 'SQL' THEN
+    -- User-requested turn: run the agent's SQL with the requesting user's
+    -- scope. Scheduled/agent-initiated turns (no requesting user) fall back to
+    -- the agent/framework scope via _tool_sql.
+    SELECT (payload->>'requesting_user_id')::bigint INTO v_req_user_id
+      FROM attobot.messages WHERE id = p_message_id;
+    IF v_req_user_id IS NOT NULL THEN
+      SELECT 'attobot_' || u.tier, u.external_id INTO v_role, v_ext_id
+        FROM attobot.users u WHERE u.id = v_req_user_id;
+      v_chat_id := attobot._config_text(v_agent_id, 'telegram_chat_id');
+    END IF;
+
+    IF v_req_user_id IS NOT NULL AND v_role IS NOT NULL AND v_ext_id IS NOT NULL THEN
+      v_result := attotools._tool_sql_as_user(p_args, v_role, v_agent_id, v_ext_id, v_chat_id);
+    ELSE
+      v_result := attotools._tool_sql(p_args);
+    END IF;
+  ELSE
+    v_result := CASE p_name
+      WHEN 'SEARCH' THEN coalesce(p_args->>'error', 'error: SEARCH requires query')
+      WHEN 'WEBFETCH' THEN coalesce(p_args->>'error', 'error: WEBFETCH requires a public http(s) URL')
+      WHEN 'SEND_ATTACHMENT' THEN attotools._tool_send_attachment(v_agent_id, p_args)
+      WHEN 'APPEND_MESSAGE' THEN attotools._tool_append_message(p_args, p_agent_slug)
+      WHEN 'WRITE_BLOB' THEN attotools._tool_write_blob(v_agent_id, p_args)
+      WHEN 'READ_BLOB' THEN attotools._tool_read_blob(v_agent_id, p_args)
+      WHEN 'SQL' THEN attotools._tool_sql(p_args)
+      ELSE NULL
+    END;
+  END IF;
 
   IF v_result IS NULL THEN
     RAISE EXCEPTION 'unknown synchronous tool: %', p_name;

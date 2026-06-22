@@ -99,3 +99,21 @@ CREATE TABLE IF NOT EXISTS attobot.lifecycle (
   detail jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+
+-- Channel-agnostic identity ledger. One row per (channel, external_id); today
+-- only 'telegram' is populated (by process_telegram_updates), but the shape
+-- supports future channels (discord, whatsapp) by new channel values.
+-- `tier` maps the user to an RLS role suffix (attobot_<tier>); it defaults to
+-- 'anonymous' and is promoted to 'authenticated' by an operator.
+CREATE TABLE IF NOT EXISTS attobot.users (
+  id bigserial PRIMARY KEY,
+  channel text NOT NULL CHECK (channel IN ('telegram', 'discord', 'whatsapp')),
+  external_id text NOT NULL,
+  username text,
+  display_name text,
+  tier text NOT NULL DEFAULT 'anonymous' CHECK (tier IN ('anonymous', 'authenticated')),
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (channel, external_id)
+);

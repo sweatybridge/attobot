@@ -131,8 +131,9 @@ CREATE POLICY models_admin_write ON attobot.models
 
 -- ============================================================================
 -- TABLE: attobot.messages
---   Worked example: anonymous group-chat user may INSERT own, UPDATE own,
---   SELECT own, and NEVER delete. Agent roles scope to current_agent_id.
+--   Anonymous/authenticated: SELECT the whole configured chat (all messages for
+--   the agent whose chat they are in), INSERT/UPDATE only their own rows, NEVER
+--   delete. Agent roles scope to current_agent_id.
 -- ============================================================================
 
 GRANT SELECT, INSERT, UPDATE ON attobot.messages
@@ -144,13 +145,14 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON attobot.messages
 
 ALTER TABLE attobot.messages ENABLE ROW LEVEL SECURITY;
 
--- anonymous / authenticated: own rows by telegram from.id; insert+update only
+-- anonymous / authenticated: SELECT is chat-wide (expanded scope). The whole
+-- conversation belongs to one configured chat = one agent, so scope by
+-- current_agent_id. INSERT/UPDATE below stay pinned to their own from.id.
 DROP POLICY IF EXISTS messages_user_select ON attobot.messages;
 CREATE POLICY messages_user_select ON attobot.messages
   FOR SELECT TO attobot_anonymous, attobot_authenticated
   USING (
-    payload #>> '{telegram_update,message,from,id}'
-      = current_setting('attobot.current_telegram_user_id', true)
+    agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint
   );
 
 DROP POLICY IF EXISTS messages_user_insert ON attobot.messages;
@@ -334,6 +336,44 @@ CREATE POLICY blobs_service_bypass ON attotools.blobs
   FOR ALL TO attobot_service, attobot_admin USING (true) WITH CHECK (true);
 
 -- ============================================================================
+-- TABLE: attobot.users   (channel identity ledger; intake upserts telegram users)
+--   A user reads only their own row; agent/service read all (to resolve the
+--   requesting user during a turn); service inserts (ensure_user); admin
+--   manages the ledger incl. promoting tier anonymous -> authenticated.
+-- ============================================================================
+
+GRANT SELECT ON attobot.users
+  TO attobot_anonymous, attobot_authenticated,
+     attobot_agent_primary, attobot_agent_subconscious, attobot_service;
+GRANT INSERT ON attobot.users TO attobot_service;
+GRANT SELECT, INSERT, UPDATE ON attobot.users TO attobot_admin;
+GRANT USAGE ON SEQUENCE attobot.users_id_seq TO attobot_service, attobot_admin;
+
+ALTER TABLE attobot.users ENABLE ROW LEVEL SECURITY;
+
+-- a user sees only their own row (resolved by the internal id in their session)
+DROP POLICY IF EXISTS users_user_select_own ON attobot.users;
+CREATE POLICY users_user_select_own ON attobot.users
+  FOR SELECT TO attobot_anonymous, attobot_authenticated
+  USING (id = NULLIF(current_setting('attobot.current_user_id', true), '')::bigint);
+
+-- agent + service read all users (resolve the requesting user during a turn)
+DROP POLICY IF EXISTS users_agent_service_read ON attobot.users;
+CREATE POLICY users_agent_service_read ON attobot.users
+  FOR SELECT TO attobot_agent_primary, attobot_agent_subconscious, attobot_service
+  USING (true);
+
+-- service inserts new users (ensure_user from intake)
+DROP POLICY IF EXISTS users_service_insert ON attobot.users;
+CREATE POLICY users_service_insert ON attobot.users
+  FOR INSERT TO attobot_service WITH CHECK (true);
+
+-- admin manages the ledger (incl. promoting tier)
+DROP POLICY IF EXISTS users_admin_all ON attobot.users;
+CREATE POLICY users_admin_all ON attobot.users
+  FOR ALL TO attobot_admin USING (true) WITH CHECK (true);
+
+-- ============================================================================
 -- FUNCTION EXECUTE PRIVILEGES
 --   Per-function for the verified attobot entrypoints (least privilege, and
 --   to document the intent). Schema-wide for attotools (the agent tooling
@@ -348,8 +388,10 @@ GRANT EXECUTE ON FUNCTION attobot.agent_id(text)
   TO attobot_agent_primary, attobot_agent_subconscious, attobot_service, attobot_admin;
 GRANT EXECUTE ON FUNCTION attobot.append_message(text, text, text, jsonb, text)
   TO attobot_agent_primary, attobot_agent_subconscious, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot.start_turn(text)
+GRANT EXECUTE ON FUNCTION attobot.start_turn(text, bigint)
   TO attobot_agent_primary, attobot_service;
+GRANT EXECUTE ON FUNCTION attobot.ensure_user(text, text, text, text, jsonb)
+  TO attobot_service, attobot_admin;
 GRANT EXECUTE ON FUNCTION attobot.finish_turn(text, bigint)
   TO attobot_agent_primary, attobot_service;
 GRANT EXECUTE ON FUNCTION attobot.compose_llm_request(text)
@@ -406,7 +448,9 @@ CREATE OR REPLACE FUNCTION attobot.set_context(
   p_role text,
   p_agent_id bigint DEFAULT NULL,
   p_telegram_user_id text DEFAULT NULL,
-  p_telegram_chat_id text DEFAULT NULL
+  p_telegram_chat_id text DEFAULT NULL,
+  p_user_id bigint DEFAULT NULL,
+  p_channel text DEFAULT NULL
 ) RETURNS void
 LANGUAGE plpgsql
 SECURITY INVOKER
@@ -417,6 +461,8 @@ BEGIN
   PERFORM set_config('attobot.current_agent_id', COALESCE(p_agent_id::text, ''), true);
   PERFORM set_config('attobot.current_telegram_user_id', COALESCE(p_telegram_user_id, ''), true);
   PERFORM set_config('attobot.current_telegram_chat_id', COALESCE(p_telegram_chat_id, ''), true);
+  PERFORM set_config('attobot.current_user_id', COALESCE(p_user_id::text, ''), true);
+  PERFORM set_config('attobot.current_channel', COALESCE(p_channel, ''), true);
 END;
 $$;
 

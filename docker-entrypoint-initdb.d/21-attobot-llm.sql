@@ -292,7 +292,8 @@ $$;
 CREATE OR REPLACE FUNCTION attobot.record_assistant_from_http(
   p_agent_slug text,
   p_http_response jsonb,
-  p_turn_id bigint DEFAULT NULL
+  p_turn_id bigint DEFAULT NULL,
+  p_requesting_user_id bigint DEFAULT NULL
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -348,7 +349,10 @@ BEGIN
     v_count := v_count + 1;
   END LOOP;
 
-  v_payload := jsonb_build_object('raw', v_message, 'tool_calls', v_tool_calls);
+  v_payload := jsonb_build_object('raw', v_message, 'tool_calls', v_tool_calls)
+    -- Stamp the requesting user so tool calls spawned from this assistant
+    -- message can run with that user's RLS scope (see _execute_sync_tool_call).
+    || jsonb_build_object('requesting_user_id', p_requesting_user_id);
   IF v_count > 0 AND p_turn_id IS NOT NULL THEN
     v_payload := v_payload || jsonb_build_object(
       'turn_id', p_turn_id,

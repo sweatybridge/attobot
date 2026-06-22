@@ -98,6 +98,39 @@ BEGIN
 END;
 $$;
 
+-- Upsert a channel user by (channel, external_id), refreshing profile fields,
+-- and return its internal id + tier. Called by intake to auto-track telegram
+-- users; tier is whatever is stored (default 'anonymous').
+CREATE OR REPLACE FUNCTION attobot.ensure_user(
+  p_channel text,
+  p_external_id text,
+  p_username text DEFAULT NULL,
+  p_display_name text DEFAULT NULL,
+  p_payload jsonb DEFAULT '{}'::jsonb
+)
+RETURNS TABLE(id bigint, tier text)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_id bigint;
+  v_tier text;
+BEGIN
+  INSERT INTO attobot.users(channel, external_id, username, display_name, payload)
+  VALUES (p_channel, p_external_id, p_username, p_display_name, p_payload)
+  ON CONFLICT (channel, external_id) DO UPDATE
+    SET username = EXCLUDED.username,
+        display_name = EXCLUDED.display_name,
+        payload = EXCLUDED.payload,
+        updated_at = now()
+  RETURNING attobot.users.id INTO v_id;
+
+  -- QUALIFY: the RETURNS TABLE columns (id, tier) shadow table column names.
+  SELECT u.tier INTO v_tier FROM attobot.users u WHERE u.id = v_id;
+
+  RETURN QUERY SELECT v_id, v_tier;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION attobot.set_config(
   p_agent_slug text,
   p_key text,

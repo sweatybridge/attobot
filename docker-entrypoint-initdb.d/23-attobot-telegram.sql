@@ -97,6 +97,9 @@ DECLARE
   v_seen boolean;
   v_accepted integer := 0;
   v_ignored integer := 0;
+  v_from_id text;
+  v_user_id bigint;
+  v_requesting_user_id bigint := NULL;
 BEGIN
   v_status := attobot._http_status(p_http_response);
   v_body := attobot._http_body_json(p_http_response);
@@ -155,6 +158,20 @@ BEGIN
       CONTINUE;
     END;
 
+    -- Track the sender and remember the last accepted one as the turn's
+    -- requesting user (tool calls during the turn run with this user's scope).
+    v_from_id := v_message #>> '{from,id}';
+    IF v_from_id IS NOT NULL AND v_from_id <> '' THEN
+      SELECT id INTO v_user_id FROM attobot.ensure_user(
+        'telegram',
+        v_from_id,
+        v_message #>> '{from,username}',
+        v_message #>> '{from,first_name}',
+        v_message->'from'
+      );
+      v_requesting_user_id := v_user_id;
+    END IF;
+
     v_accepted := v_accepted + 1;
   END LOOP;
 
@@ -167,7 +184,7 @@ BEGIN
   END IF;
 
   IF v_accepted > 0 THEN
-    PERFORM attobot.start_turn(p_agent_slug);
+    PERFORM attobot.start_turn(p_agent_slug, v_requesting_user_id);
   END IF;
 
   PERFORM attobot.log_event(

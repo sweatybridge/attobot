@@ -14,7 +14,10 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.start_turn(p_agent_slug text DEFAULT 'primary')
+CREATE OR REPLACE FUNCTION attobot.start_turn(
+  p_agent_slug text DEFAULT 'primary',
+  p_requesting_user_id bigint DEFAULT NULL
+)
 RETURNS text
 LANGUAGE plpgsql
 AS $$
@@ -39,14 +42,14 @@ BEGIN
       attobot._llm_headers(p_agent_slug),
       120
     ) |=> 'http_response'
-    ~> format('SELECT attobot.record_assistant_from_http(%L, $http_response::jsonb, %s)::jsonb AS assistant', p_agent_slug, v_turn_id)
+    ~> format('SELECT attobot.record_assistant_from_http(%L, $http_response::jsonb, %s, %L)::jsonb AS assistant', p_agent_slug, v_turn_id, p_requesting_user_id)
     ~> df.if(
       'SELECT ($assistant.tool_calls)::integer > 0',
       format('SELECT attotools.start_tool_signal_executor(%L, ($assistant.message_id)::bigint, %s) AS tool_executor', p_agent_slug, v_turn_id)
         ~> (df.wait_for_signal(attotools.tool_signal_name(p_agent_slug, v_turn_id), 900) |=> 'tool_signal')
         ~> format('SELECT attotools.record_tool_signal(%L, %s, $tool_signal::jsonb)::jsonb AS tool_signal_result', p_agent_slug, v_turn_id)
         ~> format('SELECT attobot.finish_turn(%L, %s) AS done', p_agent_slug, v_turn_id)
-        ~> format('SELECT attobot.start_turn(%L) AS next_instance', p_agent_slug),
+        ~> format('SELECT attobot.start_turn(%L, %L) AS next_instance', p_agent_slug, p_requesting_user_id),
       format('SELECT attobot.finish_turn(%L, %s) AS done', p_agent_slug, v_turn_id)
     ),
     format('attobot:%s:turn:%s', p_agent_slug, v_turn_id)
