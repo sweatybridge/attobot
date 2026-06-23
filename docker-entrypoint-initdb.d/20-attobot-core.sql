@@ -221,6 +221,7 @@ BEGIN
 END;
 $$;
 
+-- TODO: separate relationship table for memory source messages to enforce referential integrity
 CREATE OR REPLACE TRIGGER memory_validate_source_messages_trigger
 BEFORE INSERT OR UPDATE OF agent_id, content, source_message_ids, payload, enabled ON attobot.memory
 FOR EACH ROW

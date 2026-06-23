@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS attobot.outbox (
 
 CREATE INDEX IF NOT EXISTS outbox_agent_status_idx ON attobot.outbox(agent_id, status, id);
 
+-- TODO: move to 22-attobot-tools.sql
 CREATE TABLE IF NOT EXISTS attotools.blobs (
   agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
   hash text NOT NULL,

@@ -12,19 +12,40 @@ messages and inspecting database state.
 
 ## Architecture
 
+Primary agent is driven by triggers on messages table.
+
 ```
-operator/client
-  -> attobot.append_message(..., 'user', ...)
-  -> attobot.start_turn(...)
-  -> pg_durable workflow
-       -> attobot.compose_llm_request(...)
-       -> df.http(... /chat/completions ...)
-       -> attobot.record_assistant_from_http(...)
-       -> attotools.start_tool_signal_executor(...)
-       -> df.wait_for_signal(... tool results ...)
-       -> attobot.start_turn(...) after successful tool results
-  -> attobot.outbox
+-> trigger after insert on messages for each statement when role = 'user' and agent = 'primary'
+  -> df.loop(df.setvar(turn, 0) < agents.max_turn) as primary:
+    -> attobot.compose_llm_request() as primary
+      -> select soul, memory, and last n messages in chat as request
+    -> df.http(/chat/completions, $request, 120) as primary
+      -> on error attobot.append_messages(role => 'system') as primary
+      -> df.break
+    -> attobot.append_messages(role => 'assistant') as primary
+    -> df.if_rows($response.tool_calls)
+      -> df.join(all $response.tool_calls in parallel):
+        -> df.await_instance(tc, 120) as anonymous
+        -> on timeout df.cancel(tc) as anonymous
+        -> attobot.append_messages(role => 'tool') as primary
+    -> else df.break
+    -> df.setvar(turn, turn + 1)
 ```
+
+Communication to the outside world is driven by long polling telegram.
+
+```
+-> df.loop
+  -> telegram.poll_messages() as primary
+    -> attobot.append_messages(role => 'user') as primary
+      -> group batch insert statements by chat id (fallback to user id)
+      -> telegram.update_status('typing') as primary
+-> trigger after insert on messages for each row when role in ('assistant', 'system') and agent = 'primary' and channel = 'telegram'
+  -> telegram.update_status('online') as primary
+  -> telegram.send_message() as primary
+```
+
+Subconscious agent share the same loop design as primary but is driven by cron schedules. It executes tool calls as the subconscious role instead of anonymous.
 
 The durable turn workflow is SQL:
 
@@ -40,6 +61,44 @@ The durable turn workflow is SQL:
 - Optional Telegram loops use `df.http` to poll `getUpdates` into
   `attobot.messages` and deliver `attobot.outbox` rows with `sendMessage` or
   `sendDocument`.
+
+
+## 7. Least-privilege access matrix
+
+"own" for a telegram user =
+`payload #>> '{telegram_update,message,from,id}' = current_setting('attobot.current_telegram_user_id')`.
+"own agent" for an agent role =
+`agent_id = current_setting('attobot.current_agent_id')::bigint`.
+
+Each agent has its own role. The primary agent is able to dispatch subagents based on user message. Both primary and subagents run in the scope of the user.
+
+Only agents can make http calls. Primary agent polls telegram, appends new messages, and calls its own model. All assistant messages are forwarded to user. All tool messages are ignored.
+
+Primary agent can select, insert, update, and delete everything, but not update or delete its own rows in agents and memory table. Default privileges applies this rule to all new database entities. Allow interrupt / cancel the running loop.
+
+Subconscious agent can select everything and update all rows in agents and memory table.
+
+| Table | `anonymous` | `authenticated` | `agent_primary` | `agent_subconscious` | `service` | `admin` |
+|---|---|---|---|---|---|---|
+| `agents` | SELECT | SELECT | SELECT | SELECT | SELECT | ALL |
+| `models` | SELECT | SELECT | SELECT | SELECT | SELECT | ALL |
+| `messages` | **SELECT chat-wide**; INSERT/UPDATE own; **no DELETE** | same | SELECT/INSERT/UPDATE own agent; no DELETE | SELECT primary agent | ALL | ALL |
+| `memory` | — | — | ALL own agent | SELECT primary; INSERT primary; UPDATE own | ALL | ALL |
+| `config` | — | — | SELECT **non-secret** own | SELECT non-secret own | ALL | ALL |
+| `lifecycle` | — | — | SELECT; INSERT own | SELECT; INSERT own | SELECT/INSERT/UPDATE | ALL |
+| `attotools.blobs` | — | — | SELECT/INSERT/UPDATE own agent | SELECT own | ALL | ALL |
+| `users` | SELECT own row | SELECT own row | SELECT all | SELECT all | SELECT all; INSERT | ALL |
+
+Two least-privilege decisions:
+
+- **Secrets are never readable by agent/user roles.** `config` rows with
+  `secret = true` (`api_key`, `telegram_token`) are hidden even from the owning
+  agent role. Only `service`/`admin` see them.
+- **`messages` SELECT is chat-wide for users.** The whole conversation belongs
+  to one configured chat = one agent, so a user sees all of it (including other
+  users' messages and the agent's replies). INSERT/UPDATE stay pinned to their
+  own `from.id`; DELETE remains impossible.
+
 
 ## Run
 

@@ -18,6 +18,7 @@ AS $$
   );
 $$;
 
+-- TODO: infer tool schemas from functions defined in attotools
 CREATE OR REPLACE FUNCTION attotools._tool_schemas()
 RETURNS jsonb
 LANGUAGE sql
@@ -289,6 +290,7 @@ BEGIN
 END;
 $$;
 
+-- TODO: move append message to downstream function that handles tool calls and outbox
 CREATE OR REPLACE FUNCTION attobot.record_assistant_from_http(
   p_agent_slug text,
   p_http_response jsonb,
