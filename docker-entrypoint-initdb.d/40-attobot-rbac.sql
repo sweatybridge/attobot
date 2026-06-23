@@ -84,8 +84,6 @@ GRANT USAGE ON SEQUENCE attobot.messages_id_seq
      attobot_agent_primary, attobot_agent_subconscious, attobot_service, attobot_admin;
 GRANT USAGE ON SEQUENCE attobot.memory_id_seq
   TO attobot_agent_primary, attobot_agent_subconscious, attobot_service, attobot_admin;
-GRANT USAGE ON SEQUENCE attobot.outbox_id_seq
-  TO attobot_agent_primary, attobot_service, attobot_admin;
 GRANT USAGE ON SEQUENCE attobot.lifecycle_id_seq
   TO attobot_agent_primary, attobot_agent_subconscious, attobot_service, attobot_admin;
 GRANT USAGE ON SEQUENCE attobot.agents_id_seq, attobot.models_id_seq
@@ -258,26 +256,6 @@ CREATE POLICY config_service_bypass ON attobot.config
   FOR ALL TO attobot_service, attobot_admin USING (true) WITH CHECK (true);
 
 -- ============================================================================
--- TABLE: attobot.outbox
---   primary can enqueue/update its own; subconscious cannot send; service/admin full.
--- ============================================================================
-
-GRANT SELECT, INSERT, UPDATE ON attobot.outbox TO attobot_agent_primary;   -- no DELETE
-GRANT SELECT, INSERT, UPDATE, DELETE ON attobot.outbox TO attobot_service, attobot_admin;
-
-ALTER TABLE attobot.outbox ENABLE ROW LEVEL SECURITY;
-
-DROP POLICY IF EXISTS outbox_primary_all_own ON attobot.outbox;
-CREATE POLICY outbox_primary_all_own ON attobot.outbox
-  FOR ALL TO attobot_agent_primary
-  USING (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint)
-  WITH CHECK (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint);
-
-DROP POLICY IF EXISTS outbox_service_bypass ON attobot.outbox;
-CREATE POLICY outbox_service_bypass ON attobot.outbox
-  FOR ALL TO attobot_service, attobot_admin USING (true) WITH CHECK (true);
-
--- ============================================================================
 -- TABLE: attobot.lifecycle   (audit log — internal; agents append+read, service tracks)
 -- ============================================================================
 
@@ -380,62 +358,20 @@ CREATE POLICY users_admin_all ON attobot.users
 --   surface) and for the trusted service role.
 -- ============================================================================
 
--- Telegram intake entrypoint — the one function anonymous may call.
-GRANT EXECUTE ON FUNCTION attobot.process_telegram_updates(text, jsonb) TO attobot_anonymous;
+-- Trusted backend (attobot_service runs every durable instance) + admin: full
+-- function surface.
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA attobot   TO attobot_service, attobot_admin;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA attotools TO attobot_service, attobot_admin;
 
--- Agent-turn functions (verified signatures).
-GRANT EXECUTE ON FUNCTION attobot.agent_id(text)
-  TO attobot_agent_primary, attobot_agent_subconscious, attobot_service, attobot_admin;
-GRANT EXECUTE ON FUNCTION attobot.append_message(text, text, text, jsonb, text)
-  TO attobot_agent_primary, attobot_agent_subconscious, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot.start_turn(text, bigint)
-  TO attobot_agent_primary, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot.ensure_user(text, text, text, text, jsonb)
-  TO attobot_service, attobot_admin;
-GRANT EXECUTE ON FUNCTION attobot.finish_turn(text, bigint)
-  TO attobot_agent_primary, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot.compose_llm_request(text)
-  TO attobot_agent_primary, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot._config_text(bigint, text, text)
-  TO attobot_agent_primary, attobot_agent_subconscious, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot._system_prompt(bigint)
-  TO attobot_agent_primary, attobot_agent_subconscious, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot._memory_prompt(bigint)
-  TO attobot_agent_primary, attobot_agent_subconscious, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot._message_for_openai(attobot.messages)
-  TO attobot_agent_primary, attobot_agent_subconscious, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot.log_event(bigint, text, jsonb)
-  TO attobot_agent_primary, attobot_agent_subconscious, attobot_service, attobot_admin;
-
--- Config writes go through set_config (admin/service bootstrap; agents call it
--- for their own config, enforced inside the function in Phase 3).
-GRANT EXECUTE ON FUNCTION attobot.set_config(text, text, jsonb, boolean)
-  TO attobot_service, attobot_admin;
-
--- Bootstrap / configuration (admin + service).
-GRANT EXECUTE ON FUNCTION attobot.ensure_model(text, text, numeric, text, integer, boolean)
-  TO attobot_admin, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot.ensure_agent(text, text, text, bigint)
-  TO attobot_admin, attobot_service;
-GRANT EXECUTE ON FUNCTION attobot.configure_telegram(text, text, text, text, text)
-  TO attobot_admin, attobot_service;
-
--- Durable workflow control (service + admin).
-GRANT EXECUTE ON FUNCTION attobot.ensure_scheduled_message_loop(text, text, text, text)
-  TO attobot_service, attobot_admin;
-GRANT EXECUTE ON FUNCTION attobot.ensure_telegram_inbox_loop(text, integer)
-  TO attobot_service, attobot_admin;
-GRANT EXECUTE ON FUNCTION attobot.start_telegram_outbox_send(text, bigint)
-  TO attobot_service, attobot_admin;
-
--- The trusted backend needs the full attobot function surface.
-GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA attobot TO attobot_service;
-
--- Agent tooling surface (attotools). Bounded at the data layer by RLS on
--- blobs/messages; the SQL tool itself runs as the agent role and is therefore
--- RLS-bounded too.
+-- Acting roles (user tiers + per-agent roles) run tool functions inside
+-- per-call tool instances. EXECUTE is broad but contained: row-level security
+-- on the underlying tables bounds what they can actually read or write.
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA attotools
-  TO attobot_agent_primary, attobot_agent_subconscious, attobot_service;
+  TO attobot_agent_primary, attobot_agent_subconscious, attobot_anonymous, attobot_authenticated;
+GRANT EXECUTE ON FUNCTION attobot.append_message(text, text, text, jsonb, text, text, text)
+  TO attobot_agent_primary, attobot_agent_subconscious, attobot_anonymous, attobot_authenticated;
+GRANT EXECUTE ON FUNCTION attobot.queue_outbound_attachment(text, text, text, text, text, text)
+  TO attobot_anonymous, attobot_authenticated;
 
 -- ============================================================================
 -- DURABLE FRAMEWORK ACCESS (pg_durable)
@@ -444,8 +380,8 @@ GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA attotools
 --   30-attobot-durable.sql are SECURITY DEFINER owned by attobot_service, so
 --   every df.start submits as attobot_service (a non-superuser). Grant df usage
 --   to the roles that run workflows, and make service a member of the user
---   tiers so attotools._tool_sql_as_user can SET ROLE to the requesting user's
---   tier from inside a service-owned instance.
+--   tiers so attotools.run_tool_call_as_role can SET ROLE to the acting role
+--   inside a service-submitted per-call tool instance.
 --   (attobot_anonymous / attobot_authenticated are intentionally NOT granted df
 --    access: end users interact through the agent, not by submitting durable
 --    workflows themselves.)
@@ -457,18 +393,27 @@ SELECT df.grant_usage('attobot_agent_subconscious');
 
 -- The durable worker connects as the submitted role to execute instance SQL,
 -- so attobot_service must be LOGIN. It stays a non-superuser, so
--- enable_superuser_instances=off is satisfied; and because instance sessions
--- now have session_user = attobot_service, RESET ROLE in _tool_sql_as_user
--- restores to service (not a superuser) — no privilege escalation.
+-- enable_superuser_instances=off is satisfied. Instance sessions have
+-- session_user = attobot_service; per-call tool instances are also submitted by
+-- service, and run_tool_call_as_role SET ROLEs down to the acting role inside
+-- them, so RESET ROLE restores to service (no escalation).
 ALTER ROLE attobot_service LOGIN;
 
+-- service must be able to SET ROLE to the acting (user-tier) roles inside
+-- per-call tool instances.
 GRANT attobot_anonymous TO attobot_service;
 GRANT attobot_authenticated TO attobot_service;
 
--- Hand the SECURITY DEFINER workflow starters to service so they submit as it.
-ALTER FUNCTION attobot._start_durable_loop_once(text, text) OWNER TO attobot_service;
-ALTER FUNCTION attobot.start_turn(text, bigint) OWNER TO attobot_service;
-ALTER FUNCTION attobot.start_telegram_outbox_send(text, bigint) OWNER TO attobot_service;
+-- Hand the SECURITY DEFINER workflow starters / triggers / senders to service
+-- so they submit instances and do privileged work as the non-superuser service.
+ALTER FUNCTION attobot.start_agent_loop(text, bigint, bigint)          OWNER TO attobot_service;
+ALTER FUNCTION attobot.ensure_telegram_inbox_loop(text, integer)       OWNER TO attobot_service;
+ALTER FUNCTION attobot.ensure_agent_cron_loop(text, text, text, text)  OWNER TO attobot_service;
+ALTER FUNCTION attobot.after_user_message_loop()                       OWNER TO attobot_service;
+ALTER FUNCTION attobot.after_outbound_message_send()                   OWNER TO attobot_service;
+ALTER FUNCTION attobot.send_message(bigint)                            OWNER TO attobot_service;
+ALTER FUNCTION attobot.send_message_future(bigint)                     OWNER TO attobot_service;
+ALTER FUNCTION attobot.queue_outbound_attachment(text, text, text, text, text, text) OWNER TO attobot_service;
 
 -- ============================================================================
 -- CONTEXT HELPER  (sets the ABAC session attributes; see design §10.2)

@@ -173,7 +173,9 @@ CREATE OR REPLACE FUNCTION attobot.append_message(
   p_role text,
   p_content text,
   p_payload jsonb DEFAULT '{}'::jsonb,
-  p_tool_call_id text DEFAULT NULL
+  p_tool_call_id text DEFAULT NULL,
+  p_channel text DEFAULT NULL,
+  p_chat_id text DEFAULT NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql
@@ -182,8 +184,8 @@ DECLARE
   v_agent_id bigint := attobot.agent_id(p_agent_slug);
   v_id bigint;
 BEGIN
-  INSERT INTO attobot.messages(agent_id, role, content, payload, tool_call_id)
-  VALUES (v_agent_id, p_role, coalesce(p_content, ''), coalesce(p_payload, '{}'::jsonb), p_tool_call_id)
+  INSERT INTO attobot.messages(agent_id, role, content, payload, channel, chat_id, tool_call_id)
+  VALUES (v_agent_id, p_role, coalesce(p_content, ''), coalesce(p_payload, '{}'::jsonb), p_channel, p_chat_id, p_tool_call_id)
   RETURNING id INTO v_id;
 
   PERFORM attobot.log_event(

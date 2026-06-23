@@ -1,14 +1,3 @@
-CREATE OR REPLACE FUNCTION attotools.tool_signal_name(
-  p_agent_slug text,
-  p_turn_id bigint
-)
-RETURNS text
-LANGUAGE sql
-IMMUTABLE
-AS $$
-  SELECT format('attobot:%s:turn:%s:tools', p_agent_slug, p_turn_id);
-$$;
-
 CREATE OR REPLACE FUNCTION attotools._append_tool_message(
   p_agent_id bigint,
   p_tool_call_id text,
@@ -26,6 +15,11 @@ BEGIN
 END;
 $$;
 
+-- SEND_ATTACHMENT: validate the blob (read as the acting role) and queue an
+-- outbound system message (channel='telegram') that the outbound trigger
+-- delivers. No outbox. queue_outbound_attachment (SECURITY DEFINER, owner
+-- attobot_service) does the privileged append so this works even when the
+-- caller is the anonymous acting role.
 CREATE OR REPLACE FUNCTION attotools._tool_send_attachment(
   p_agent_id bigint,
   p_args jsonb
@@ -35,39 +29,33 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   v_hash text := btrim(coalesce(p_args->>'hash', ''));
-  v_outbox_id bigint;
+  v_slug text;
+  v_chat_id text;
 BEGIN
   IF v_hash = '' THEN
     RAISE EXCEPTION 'SEND_ATTACHMENT requires hash';
   END IF;
 
   IF NOT EXISTS (
-    SELECT 1
-    FROM attotools.blobs
-    WHERE agent_id = p_agent_id
-      AND hash = v_hash
+    SELECT 1 FROM attotools.blobs WHERE agent_id = p_agent_id AND hash = v_hash
   ) THEN
     RAISE EXCEPTION 'blob not found: %', v_hash;
   END IF;
 
-  INSERT INTO attobot.outbox(agent_id, channel, body)
-  VALUES (
-    p_agent_id,
-    'telegram_attachment',
-    jsonb_strip_nulls(jsonb_build_object(
-      'blob_hash', v_hash,
-      'filename', nullif(p_args->>'filename', ''),
-      'caption', nullif(p_args->>'caption', ''),
-      'mime_type', nullif(p_args->>'mime_type', '')
-    ))
-  )
-  RETURNING id INTO v_outbox_id;
+  SELECT slug, chat_id INTO v_slug, v_chat_id
+  FROM attobot.messages m JOIN attobot.agents a ON a.id = m.agent_id
+  WHERE m.agent_id = p_agent_id AND m.role = 'user'
+  ORDER BY m.id DESC LIMIT 1;
 
-  RETURN jsonb_build_object(
-    'queued', true,
-    'outbox_id', v_outbox_id,
-    'blob_hash', v_hash
-  )::text;
+  PERFORM attobot.queue_outbound_attachment(
+    v_slug, v_hash,
+    nullif(p_args->>'filename', ''),
+    nullif(p_args->>'caption', ''),
+    nullif(p_args->>'mime_type', ''),
+    v_chat_id
+  );
+
+  RETURN jsonb_build_object('queued', true, 'blob_hash', v_hash)::text;
 END;
 $$;
 
@@ -158,10 +146,7 @@ DECLARE
   v_bytes bytea;
   v_hash text;
 BEGIN
-  v_bytes := attotools._blob_decode_content(
-    p_args->>'content',
-    p_args->>'encoding'
-  );
+  v_bytes := attotools._blob_decode_content(p_args->>'content', p_args->>'encoding');
   v_hash := left(md5(v_bytes), 12);
 
   INSERT INTO attotools.blobs(agent_id, hash, content)
@@ -188,17 +173,13 @@ DECLARE
 BEGIN
   SELECT content INTO v_content
   FROM attotools.blobs
-  WHERE agent_id = p_agent_id
-    AND hash = p_args->>'hash';
+  WHERE agent_id = p_agent_id AND hash = p_args->>'hash';
 
   IF v_content IS NULL THEN
     RETURN 'error: blob not found';
   END IF;
 
-  RETURN attotools._blob_encode_content(
-    v_content,
-    coalesce(p_args->>'encoding', 'UTF8')
-  );
+  RETURN attotools._blob_encode_content(v_content, coalesce(p_args->>'encoding', 'UTF8'));
 END;
 $$;
 
@@ -398,9 +379,7 @@ BEGIN
     END IF;
 
     v_results := v_results || jsonb_build_array(jsonb_build_object(
-      'title', v_title,
-      'url', v_url,
-      'snippet', v_snippet
+      'title', v_title, 'url', v_url, 'snippet', v_snippet
     ));
 
     v_count := v_count + 1;
@@ -444,144 +423,24 @@ BEGIN
 END;
 $$;
 
--- Run the SQL tool query under the requesting user's RLS scope. The caller
--- (the durable framework) is the superuser; we SET ROLE down to the user's tier
--- so row-level security binds for the inner query, then RESET ROLE before
--- returning so the caller's subsequent bookkeeping stays privileged. SECURITY
--- INVOKER is required: SET ROLE is forbidden inside SECURITY DEFINER functions.
-CREATE OR REPLACE FUNCTION attotools._tool_sql_as_user(
-  p_args jsonb,
-  p_role text,
-  p_agent_id bigint,
-  p_telegram_user_id text,
-  p_telegram_chat_id text
-)
-RETURNS text
-LANGUAGE plpgsql
-SECURITY INVOKER
-SET search_path = attobot, attotools, pg_temp
-AS $$
-DECLARE
-  v_query text;
-  v_rows jsonb;
-  v_err text;
-BEGIN
-  v_query := btrim(coalesce(p_args->>'query', ''));
-  IF v_query = '' THEN
-    RAISE EXCEPTION 'SQL tool requires query';
-  END IF;
-  IF position(';' IN v_query) > 0 THEN
-    RAISE EXCEPTION 'SQL tool accepts one semicolon-free query';
-  END IF;
-
-  EXECUTE format('SET ROLE %I', p_role);
-  PERFORM set_config('attobot.current_agent_id', p_agent_id::text, true);
-  PERFORM set_config('attobot.current_telegram_user_id', p_telegram_user_id, true);
-  PERFORM set_config('attobot.current_telegram_chat_id', coalesce(p_telegram_chat_id, ''), true);
-  BEGIN
-    EXECUTE format(
-      'SELECT coalesce(jsonb_agg(to_jsonb(q)), ''[]''::jsonb) FROM (%s) AS q',
-      v_query
-    )
-    INTO v_rows;
-  EXCEPTION WHEN OTHERS THEN
-    v_err := SQLERRM;
-    EXECUTE 'RESET ROLE';        -- never leak the dropped role on error
-    RAISE EXCEPTION '%', v_err;
-  END;
-  EXECUTE 'RESET ROLE';
-
-  RETURN jsonb_pretty(jsonb_build_object(
-    'rows', coalesce(v_rows, '[]'::jsonb),
-    'row_count', jsonb_array_length(coalesce(v_rows, '[]'::jsonb))
-  ));
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION attotools._execute_sync_tool_call(
-  p_agent_slug text,
-  p_message_id bigint,
-  p_tool_call_id text,
-  p_name text,
-  p_args jsonb
-)
-RETURNS text
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_agent_id bigint := attobot.agent_id(p_agent_slug);
-  v_result text;
-  v_req_user_id bigint;
-  v_role text;
-  v_ext_id text;
-  v_chat_id text;
-BEGIN
-  IF p_name = 'SQL' THEN
-    -- User-requested turn: run the agent's SQL with the requesting user's
-    -- scope. Scheduled/agent-initiated turns (no requesting user) fall back to
-    -- the agent/framework scope via _tool_sql.
-    SELECT (payload->>'requesting_user_id')::bigint INTO v_req_user_id
-      FROM attobot.messages WHERE id = p_message_id;
-    IF v_req_user_id IS NOT NULL THEN
-      SELECT 'attobot_' || u.tier, u.external_id INTO v_role, v_ext_id
-        FROM attobot.users u WHERE u.id = v_req_user_id;
-      v_chat_id := attobot._config_text(v_agent_id, 'telegram_chat_id');
-    END IF;
-
-    IF v_req_user_id IS NOT NULL AND v_role IS NOT NULL AND v_ext_id IS NOT NULL THEN
-      v_result := attotools._tool_sql_as_user(p_args, v_role, v_agent_id, v_ext_id, v_chat_id);
-    ELSE
-      v_result := attotools._tool_sql(p_args);
-    END IF;
-  ELSE
-    v_result := CASE p_name
-      WHEN 'SEARCH' THEN coalesce(p_args->>'error', 'error: SEARCH requires query')
-      WHEN 'WEBFETCH' THEN coalesce(p_args->>'error', 'error: WEBFETCH requires a public http(s) URL')
-      WHEN 'SEND_ATTACHMENT' THEN attotools._tool_send_attachment(v_agent_id, p_args)
-      WHEN 'APPEND_MESSAGE' THEN attotools._tool_append_message(p_args, p_agent_slug)
-      WHEN 'WRITE_BLOB' THEN attotools._tool_write_blob(v_agent_id, p_args)
-      WHEN 'READ_BLOB' THEN attotools._tool_read_blob(v_agent_id, p_args)
-      WHEN 'SQL' THEN attotools._tool_sql(p_args)
-      ELSE NULL
-    END;
-  END IF;
-
-  IF v_result IS NULL THEN
-    RAISE EXCEPTION 'unknown synchronous tool: %', p_name;
-  END IF;
-
-  PERFORM attotools._append_tool_message(v_agent_id, p_tool_call_id, v_result);
-  RETURN v_result;
-
-EXCEPTION WHEN others THEN
-  v_result := 'error: ' || SQLERRM;
-  PERFORM attotools._append_tool_message(v_agent_id, p_tool_call_id, v_result);
-  RETURN v_result;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION attotools._complete_webfetch_tool_from_http(
-  p_agent_slug text,
-  p_message_id bigint,
-  p_tool_call_id text,
+-- Build the result text of a WEBFETCH from its http response (no append).
+CREATE OR REPLACE FUNCTION attotools._webfetch_result(
   p_args jsonb,
   p_http_response jsonb
 )
-RETURNS jsonb
+RETURNS text
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  v_agent_id bigint := attobot.agent_id(p_agent_slug);
   v_max_bytes integer;
   v_headers jsonb;
   v_body text;
-  v_result jsonb;
 BEGIN
   v_max_bytes := least(greatest(coalesce((p_args->>'max_bytes')::integer, 20000), 1000), 200000);
   v_headers := coalesce(p_http_response->'headers', '{}'::jsonb);
   v_body := left(coalesce(p_http_response->>'body', ''), v_max_bytes);
 
-  v_result := jsonb_build_object(
+  RETURN jsonb_build_object(
     'url', p_args->>'url',
     'effective_url', p_args->>'url',
     'status', coalesce((p_http_response->>'status')::integer, 0),
@@ -589,371 +448,236 @@ BEGIN
     'bytes_returned', length(v_body),
     'truncated', length(coalesce(p_http_response->>'body', '')) > length(v_body),
     'body', v_body
-  );
-
-  PERFORM attotools._append_tool_message(v_agent_id, p_tool_call_id, v_result::text);
-  RETURN jsonb_build_object('completed', true, 'tool_call_id', p_tool_call_id);
+  )::text;
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attotools._complete_search_tool_from_http(
-  p_agent_slug text,
-  p_message_id bigint,
-  p_tool_call_id text,
+-- Build the result text of a SEARCH from its http response (no append).
+CREATE OR REPLACE FUNCTION attotools._search_result(
   p_args jsonb,
   p_http_response jsonb
 )
-RETURNS jsonb
+RETURNS text
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  v_agent_id bigint := attobot.agent_id(p_agent_slug);
   v_limit integer;
-  v_result jsonb;
 BEGIN
   v_limit := least(greatest(coalesce((p_args->>'limit')::integer, 5), 1), 10);
-  v_result := attotools._search_results_from_html(
-    p_args->>'query',
-    v_limit,
-    coalesce(p_http_response->>'body', '')
-  ) || jsonb_build_object(
-    'status', coalesce((p_http_response->>'status')::integer, 0)
-  );
-
-  PERFORM attotools._append_tool_message(v_agent_id, p_tool_call_id, v_result::text);
-  RETURN jsonb_build_object('completed', true, 'tool_call_id', p_tool_call_id);
+  RETURN (attotools._search_results_from_html(
+    p_args->>'query', v_limit, coalesce(p_http_response->>'body', '')
+  ) || jsonb_build_object('status', coalesce((p_http_response->>'status')::integer, 0)))::text;
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attotools._turn_durable_instance_id(p_turn_id bigint)
-RETURNS text
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT detail->>'durable_instance_id'
-  FROM attobot.lifecycle
-  WHERE event = 'turn.instance'
-    AND (detail->>'turn_id')::bigint = p_turn_id
-  ORDER BY id DESC
-  LIMIT 1;
-$$;
-
-CREATE OR REPLACE FUNCTION attotools._wait_until_turn_signal_ready(
-  p_turn_id bigint,
-  p_signal_name text,
-  p_timeout_seconds integer DEFAULT 30
-)
-RETURNS boolean
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_instance_id text;
-  v_deadline timestamptz := clock_timestamp() + make_interval(secs => p_timeout_seconds);
-BEGIN
-  LOOP
-    v_instance_id := attotools._turn_durable_instance_id(p_turn_id);
-
-    IF v_instance_id IS NOT NULL AND EXISTS (
-      SELECT 1
-      FROM df.instance_nodes(v_instance_id, 1)
-      WHERE node_type = 'SIGNAL'
-        AND status = 'running'
-        AND query::text LIKE '%' || p_signal_name || '%'
-    ) THEN
-      RETURN true;
-    END IF;
-
-    IF clock_timestamp() >= v_deadline THEN
-      RETURN false;
-    END IF;
-
-    PERFORM pg_sleep(0.25);
-  END LOOP;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION attotools._signal_turn_tools(
-  p_turn_id bigint,
-  p_signal_name text,
-  p_message_id bigint
-)
-RETURNS jsonb
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_instance_id text;
-  v_tool_count integer;
-  v_signal_result text;
-BEGIN
-  v_instance_id := attotools._turn_durable_instance_id(p_turn_id);
-
-  IF v_instance_id IS NULL THEN
-    RAISE EXCEPTION 'turn % has no durable_instance_id', p_turn_id;
-  END IF;
-
-  SELECT count(*)
-  INTO v_tool_count
-  FROM attobot.messages a
-  CROSS JOIN LATERAL jsonb_array_elements(coalesce(a.payload->'tool_calls', '[]'::jsonb)) AS call(value)
-  JOIN attobot.messages t
-    ON t.agent_id = a.agent_id
-   AND t.role = 'tool'
-   AND t.tool_call_id = call.value->>'id'
-  WHERE a.id = p_message_id;
-
-  v_signal_result := df.signal(
-    v_instance_id,
-    p_signal_name,
-    jsonb_build_object(
-      'message_id', p_message_id,
-      'tool_results', v_tool_count
-    )::text
-  );
-
-  UPDATE attobot.messages
-  SET payload = payload || jsonb_build_object(
-    'tool_signal_sent_at', now(),
-    'tool_signal_result', v_signal_result
-  )
-  WHERE id = p_message_id;
-
-  RETURN jsonb_build_object(
-    'signaled', true,
-    'signal_result', v_signal_result,
-    'tool_results', v_tool_count
-  );
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION attotools.compose_tool_signal_future(
+-- Run one synchronous tool's WORK under the acting role (SET ROLE + GUCs), then
+-- RESET. SECURITY INVOKER — SET ROLE is forbidden inside SECURITY DEFINER. The
+-- instance that calls this is submitted by attobot_service; we drop to the
+-- acting role (the requesting user's tier, or the subconscious role) so RLS
+-- binds for the tool's data access. Returns the result text; the orchestrator
+-- appends the role='tool' message as service.
+CREATE OR REPLACE FUNCTION attotools.run_tool_call_as_role(
+  p_name text,
+  p_args jsonb,
+  p_acting_role text,
+  p_agent_id bigint,
   p_agent_slug text,
-  p_message_id bigint,
-  p_turn_id bigint
+  p_user_external_id text DEFAULT NULL,
+  p_chat_id text DEFAULT NULL,
+  p_user_id bigint DEFAULT NULL
 )
 RETURNS text
 LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE
-  v_message attobot.messages%ROWTYPE;
-  v_signal_name text := attotools.tool_signal_name(p_agent_slug, p_turn_id);
-  v_future text;
-  v_step text;
-  v_call jsonb;
-  v_args jsonb;
-  v_name text;
-  v_tool_call_id text;
-  v_index integer := 0;
-  v_alias text;
+  v_result text;
+  v_err text;
+BEGIN
+  EXECUTE format('SET ROLE %I', p_acting_role);
+  PERFORM set_config('attobot.current_agent_id', p_agent_id::text, true);
+  PERFORM set_config('attobot.current_telegram_user_id', coalesce(p_user_external_id, ''), true);
+  PERFORM set_config('attobot.current_telegram_chat_id', coalesce(p_chat_id, ''), true);
+  PERFORM set_config('attobot.current_user_id', coalesce(p_user_id::text, ''), true);
+  BEGIN
+    v_result := CASE p_name
+      WHEN 'SQL' THEN attotools._tool_sql(p_args)
+      WHEN 'SEND_ATTACHMENT' THEN attotools._tool_send_attachment(p_agent_id, p_args)
+      WHEN 'APPEND_MESSAGE' THEN attotools._tool_append_message(p_args, p_agent_slug)
+      WHEN 'WRITE_BLOB' THEN attotools._tool_write_blob(p_agent_id, p_args)
+      WHEN 'READ_BLOB' THEN attotools._tool_read_blob(p_agent_id, p_args)
+      ELSE NULL
+    END;
+  EXCEPTION WHEN OTHERS THEN
+    v_err := SQLERRM;
+    EXECUTE 'RESET ROLE';
+    v_result := 'error: ' || v_err;
+  END;
+  EXECUTE 'RESET ROLE';
+
+  IF v_result IS NULL THEN
+    v_result := 'error: unknown synchronous tool: ' || p_name;
+  END IF;
+  RETURN v_result;
+END;
+$$;
+
+-- Build the df future for one tool call (the body of its tc instance).
+-- SEARCH/WEBFETCH become an http graph; the rest run synchronously as the
+-- acting role. Returns a df graph text.
+CREATE OR REPLACE FUNCTION attotools.tool_call_future(
+  p_name text,
+  p_args jsonb,
+  p_acting_role text,
+  p_agent_id bigint,
+  p_agent_slug text,
+  p_user_external_id text DEFAULT NULL,
+  p_chat_id text DEFAULT NULL,
+  p_user_id bigint DEFAULT NULL
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = attobot, attotools, public, pg_temp
+AS $$
+DECLARE
   v_url text;
 BEGIN
-  SELECT *
-  INTO v_message
-  FROM attobot.messages
-  WHERE id = p_message_id
-    AND agent_id = attobot.agent_id(p_agent_slug)
-    AND role = 'assistant';
-
-  IF v_message.id IS NULL THEN
-    RAISE EXCEPTION 'assistant message not found: %', p_message_id;
+  IF p_name = 'WEBFETCH' THEN
+    v_url := btrim(coalesce(p_args->>'url', ''));
+    IF attotools._http_url_allowed(v_url) THEN
+      RETURN df.http(
+        v_url, 'GET', '',
+        jsonb_build_object(
+          'User-Agent', 'attobot-webfetch/1.0',
+          'Accept', 'text/html,application/xhtml+xml,application/xml,text/plain,*/*;q=0.8'
+        ), 30
+      ) |=> 'http'
+        ~> format(
+          'SELECT attotools._webfetch_result(%L::jsonb, $http::jsonb)::text AS result',
+          p_args::text
+        );
+    END IF;
+    RETURN format('SELECT %L::text AS result', 'error: WEBFETCH requires a public http(s) URL');
+  ELSIF p_name = 'SEARCH' THEN
+    IF btrim(coalesce(p_args->>'query', '')) = '' THEN
+      RETURN format('SELECT %L::text AS result', 'error: SEARCH requires query');
+    END IF;
+    v_url := 'https://www.bing.com/search?q=' || attotools._url_encode(p_args->>'query');
+    RETURN df.http(
+      v_url, 'GET', '',
+      jsonb_build_object(
+        'User-Agent', 'Mozilla/5.0 (compatible; attobot-search/1.0)',
+        'Accept', 'text/html,application/xhtml+xml,application/xml,text/plain,*/*;q=0.8'
+      ), 30
+    ) |=> 'http'
+      ~> format(
+        'SELECT attotools._search_result(%L::jsonb, $http::jsonb)::text AS result',
+        p_args::text
+      );
   END IF;
 
-  v_future := format(
-    'SELECT attotools._wait_until_turn_signal_ready(%s, %L, 30) AS signal_ready',
-    p_turn_id,
-    v_signal_name
+  -- synchronous tools run as the acting role
+  RETURN format(
+    'SELECT attotools.run_tool_call_as_role(%L, %L::jsonb, %L, %s, %L, %L, %L, %s)::text AS result',
+    p_name, p_args::text, p_acting_role, p_agent_id, p_agent_slug,
+    coalesce(p_user_external_id, ''), coalesce(p_chat_id, ''),
+    coalesce(p_user_id::text, 'NULL')
   );
-
-  FOR v_call IN SELECT value FROM jsonb_array_elements(coalesce(v_message.payload->'tool_calls', '[]'::jsonb))
-  LOOP
-    v_index := v_index + 1;
-    v_tool_call_id := v_call->>'id';
-    v_name := v_call #>> '{function,name}';
-    v_args := attobot._try_jsonb(v_call #>> '{function,arguments}');
-
-    IF v_name = 'WEBFETCH' THEN
-      v_url := btrim(coalesce(v_args->>'url', ''));
-      IF attotools._http_url_allowed(v_url) THEN
-        v_alias := format('http_%s', v_index);
-        v_step :=
-          df.http(
-            v_url,
-            'GET',
-            '',
-            jsonb_build_object(
-              'User-Agent', 'attobot-webfetch/1.0',
-              'Accept', 'text/html,application/xhtml+xml,application/xml,text/plain,*/*;q=0.8'
-            ),
-            30
-          ) |=> v_alias
-          ~> format(
-            'SELECT attotools._complete_webfetch_tool_from_http(%L, %s, %L, %L::jsonb, $%s::jsonb)::jsonb AS tool_%s',
-            p_agent_slug,
-            p_message_id,
-            v_tool_call_id,
-            v_args::text,
-            v_alias,
-            v_index
-          );
-      ELSE
-        v_step := format(
-          'SELECT attotools._execute_sync_tool_call(%L, %s, %L, %L, %L::jsonb)::text AS tool_%s',
-          p_agent_slug,
-          p_message_id,
-          v_tool_call_id,
-          'WEBFETCH',
-          jsonb_build_object('error', 'WEBFETCH requires a public http(s) URL')::text,
-          v_index
-        );
-      END IF;
-    ELSIF v_name = 'SEARCH' THEN
-      IF btrim(coalesce(v_args->>'query', '')) = '' THEN
-        v_step := format(
-          'SELECT attotools._execute_sync_tool_call(%L, %s, %L, %L, %L::jsonb)::text AS tool_%s',
-          p_agent_slug,
-          p_message_id,
-          v_tool_call_id,
-          'SEARCH',
-          jsonb_build_object('error', 'SEARCH requires query')::text,
-          v_index
-        );
-      ELSE
-        v_alias := format('http_%s', v_index);
-        v_url := 'https://www.bing.com/search?q=' || attotools._url_encode(v_args->>'query');
-        v_step :=
-          df.http(
-            v_url,
-            'GET',
-            '',
-            jsonb_build_object(
-              'User-Agent', 'Mozilla/5.0 (compatible; attobot-search/1.0)',
-              'Accept', 'text/html,application/xhtml+xml,application/xml,text/plain,*/*;q=0.8'
-            ),
-            30
-          ) |=> v_alias
-          ~> format(
-            'SELECT attotools._complete_search_tool_from_http(%L, %s, %L, %L::jsonb, $%s::jsonb)::jsonb AS tool_%s',
-            p_agent_slug,
-            p_message_id,
-            v_tool_call_id,
-            v_args::text,
-            v_alias,
-            v_index
-          );
-      END IF;
-    ELSE
-      v_step := format(
-        'SELECT attotools._execute_sync_tool_call(%L, %s, %L, %L, %L::jsonb)::text AS tool_%s',
-        p_agent_slug,
-        p_message_id,
-        v_tool_call_id,
-        v_name,
-        v_args::text,
-        v_index
-      );
-    END IF;
-
-    v_future := v_future ~> v_step;
-  END LOOP;
-
-  v_future := v_future ~> format(
-    'SELECT attotools._signal_turn_tools(%s, %L, %s)::jsonb AS signal',
-    p_turn_id,
-    v_signal_name,
-    p_message_id
-  );
-
-  RETURN v_future;
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attotools.start_tool_signal_executor(
+-- Orchestrator: run all tool calls for an assistant message as per-call durable
+-- instances, in parallel (start all before awaiting), with timeout + cancel,
+-- then append each result as role='tool' (as service). Runs as attobot_service
+-- inside the agent-loop instance. Returns a summary.
+CREATE OR REPLACE FUNCTION attotools.run_tool_calls(
   p_agent_slug text,
   p_message_id bigint,
-  p_turn_id bigint
+  p_tool_calls jsonb,
+  p_acting_role text,
+  p_user_external_id text DEFAULT NULL,
+  p_chat_id text DEFAULT NULL,
+  p_user_id bigint DEFAULT NULL,
+  p_timeout integer DEFAULT 120
 )
 RETURNS text
 LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_instance text;
-BEGIN
-  SELECT df.start(
-    attotools.compose_tool_signal_future(p_agent_slug, p_message_id, p_turn_id),
-    format('attobot:%s:tools:%s:%s', p_agent_slug, p_message_id, txid_current())
-  )
-  INTO v_instance;
-
-  UPDATE attobot.messages
-  SET payload = payload || jsonb_build_object('tool_executor_instance_id', v_instance)
-  WHERE id = p_message_id;
-
-  RETURN v_instance;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION attotools.record_tool_signal(
-  p_agent_slug text,
-  p_turn_id bigint,
-  p_signal jsonb
-)
-RETURNS jsonb
-LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE
   v_agent_id bigint := attobot.agent_id(p_agent_slug);
-  v_message attobot.messages%ROWTYPE;
-  v_reason text := format('tool signal timed out for turn %s', p_turn_id);
   v_call jsonb;
-  v_timed_out boolean := coalesce((p_signal->>'timed_out')::boolean, false);
-  v_timeout_tool_results integer := 0;
-  v_executor_instance_id text;
-  v_executor_cancel_result text;
+  v_tool_call_id text;
+  v_name text;
+  v_args jsonb;
+  v_future text;
+  v_tc text;
+  v_ids text[] := '{}';
+  v_callids text[] := '{}';
+  v_status text;
+  v_result text;
+  v_deadline timestamptz;
+  v_i integer;
 BEGIN
-  IF v_timed_out THEN
-    SELECT *
-    INTO v_message
-    FROM attobot.messages
-    WHERE agent_id = v_agent_id
-      AND role = 'assistant'
-      AND (payload->>'turn_id')::bigint = p_turn_id
-    ORDER BY id DESC
-    LIMIT 1;
-
-    v_executor_instance_id := nullif(v_message.payload->>'tool_executor_instance_id', '');
-
-    IF v_executor_instance_id IS NOT NULL THEN
-      BEGIN
-        v_executor_cancel_result := df.cancel(v_executor_instance_id, v_reason);
-      EXCEPTION WHEN OTHERS THEN
-        v_executor_cancel_result := format('error: %s', SQLERRM);
-      END;
-    END IF;
-
-    FOR v_call IN SELECT value FROM jsonb_array_elements(coalesce(v_message.payload->'tool_calls', '[]'::jsonb))
-    LOOP
-      PERFORM attotools._append_tool_message(v_agent_id, v_call->>'id', 'error: timed out waiting for tool signal');
-      v_timeout_tool_results := v_timeout_tool_results + 1;
-    END LOOP;
+  IF p_acting_role IS NULL OR p_acting_role = '' THEN
+    p_acting_role := 'attobot_agent_primary';
   END IF;
 
-  PERFORM attobot.log_event(
-    v_agent_id,
-    'tool.signal',
-    jsonb_build_object(
-      'turn_id', p_turn_id,
-      'signal', p_signal,
-      'tool_executor_instance_id', v_executor_instance_id,
-      'tool_executor_cancel_result', v_executor_cancel_result,
-      'timeout_tool_results', v_timeout_tool_results
-    )
-  );
+  -- 1. start every tool call as its own instance (parallel: all started first)
+  FOR v_call IN SELECT value FROM jsonb_array_elements(coalesce(p_tool_calls, '[]'::jsonb))
+  LOOP
+    v_tool_call_id := coalesce(v_call->>'id', 'call_' || md5(v_call::text));
+    v_name := v_call #>> '{function,name}';
+    v_args := attobot._try_jsonb(v_call #>> '{function,arguments}');
+    v_future := attotools.tool_call_future(
+      v_name, v_args, p_acting_role, v_agent_id, p_agent_slug,
+      p_user_external_id, p_chat_id, p_user_id
+    );
+    SELECT df.start(v_future, format('attobot:tool:%s:%s', p_message_id, v_tool_call_id)) INTO v_tc;
+    v_ids := array_append(v_ids, v_tc);
+    v_callids := array_append(v_callids, v_tool_call_id);
+  END LOOP;
 
-  RETURN jsonb_build_object(
-    'turn_id', p_turn_id,
-    'timed_out', v_timed_out,
-    'data', p_signal->'data',
-    'tool_executor_cancel_result', v_executor_cancel_result,
-    'timeout_tool_results', v_timeout_tool_results
-  );
+  -- 2. await each (poll df.status, cancel on timeout), 3. append result as service
+  FOR v_i IN 1..coalesce(array_length(v_ids, 1), 0)
+  LOOP
+    v_deadline := clock_timestamp() + make_interval(secs => p_timeout);
+    v_status := NULL;
+    LOOP
+      BEGIN
+        SELECT df.status(v_ids[v_i]) INTO v_status;
+      EXCEPTION WHEN OTHERS THEN
+        v_status := 'error';
+      END;
+      EXIT WHEN v_status IN ('completed', 'failed', 'cancelled', 'error');
+      IF clock_timestamp() >= v_deadline THEN
+        BEGIN
+          PERFORM df.cancel(v_ids[v_i], 'tool call timeout');
+        EXCEPTION WHEN OTHERS THEN
+          NULL;
+        END;
+        v_status := 'cancelled';
+        EXIT;
+      END IF;
+      PERFORM pg_sleep(0.5);
+    END LOOP;
+
+    BEGIN
+      SELECT df.result(v_ids[v_i]) INTO v_result;
+      v_result := coalesce((attobot._try_jsonb(v_result)->>'result'), v_result);
+    EXCEPTION WHEN OTHERS THEN
+      v_result := 'error: ' || SQLERRM;
+    END;
+    IF v_status <> 'completed' THEN
+      v_result := coalesce(v_result, 'error: tool ' || v_status);
+    END IF;
+
+    PERFORM attotools._append_tool_message(v_agent_id, v_callids[v_i], v_result);
+  END LOOP;
+
+  RETURN jsonb_build_object('tool_calls', array_length(v_ids, 1))::text;
 END;
 $$;

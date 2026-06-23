@@ -176,9 +176,7 @@ BEGIN
 <harness>
 You run inside PostgreSQL. Your canonical state is attobot.messages.
 Use tool calls when you need to act. Final assistant text with no tool calls is
-queued automatically in attobot.outbox.
-Do not claim that external delivery happened; attobot.outbox is only a delivery
-queue.
+delivered to the operator automatically.
 Use SEARCH for web discovery, WEBFETCH to read a URL, SQL for database work,
 and WRITE_BLOB for large or binary content.
 </harness>',
@@ -290,12 +288,15 @@ BEGIN
 END;
 $$;
 
--- TODO: move append message to downstream function that handles tool calls and outbox
-CREATE OR REPLACE FUNCTION attobot.record_assistant_from_http(
+-- Record the assistant turn from the LLM HTTP response: append the assistant
+-- message (with channel/chat_id so the outbound trigger delivers it) and the
+-- parsed tool_calls. No outbox — outbound delivery is trigger-driven.
+CREATE OR REPLACE FUNCTION attobot.record_assistant(
   p_agent_slug text,
   p_http_response jsonb,
-  p_turn_id bigint DEFAULT NULL,
-  p_requesting_user_id bigint DEFAULT NULL
+  p_requesting_user_id bigint DEFAULT NULL,
+  p_channel text DEFAULT NULL,
+  p_chat_id text DEFAULT NULL
 )
 RETURNS jsonb
 LANGUAGE plpgsql
@@ -308,23 +309,20 @@ DECLARE
   v_message jsonb;
   v_tool_calls jsonb;
   v_message_id bigint;
-  v_outbox_id bigint;
   v_content text;
-  v_call jsonb;
   v_payload jsonb;
-  v_count integer := 0;
 BEGIN
   v_status := attobot._http_status(p_http_response);
   v_body_text := coalesce(p_http_response->>'body', '');
 
   IF v_status < 200 OR v_status >= 300 THEN
     v_message_id := attobot.append_message(
-      p_agent_slug,
-      'system',
+      p_agent_slug, 'system',
       format('[llm http error %s] %s', v_status, left(v_body_text, 4000)),
-      jsonb_build_object('http_response', p_http_response)
+      jsonb_build_object('http_response', p_http_response),
+      NULL, p_channel, p_chat_id
     );
-    RETURN jsonb_build_object('message_id', v_message_id, 'tool_calls', 0, 'error', true);
+    RETURN jsonb_build_object('message_id', v_message_id, 'tool_calls', '[]'::jsonb, 'error', true);
   END IF;
 
   v_body := attobot._try_jsonb(v_body_text);
@@ -332,12 +330,12 @@ BEGIN
 
   IF v_message IS NULL OR v_message = 'null'::jsonb THEN
     v_message_id := attobot.append_message(
-      p_agent_slug,
-      'system',
+      p_agent_slug, 'system',
       '[llm parse error] missing choices[0].message',
-      jsonb_build_object('http_response', p_http_response)
+      jsonb_build_object('http_response', p_http_response),
+      NULL, p_channel, p_chat_id
     );
-    RETURN jsonb_build_object('message_id', v_message_id, 'tool_calls', 0, 'error', true);
+    RETURN jsonb_build_object('message_id', v_message_id, 'tool_calls', '[]'::jsonb, 'error', true);
   END IF;
 
   v_content := coalesce(v_message->>'content', '');
@@ -346,39 +344,18 @@ BEGIN
     ELSE '[]'::jsonb
   END;
 
-  FOR v_call IN SELECT value FROM jsonb_array_elements(v_tool_calls)
-  LOOP
-    v_count := v_count + 1;
-  END LOOP;
-
   v_payload := jsonb_build_object('raw', v_message, 'tool_calls', v_tool_calls)
-    -- Stamp the requesting user so tool calls spawned from this assistant
-    -- message can run with that user's RLS scope (see _execute_sync_tool_call).
+    -- Stamp the requesting user so tool calls can run with that user's scope.
     || jsonb_build_object('requesting_user_id', p_requesting_user_id);
-  IF v_count > 0 AND p_turn_id IS NOT NULL THEN
-    v_payload := v_payload || jsonb_build_object(
-      'turn_id', p_turn_id,
-      'tool_signal_name', format('attobot:%s:turn:%s:tools', p_agent_slug, p_turn_id)
-    );
-  END IF;
 
   v_message_id := attobot.append_message(
-    p_agent_slug,
-    'assistant',
-    v_content,
-    v_payload
+    p_agent_slug, 'assistant', v_content, v_payload,
+    NULL, p_channel, p_chat_id
   );
-
-  IF v_count = 0 AND v_content <> '' THEN
-    INSERT INTO attobot.outbox(agent_id, channel, body)
-    VALUES (v_agent_id, 'chat', jsonb_build_object('text', v_content))
-    RETURNING id INTO v_outbox_id;
-  END IF;
 
   RETURN jsonb_strip_nulls(jsonb_build_object(
     'message_id', v_message_id,
-    'tool_calls', v_count,
-    'outbox_id', v_outbox_id,
+    'tool_calls', v_tool_calls,
     'error', false
   ));
 END;
