@@ -18,121 +18,76 @@ AS $$
   );
 $$;
 
--- TODO: infer tool schemas from functions defined in attotools
-CREATE OR REPLACE FUNCTION attotools._tool_schemas()
+-- Tool schemas are inferred from the attotools._tool_* functions: parameter
+-- names/types and required-vs-optional come from pg_proc (pronargdefaults marks
+-- the trailing optional args), enum values from pg_enum, and the description
+-- from COMMENT ON FUNCTION. Defined here in 21; the _tool_* functions live in 22
+-- but are read from the catalog only at call time (during an agent turn), so the
+-- load order is fine.
+CREATE OR REPLACE FUNCTION attotools.tool_schemas()
 RETURNS jsonb
 LANGUAGE sql
 STABLE
 AS $$
-  SELECT jsonb_build_array(
-    jsonb_build_object(
-      'type', 'function',
-      'function', jsonb_build_object(
-        'name', 'SEARCH',
-        'description', 'Search the public web and return a JSON list of result titles, URLs, and snippets.',
-        'parameters', jsonb_build_object(
-          'type', 'object',
-          'properties', jsonb_build_object(
-            'query', jsonb_build_object('type', 'string'),
-            'limit', jsonb_build_object('type', 'integer')
-          ),
-          'required', jsonb_build_array('query')
+  WITH tools AS (
+    SELECT
+      p.oid,
+      upper(substr(p.proname, 7))                     AS tool_name,
+      p.pronargs,
+      p.pronargdefaults,
+      obj_description(p.oid, 'pg_proc')               AS description,
+      coalesce(p.proallargtypes, p.proargtypes::oid[]) AS argtypes,
+      p.proargnames
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'attotools'
+      AND p.proname ~ '^_tool_'
+  ),
+  args AS (
+    SELECT
+      t.tool_name,
+      t.description,
+      a.ordinality                                      AS pos,
+      an.argname,
+      regexp_replace(an.argname, '^p_', '')             AS param_name,
+      (a.ordinality <= t.pronargs - t.pronargdefaults)  AS required,
+      CASE
+        WHEN ty.typtype = 'e' THEN
+          jsonb_build_object(
+            'type', 'string',
+            'enum', (SELECT jsonb_agg(e.enumlabel ORDER BY e.enumsortorder)
+                     FROM pg_enum e WHERE e.enumtypid = ty.oid)
+          )
+        WHEN ty.typname IN ('int2', 'int4', 'int8')        THEN jsonb_build_object('type', 'integer')
+        WHEN ty.typname = 'bool'                           THEN jsonb_build_object('type', 'boolean')
+        WHEN ty.typname IN ('float4', 'float8', 'numeric') THEN jsonb_build_object('type', 'number')
+        ELSE jsonb_build_object('type', 'string')
+      END AS schema
+    FROM tools t
+    LEFT JOIN LATERAL unnest(t.argtypes) WITH ORDINALITY AS a(argtypeoid, ordinality) ON true
+    LEFT JOIN LATERAL unnest(t.proargnames) WITH ORDINALITY AS an(argname, ordinality) ON an.ordinality = a.ordinality
+    JOIN pg_type ty ON ty.oid = a.argtypeoid
+  ),
+  tool_obj AS (
+    SELECT
+      tool_name,
+      jsonb_build_object(
+        'type', 'function',
+        'function', jsonb_build_object(
+          'name', tool_name,
+          'description', description,
+          'parameters', jsonb_build_object(
+            'type', 'object',
+            'properties', coalesce(jsonb_object_agg(param_name, schema) FILTER (WHERE argname IS NOT NULL), '{}'::jsonb),
+            'required',   coalesce(jsonb_agg(param_name ORDER BY pos) FILTER (WHERE required), '[]'::jsonb)
+          )
         )
-      )
-    ),
-    jsonb_build_object(
-      'type', 'function',
-      'function', jsonb_build_object(
-        'name', 'WEBFETCH',
-        'description', 'Fetch an HTTP or HTTPS URL and return status, content type, effective URL, and a truncated text body.',
-        'parameters', jsonb_build_object(
-          'type', 'object',
-          'properties', jsonb_build_object(
-            'url', jsonb_build_object('type', 'string'),
-            'max_bytes', jsonb_build_object('type', 'integer')
-          ),
-          'required', jsonb_build_array('url')
-        )
-      )
-    ),
-    jsonb_build_object(
-      'type', 'function',
-      'function', jsonb_build_object(
-        'name', 'SQL',
-        'description', 'Run one semicolon-free SQL query inside PostgreSQL. The query must return rows. For writes, use a data-modifying CTE with RETURNING.',
-        'parameters', jsonb_build_object(
-          'type', 'object',
-          'properties', jsonb_build_object(
-            'query', jsonb_build_object('type', 'string')
-          ),
-          'required', jsonb_build_array('query')
-        )
-      )
-    ),
-    jsonb_build_object(
-      'type', 'function',
-      'function', jsonb_build_object(
-        'name', 'SEND_ATTACHMENT',
-        'description', 'Send blob content as a Telegram document attachment. Use WRITE_BLOB first, then pass the returned hash.',
-        'parameters', jsonb_build_object(
-          'type', 'object',
-          'properties', jsonb_build_object(
-            'hash', jsonb_build_object('type', 'string'),
-            'filename', jsonb_build_object('type', 'string'),
-            'caption', jsonb_build_object('type', 'string'),
-            'mime_type', jsonb_build_object('type', 'string')
-          ),
-          'required', jsonb_build_array('hash')
-        )
-      )
-    ),
-    jsonb_build_object(
-      'type', 'function',
-      'function', jsonb_build_object(
-        'name', 'APPEND_MESSAGE',
-        'description', 'Append a message to an agent stream.',
-        'parameters', jsonb_build_object(
-          'type', 'object',
-          'properties', jsonb_build_object(
-            'agent', jsonb_build_object('type', 'string'),
-            'role', jsonb_build_object('type', 'string', 'enum', jsonb_build_array('system', 'user')),
-            'content', jsonb_build_object('type', 'string')
-          ),
-          'required', jsonb_build_array('content')
-        )
-      )
-    ),
-    jsonb_build_object(
-      'type', 'function',
-      'function', jsonb_build_object(
-        'name', 'WRITE_BLOB',
-        'description', 'Write data to attotools.blobs. The content is decoded using encoding: base64, hex, escape, or a PostgreSQL text encoding such as UTF8, LATIN1, or WIN1252.',
-        'parameters', jsonb_build_object(
-          'type', 'object',
-          'properties', jsonb_build_object(
-            'content', jsonb_build_object('type', 'string'),
-            'encoding', jsonb_build_object('type', 'string')
-          ),
-          'required', jsonb_build_array('content', 'encoding')
-        )
-      )
-    ),
-    jsonb_build_object(
-      'type', 'function',
-      'function', jsonb_build_object(
-        'name', 'READ_BLOB',
-        'description', 'Read blob data by hash. The result is encoded using encoding: base64, hex, escape, or a PostgreSQL text encoding such as UTF8.',
-        'parameters', jsonb_build_object(
-          'type', 'object',
-          'properties', jsonb_build_object(
-            'hash', jsonb_build_object('type', 'string'),
-            'encoding', jsonb_build_object('type', 'string')
-          ),
-          'required', jsonb_build_array('hash')
-        )
-      )
-    )
-  );
+      ) AS obj
+    FROM args
+    GROUP BY tool_name, description
+  )
+  SELECT coalesce(jsonb_agg(obj ORDER BY tool_name), '[]'::jsonb)
+  FROM tool_obj;
 $$;
 
 CREATE OR REPLACE FUNCTION attobot._memory_prompt(p_agent_id bigint)
@@ -144,18 +99,19 @@ AS $$
     string_agg(
       format(
         '- memory_id=%s source_message_ids=[%s]: %s',
-        id,
-        array_to_string(source_message_ids, ','),
-        content
+        m.id,
+        (SELECT coalesce(string_agg(ms.message_id::text, ',' ORDER BY ms.message_id), '')
+         FROM attobot.memory_sources ms WHERE ms.memory_id = m.id),
+        m.content
       ),
       E'\n'
-      ORDER BY id
+      ORDER BY m.id
     ),
     ''
   )
-  FROM attobot.memory
-  WHERE agent_id = p_agent_id
-    AND enabled;
+  FROM attobot.memory m
+  WHERE m.agent_id = p_agent_id
+    AND m.enabled;
 $$;
 
 CREATE OR REPLACE FUNCTION attobot._system_prompt(p_agent_id bigint)
@@ -234,7 +190,7 @@ BEGIN
         'role', 'system',
         'content', attobot._system_prompt(v_agent.id)
       )) || coalesce(v_messages, '[]'::jsonb),
-    'tools', attotools._tool_schemas()
+    'tools', attotools.tool_schemas()
   );
 
   IF v_model.reasoning_effort <> '' THEN

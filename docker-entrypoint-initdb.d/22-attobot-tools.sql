@@ -1,3 +1,20 @@
+-- Agent-scoped, content-addressed blob store. Large/binary content is kept out
+-- of the message stream and referenced by hash. EXTERNAL storage so bytea is
+-- neither compressed nor inlined.
+CREATE TABLE IF NOT EXISTS attotools.blobs (
+  agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
+  hash text NOT NULL,
+  content bytea NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, hash)
+);
+
+ALTER TABLE attotools.blobs ALTER COLUMN content SET STORAGE EXTERNAL;
+
+-- Role values accepted by APPEND_MESSAGE. Declared as an enum so the tool-schema
+-- introspection (attotools.tool_schemas) derives the role enum list from pg_enum.
+CREATE TYPE attotools.memory_role AS ENUM ('system', 'user');
+
 CREATE OR REPLACE FUNCTION attotools._append_tool_message(
   p_agent_id bigint,
   p_tool_call_id text,
@@ -21,60 +38,74 @@ $$;
 -- attobot_service) does the privileged append so this works even when the
 -- caller is the anonymous acting role.
 CREATE OR REPLACE FUNCTION attotools._tool_send_attachment(
-  p_agent_id bigint,
-  p_args jsonb
+  p_hash text,
+  p_filename text DEFAULT '',
+  p_caption text DEFAULT '',
+  p_mime_type text DEFAULT ''
 )
 RETURNS text
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  v_hash text := btrim(coalesce(p_args->>'hash', ''));
+  v_agent_id bigint := nullif(current_setting('attobot.current_agent_id', true), '')::bigint;
+  v_hash text := btrim(coalesce(p_hash, ''));
   v_slug text;
   v_chat_id text;
 BEGIN
+  IF v_agent_id IS NULL THEN
+    RAISE EXCEPTION 'SEND_ATTACHMENT has no current agent context';
+  END IF;
   IF v_hash = '' THEN
     RAISE EXCEPTION 'SEND_ATTACHMENT requires hash';
   END IF;
 
   IF NOT EXISTS (
-    SELECT 1 FROM attotools.blobs WHERE agent_id = p_agent_id AND hash = v_hash
+    SELECT 1 FROM attotools.blobs WHERE agent_id = v_agent_id AND hash = v_hash
   ) THEN
     RAISE EXCEPTION 'blob not found: %', v_hash;
   END IF;
 
   SELECT slug, chat_id INTO v_slug, v_chat_id
   FROM attobot.messages m JOIN attobot.agents a ON a.id = m.agent_id
-  WHERE m.agent_id = p_agent_id AND m.role = 'user'
+  WHERE m.agent_id = v_agent_id AND m.role = 'user'
   ORDER BY m.id DESC LIMIT 1;
 
   PERFORM attobot.queue_outbound_attachment(
     v_slug, v_hash,
-    nullif(p_args->>'filename', ''),
-    nullif(p_args->>'caption', ''),
-    nullif(p_args->>'mime_type', ''),
+    nullif(p_filename, ''),
+    nullif(p_caption, ''),
+    nullif(p_mime_type, ''),
     v_chat_id
   );
 
   RETURN jsonb_build_object('queued', true, 'blob_hash', v_hash)::text;
 END;
 $$;
+COMMENT ON FUNCTION attotools._tool_send_attachment(text, text, text, text) IS 'Send blob content as a Telegram document attachment. Use WRITE_BLOB first, then pass the returned hash.';
 
 CREATE OR REPLACE FUNCTION attotools._tool_append_message(
-  p_args jsonb,
-  p_agent_slug text
+  p_content text,
+  p_role attotools.memory_role DEFAULT 'system',
+  p_agent text DEFAULT NULL
 )
 RETURNS text
 LANGUAGE plpgsql
 AS $$
+DECLARE
+  v_slug text := p_agent;
 BEGIN
-  PERFORM attobot.append_message(
-    coalesce(p_args->>'agent', p_agent_slug),
-    coalesce(p_args->>'role', 'system'),
-    coalesce(p_args->>'content', '')
-  );
+  -- Default to the current agent (from the harness GUC) when no target is given.
+  IF v_slug IS NULL THEN
+    SELECT a.slug INTO v_slug
+    FROM attobot.agents a
+    WHERE a.id = nullif(current_setting('attobot.current_agent_id', true), '')::bigint;
+  END IF;
+
+  PERFORM attobot.append_message(v_slug, p_role::text, coalesce(p_content, ''));
   RETURN 'appended';
 END;
 $$;
+COMMENT ON FUNCTION attotools._tool_append_message(text, attotools.memory_role, text) IS 'Append a message to an agent stream.';
 
 CREATE OR REPLACE FUNCTION attotools._blob_decode_content(
   p_content text,
@@ -136,21 +167,22 @@ END;
 $$;
 
 CREATE OR REPLACE FUNCTION attotools._tool_write_blob(
-  p_agent_id bigint,
-  p_args jsonb
+  p_content text,
+  p_encoding text
 )
 RETURNS text
 LANGUAGE plpgsql
 AS $$
 DECLARE
+  v_agent_id bigint := nullif(current_setting('attobot.current_agent_id', true), '')::bigint;
   v_bytes bytea;
   v_hash text;
 BEGIN
-  v_bytes := attotools._blob_decode_content(p_args->>'content', p_args->>'encoding');
+  v_bytes := attotools._blob_decode_content(p_content, p_encoding);
   v_hash := left(md5(v_bytes), 12);
 
   INSERT INTO attotools.blobs(agent_id, hash, content)
-  VALUES (p_agent_id, v_hash, v_bytes)
+  VALUES (v_agent_id, v_hash, v_bytes)
   ON CONFLICT (agent_id, hash) DO NOTHING;
 
   RETURN jsonb_build_object(
@@ -160,28 +192,31 @@ BEGIN
   )::text;
 END;
 $$;
+COMMENT ON FUNCTION attotools._tool_write_blob(text, text) IS 'Write data to attotools.blobs. The content is decoded using encoding: base64, hex, escape, or a PostgreSQL text encoding such as UTF8, LATIN1, or WIN1252.';
 
 CREATE OR REPLACE FUNCTION attotools._tool_read_blob(
-  p_agent_id bigint,
-  p_args jsonb
+  p_hash text,
+  p_encoding text DEFAULT 'UTF8'
 )
 RETURNS text
 LANGUAGE plpgsql
 AS $$
 DECLARE
+  v_agent_id bigint := nullif(current_setting('attobot.current_agent_id', true), '')::bigint;
   v_content bytea;
 BEGIN
   SELECT content INTO v_content
   FROM attotools.blobs
-  WHERE agent_id = p_agent_id AND hash = p_args->>'hash';
+  WHERE agent_id = v_agent_id AND hash = p_hash;
 
   IF v_content IS NULL THEN
     RETURN 'error: blob not found';
   END IF;
 
-  RETURN attotools._blob_encode_content(v_content, coalesce(p_args->>'encoding', 'UTF8'));
+  RETURN attotools._blob_encode_content(v_content, coalesce(p_encoding, 'UTF8'));
 END;
 $$;
+COMMENT ON FUNCTION attotools._tool_read_blob(text, text) IS 'Read blob data by hash. The result is encoded using encoding: base64, hex, escape, or a PostgreSQL text encoding such as UTF8.';
 
 CREATE OR REPLACE FUNCTION attotools._url_decode(p_text text)
 RETURNS text
@@ -394,7 +429,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attotools._tool_sql(p_args jsonb)
+CREATE OR REPLACE FUNCTION attotools._tool_sql(p_query text)
 RETURNS text
 LANGUAGE plpgsql
 AS $$
@@ -402,7 +437,7 @@ DECLARE
   v_query text;
   v_rows jsonb;
 BEGIN
-  v_query := btrim(coalesce(p_args->>'query', ''));
+  v_query := btrim(coalesce(p_query, ''));
   IF v_query = '' THEN
     RAISE EXCEPTION 'SQL tool requires query';
   END IF;
@@ -422,6 +457,7 @@ BEGIN
   ));
 END;
 $$;
+COMMENT ON FUNCTION attotools._tool_sql(text) IS 'Run one semicolon-free SQL query inside PostgreSQL. The query must return rows. For writes, use a data-modifying CTE with RETURNING.';
 
 -- Build the result text of a WEBFETCH from its http response (no append).
 CREATE OR REPLACE FUNCTION attotools._webfetch_result(
@@ -470,6 +506,70 @@ BEGIN
 END;
 $$;
 
+-- Build the SEARCH future (a df http graph). Returns the graph text, or an error
+-- result text when the query is empty. Introspected as the SEARCH tool schema.
+CREATE OR REPLACE FUNCTION attotools._tool_search(
+  p_query text,
+  p_limit integer DEFAULT 5
+)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = attobot, attotools, public, pg_temp
+AS $$
+DECLARE
+  v_url text;
+  v_limit integer := least(greatest(coalesce(p_limit, 5), 1), 10);
+BEGIN
+  IF btrim(coalesce(p_query, '')) = '' THEN
+    RETURN format('SELECT %L::text AS result', 'error: SEARCH requires query');
+  END IF;
+
+  v_url := 'https://www.bing.com/search?q=' || attotools._url_encode(p_query);
+  RETURN df.http(
+    v_url, 'GET', '',
+    jsonb_build_object(
+      'User-Agent', 'Mozilla/5.0 (compatible; attobot-search/1.0)',
+      'Accept', 'text/html,application/xhtml+xml,application/xml,text/plain,*/*;q=0.8'
+    ), 30
+  ) |=> 'http'
+    ~> format(
+      'SELECT attotools._search_result(%L::jsonb, $http::jsonb)::text AS result',
+      jsonb_build_object('query', p_query, 'limit', v_limit)::text
+    );
+END;
+$$;
+COMMENT ON FUNCTION attotools._tool_search(text, integer) IS 'Search the public web and return a JSON list of result titles, URLs, and snippets.';
+
+-- Build the WEBFETCH future (a df http graph). Returns the graph text, or an
+-- error result text for non-public URLs. Introspected as the WEBFETCH tool schema.
+CREATE OR REPLACE FUNCTION attotools._tool_webfetch(
+  p_url text,
+  p_max_bytes integer DEFAULT 20000
+)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = attobot, attotools, public, pg_temp
+AS $$
+BEGIN
+  IF NOT attotools._http_url_allowed(p_url) THEN
+    RETURN format('SELECT %L::text AS result', 'error: WEBFETCH requires a public http(s) URL');
+  END IF;
+
+  RETURN df.http(
+    p_url, 'GET', '',
+    jsonb_build_object(
+      'User-Agent', 'attobot-webfetch/1.0',
+      'Accept', 'text/html,application/xhtml+xml,application/xml,text/plain,*/*;q=0.8'
+    ), 30
+  ) |=> 'http'
+    ~> format(
+      'SELECT attotools._webfetch_result(%L::jsonb, $http::jsonb)::text AS result',
+      jsonb_build_object('url', p_url, 'max_bytes', p_max_bytes)::text
+    );
+END;
+$$;
+COMMENT ON FUNCTION attotools._tool_webfetch(text, integer) IS 'Fetch an HTTP or HTTPS URL and return status, content type, effective URL, and a truncated text body.';
+
 -- Run one synchronous tool's WORK under the acting role (SET ROLE + GUCs), then
 -- RESET. SECURITY INVOKER — SET ROLE is forbidden inside SECURITY DEFINER. The
 -- instance that calls this is submitted by attobot_service; we drop to the
@@ -501,12 +601,23 @@ BEGIN
   PERFORM set_config('attobot.current_telegram_chat_id', coalesce(p_chat_id, ''), true);
   PERFORM set_config('attobot.current_user_id', coalesce(p_user_id::text, ''), true);
   BEGIN
+    -- Agent context reaches the tool functions via GUCs (they no longer take an
+    -- agent_id/agent_slug param, so every parameter is LLM-facing & introspectable).
     v_result := CASE p_name
-      WHEN 'SQL' THEN attotools._tool_sql(p_args)
-      WHEN 'SEND_ATTACHMENT' THEN attotools._tool_send_attachment(p_agent_id, p_args)
-      WHEN 'APPEND_MESSAGE' THEN attotools._tool_append_message(p_args, p_agent_slug)
-      WHEN 'WRITE_BLOB' THEN attotools._tool_write_blob(p_agent_id, p_args)
-      WHEN 'READ_BLOB' THEN attotools._tool_read_blob(p_agent_id, p_args)
+      WHEN 'SQL' THEN attotools._tool_sql(coalesce(p_args->>'query', ''))
+      WHEN 'SEND_ATTACHMENT' THEN attotools._tool_send_attachment(
+            coalesce(p_args->>'hash', ''),
+            coalesce(p_args->>'filename', ''),
+            coalesce(p_args->>'caption', ''),
+            coalesce(p_args->>'mime_type', ''))
+      WHEN 'APPEND_MESSAGE' THEN attotools._tool_append_message(
+            coalesce(p_args->>'content', ''),
+            coalesce(p_args->>'role', 'system')::attotools.memory_role,
+            p_args->>'agent')
+      WHEN 'WRITE_BLOB' THEN attotools._tool_write_blob(
+            coalesce(p_args->>'content', ''), coalesce(p_args->>'encoding', ''))
+      WHEN 'READ_BLOB' THEN attotools._tool_read_blob(
+            coalesce(p_args->>'hash', ''), coalesce(p_args->>'encoding', 'UTF8'))
       ELSE NULL
     END;
   EXCEPTION WHEN OTHERS THEN
@@ -542,40 +653,22 @@ SECURITY INVOKER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE
-  v_url text;
+  v_limit text;
+  v_max_bytes text;
 BEGIN
   IF p_name = 'WEBFETCH' THEN
-    v_url := btrim(coalesce(p_args->>'url', ''));
-    IF attotools._http_url_allowed(v_url) THEN
-      RETURN df.http(
-        v_url, 'GET', '',
-        jsonb_build_object(
-          'User-Agent', 'attobot-webfetch/1.0',
-          'Accept', 'text/html,application/xhtml+xml,application/xml,text/plain,*/*;q=0.8'
-        ), 30
-      ) |=> 'http'
-        ~> format(
-          'SELECT attotools._webfetch_result(%L::jsonb, $http::jsonb)::text AS result',
-          p_args::text
-        );
-    END IF;
-    RETURN format('SELECT %L::text AS result', 'error: WEBFETCH requires a public http(s) URL');
+    -- Safe integer parse: a malformed max_bytes must not abort the whole turn.
+    v_max_bytes := p_args->>'max_bytes';
+    RETURN attotools._tool_webfetch(
+      btrim(coalesce(p_args->>'url', '')),
+      CASE WHEN v_max_bytes ~ '^[0-9]+$' THEN v_max_bytes::integer ELSE 20000 END
+    );
   ELSIF p_name = 'SEARCH' THEN
-    IF btrim(coalesce(p_args->>'query', '')) = '' THEN
-      RETURN format('SELECT %L::text AS result', 'error: SEARCH requires query');
-    END IF;
-    v_url := 'https://www.bing.com/search?q=' || attotools._url_encode(p_args->>'query');
-    RETURN df.http(
-      v_url, 'GET', '',
-      jsonb_build_object(
-        'User-Agent', 'Mozilla/5.0 (compatible; attobot-search/1.0)',
-        'Accept', 'text/html,application/xhtml+xml,application/xml,text/plain,*/*;q=0.8'
-      ), 30
-    ) |=> 'http'
-      ~> format(
-        'SELECT attotools._search_result(%L::jsonb, $http::jsonb)::text AS result',
-        p_args::text
-      );
+    v_limit := p_args->>'limit';
+    RETURN attotools._tool_search(
+      coalesce(p_args->>'query', ''),
+      CASE WHEN v_limit ~ '^[0-9]+$' THEN v_limit::integer ELSE 5 END
+    );
   END IF;
 
   -- synchronous tools run as the acting role

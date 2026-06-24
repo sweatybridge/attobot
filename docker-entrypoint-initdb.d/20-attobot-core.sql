@@ -197,37 +197,24 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot._validate_memory_source_messages()
+-- Touch updated_at on any memory write. (This trigger previously also validated
+-- memory.source_message_ids; that array was replaced by the memory_sources
+-- junction table, whose composite foreign keys enforce referential integrity
+-- directly, so the validation is gone and only the timestamp touch remains.)
+CREATE OR REPLACE FUNCTION attobot._touch_memory_updated_at()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
-DECLARE
-  v_missing bigint[];
 BEGIN
-  SELECT array_agg(source_id ORDER BY source_id)
-  INTO v_missing
-  FROM unnest(NEW.source_message_ids) AS source_id
-  WHERE NOT EXISTS (
-    SELECT 1
-    FROM attobot.messages
-    WHERE id = source_id
-      AND agent_id = NEW.agent_id
-  );
-
-  IF v_missing IS NOT NULL THEN
-    RAISE EXCEPTION 'memory source_message_ids must reference messages for the same agent: %', v_missing;
-  END IF;
-
   NEW.updated_at := now();
   RETURN NEW;
 END;
 $$;
 
--- TODO: separate relationship table for memory source messages to enforce referential integrity
-CREATE OR REPLACE TRIGGER memory_validate_source_messages_trigger
-BEFORE INSERT OR UPDATE OF agent_id, content, source_message_ids, payload, enabled ON attobot.memory
+CREATE OR REPLACE TRIGGER memory_touch_updated_at_trigger
+BEFORE INSERT OR UPDATE OF agent_id, content, payload, enabled ON attobot.memory
 FOR EACH ROW
-EXECUTE FUNCTION attobot._validate_memory_source_messages();
+EXECUTE FUNCTION attobot._touch_memory_updated_at();
 
 CREATE OR REPLACE FUNCTION attobot._try_jsonb(p_text text)
 RETURNS jsonb

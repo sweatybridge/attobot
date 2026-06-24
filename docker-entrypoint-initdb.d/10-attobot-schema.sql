@@ -59,29 +59,36 @@ CREATE TABLE IF NOT EXISTS attobot.memory (
   id bigserial PRIMARY KEY,
   agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
   content text NOT NULL,
-  source_message_ids bigint[] NOT NULL,
   payload jsonb NOT NULL DEFAULT '{}'::jsonb,
   enabled boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
-  CHECK (btrim(content) <> ''),
-  CHECK (cardinality(source_message_ids) > 0),
-  CHECK (array_position(source_message_ids, NULL) IS NULL)
+  CHECK (btrim(content) <> '')
 );
 
 CREATE INDEX IF NOT EXISTS memory_agent_enabled_id_idx
   ON attobot.memory(agent_id, enabled, id);
 
--- TODO: move to 22-attobot-tools.sql
-CREATE TABLE IF NOT EXISTS attotools.blobs (
-  agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
-  hash text NOT NULL,
-  content bytea NOT NULL,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  PRIMARY KEY (agent_id, hash)
-);
+-- Referential-integrity backing for the (agent_id, id) pairs the composite
+-- foreign keys below target. id is already the primary key, so these unique
+-- constraints add no new uniqueness; they exist only as FK targets.
+ALTER TABLE attobot.messages ADD CONSTRAINT messages_agent_id_id_key UNIQUE (agent_id, id);
+ALTER TABLE attobot.memory   ADD CONSTRAINT memory_id_agent_key     UNIQUE (id, agent_id);
 
-ALTER TABLE attotools.blobs ALTER COLUMN content SET STORAGE EXTERNAL;
+-- Junction table replacing memory.source_message_ids. The two composite foreign
+-- keys force memory.agent_id == messages.agent_id declaratively (same-agent
+-- integrity, with no trigger), and both cascade on delete of either parent. A
+-- memory may legitimately have zero sources.
+CREATE TABLE IF NOT EXISTS attobot.memory_sources (
+  memory_id  bigint NOT NULL,
+  agent_id   bigint NOT NULL,
+  message_id bigint NOT NULL,
+  PRIMARY KEY (memory_id, message_id),
+  FOREIGN KEY (memory_id, agent_id)
+    REFERENCES attobot.memory(id, agent_id) ON DELETE CASCADE,
+  FOREIGN KEY (agent_id, message_id)
+    REFERENCES attobot.messages(agent_id, id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS attobot.lifecycle (
   id bigserial PRIMARY KEY,

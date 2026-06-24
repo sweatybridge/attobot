@@ -238,8 +238,8 @@ SELECT attobot.ensure_scheduled_message_loop(
 - `attobot.models`: reusable model, endpoint, temperature, reasoning, context, and modality configuration.
 - `attobot.config`: per-agent configuration and secrets.
 - `attobot.messages`: canonical conversation stream.
-- `attobot.memory`: agent-scoped durable memories forwarded to the LLM; each
-  row stores `source_message_ids` for the messages it was constructed from.
+- `attobot.memory`: agent-scoped durable memories forwarded to the LLM. Each row
+  links to the messages it was constructed from via `attobot.memory_sources`.
 - `attobot.outbox`: outbound messages for chat relays or clients.
 - `attotools.blobs`: content-addressed large content storage as external `bytea`.
 - `attobot.lifecycle`: append-only operational events, including turn start,
