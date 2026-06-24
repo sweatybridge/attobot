@@ -25,7 +25,6 @@ RUN set -eux; \
 RUN set -eux; \
     echo "shared_preload_libraries = 'pg_durable'" >> /usr/share/postgresql/postgresql.conf.sample; \
     echo "pg_durable.database = 'postgres'" >> /usr/share/postgresql/postgresql.conf.sample; \
-    echo "pg_durable.worker_role = 'postgres'" >> /usr/share/postgresql/postgresql.conf.sample; \
-    echo "pg_durable.enable_superuser_instances = on" >> /usr/share/postgresql/postgresql.conf.sample
+    echo "pg_durable.worker_role = 'postgres'" >> /usr/share/postgresql/postgresql.conf.sample
 
 COPY docker-entrypoint-initdb.d/ /docker-entrypoint-initdb.d/

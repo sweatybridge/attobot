@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS attobot.agents (
   soul text NOT NULL DEFAULT '',
   model_id bigint NOT NULL REFERENCES attobot.models(id) ON DELETE RESTRICT,
   enabled boolean NOT NULL DEFAULT true,
+  max_turn integer NOT NULL DEFAULT 10,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -38,6 +39,8 @@ CREATE TABLE IF NOT EXISTS attobot.messages (
   role text NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
   content text NOT NULL DEFAULT '',
   payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  channel text,
+  chat_id text,
   tool_call_id text,
   created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -69,19 +72,7 @@ CREATE TABLE IF NOT EXISTS attobot.memory (
 CREATE INDEX IF NOT EXISTS memory_agent_enabled_id_idx
   ON attobot.memory(agent_id, enabled, id);
 
-CREATE TABLE IF NOT EXISTS attobot.outbox (
-  id bigserial PRIMARY KEY,
-  agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
-  channel text NOT NULL DEFAULT 'chat',
-  body jsonb NOT NULL,
-  status text NOT NULL DEFAULT 'pending'
-    CHECK (status IN ('pending', 'sending', 'sent', 'failed')),
-  created_at timestamptz NOT NULL DEFAULT now(),
-  sent_at timestamptz
-);
-
-CREATE INDEX IF NOT EXISTS outbox_agent_status_idx ON attobot.outbox(agent_id, status, id);
-
+-- TODO: move to 22-attobot-tools.sql
 CREATE TABLE IF NOT EXISTS attotools.blobs (
   agent_id bigint NOT NULL REFERENCES attobot.agents(id) ON DELETE CASCADE,
   hash text NOT NULL,
@@ -98,4 +89,22 @@ CREATE TABLE IF NOT EXISTS attobot.lifecycle (
   event text NOT NULL,
   detail jsonb NOT NULL DEFAULT '{}'::jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Channel-agnostic identity ledger. One row per (channel, external_id); today
+-- only 'telegram' is populated (by process_telegram_updates), but the shape
+-- supports future channels (discord, whatsapp) by new channel values.
+-- `tier` maps the user to an RLS role suffix (attobot_<tier>); it defaults to
+-- 'anonymous' and is promoted to 'authenticated' by an operator.
+CREATE TABLE IF NOT EXISTS attobot.users (
+  id bigserial PRIMARY KEY,
+  channel text NOT NULL CHECK (channel IN ('telegram', 'discord', 'whatsapp')),
+  external_id text NOT NULL,
+  username text,
+  display_name text,
+  tier text NOT NULL DEFAULT 'anonymous' CHECK (tier IN ('anonymous', 'authenticated')),
+  payload jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (channel, external_id)
 );

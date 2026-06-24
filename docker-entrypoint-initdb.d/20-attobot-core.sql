@@ -98,6 +98,39 @@ BEGIN
 END;
 $$;
 
+-- Upsert a channel user by (channel, external_id), refreshing profile fields,
+-- and return its internal id + tier. Called by intake to auto-track telegram
+-- users; tier is whatever is stored (default 'anonymous').
+CREATE OR REPLACE FUNCTION attobot.ensure_user(
+  p_channel text,
+  p_external_id text,
+  p_username text DEFAULT NULL,
+  p_display_name text DEFAULT NULL,
+  p_payload jsonb DEFAULT '{}'::jsonb
+)
+RETURNS TABLE(id bigint, tier text)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_id bigint;
+  v_tier text;
+BEGIN
+  INSERT INTO attobot.users(channel, external_id, username, display_name, payload)
+  VALUES (p_channel, p_external_id, p_username, p_display_name, p_payload)
+  ON CONFLICT (channel, external_id) DO UPDATE
+    SET username = EXCLUDED.username,
+        display_name = EXCLUDED.display_name,
+        payload = EXCLUDED.payload,
+        updated_at = now()
+  RETURNING attobot.users.id INTO v_id;
+
+  -- QUALIFY: the RETURNS TABLE columns (id, tier) shadow table column names.
+  SELECT u.tier INTO v_tier FROM attobot.users u WHERE u.id = v_id;
+
+  RETURN QUERY SELECT v_id, v_tier;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION attobot.set_config(
   p_agent_slug text,
   p_key text,
@@ -140,7 +173,9 @@ CREATE OR REPLACE FUNCTION attobot.append_message(
   p_role text,
   p_content text,
   p_payload jsonb DEFAULT '{}'::jsonb,
-  p_tool_call_id text DEFAULT NULL
+  p_tool_call_id text DEFAULT NULL,
+  p_channel text DEFAULT NULL,
+  p_chat_id text DEFAULT NULL
 )
 RETURNS bigint
 LANGUAGE plpgsql
@@ -149,8 +184,8 @@ DECLARE
   v_agent_id bigint := attobot.agent_id(p_agent_slug);
   v_id bigint;
 BEGIN
-  INSERT INTO attobot.messages(agent_id, role, content, payload, tool_call_id)
-  VALUES (v_agent_id, p_role, coalesce(p_content, ''), coalesce(p_payload, '{}'::jsonb), p_tool_call_id)
+  INSERT INTO attobot.messages(agent_id, role, content, payload, channel, chat_id, tool_call_id)
+  VALUES (v_agent_id, p_role, coalesce(p_content, ''), coalesce(p_payload, '{}'::jsonb), p_channel, p_chat_id, p_tool_call_id)
   RETURNING id INTO v_id;
 
   PERFORM attobot.log_event(
@@ -188,6 +223,7 @@ BEGIN
 END;
 $$;
 
+-- TODO: separate relationship table for memory source messages to enforce referential integrity
 CREATE OR REPLACE TRIGGER memory_validate_source_messages_trigger
 BEFORE INSERT OR UPDATE OF agent_id, content, source_message_ids, payload, enabled ON attobot.memory
 FOR EACH ROW
