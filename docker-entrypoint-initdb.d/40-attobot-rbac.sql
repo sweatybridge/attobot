@@ -201,21 +201,28 @@ CREATE POLICY memory_sources_subconscious_bypass ON attobot.memory_sources
 --   loop code does. LLM-authored SQL runs as the user tier (primary) or
 --   attobot_service (subconscious), neither of which can read secrets.
 --   attobot_service is the subconscious's broad, secret-free tool scope, so it
---   gets non-secret SELECT only. All writes go through attobot.set_config (a
---   function) as superuser/admin, so only admin gets direct table writes.
+--   gets non-secret SELECT only. Agent roles also write their own config rows
+--   (INSERT/UPDATE, no DELETE, scoped to current_agent_id) — e.g. poll_messages
+--   bumps telegram_update_offset as the agent role. Admin/superuser still owns
+--   bootstrap writes (configure_telegram / set_config) at init.
 -- ============================================================================
 
 GRANT SELECT ON attobot.config
+  TO attobot_anonymous, attobot_authenticated;
+GRANT SELECT, INSERT, UPDATE ON attobot.config
   TO attobot_agent_primary, attobot_agent_subconscious;
 GRANT SELECT, INSERT, UPDATE, DELETE ON attobot.config TO attobot_service;
 
 ALTER TABLE attobot.config ENABLE ROW LEVEL SECURITY;
 
--- agent roles: their own config rows (incl. secrets) — fixed loop code only
-DROP POLICY IF EXISTS config_agent_read_own ON attobot.config;
-CREATE POLICY config_agent_read_own ON attobot.config
-  FOR SELECT TO attobot_agent_primary, attobot_agent_subconscious
-  USING (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint);
+-- agent roles: write their own config rows. No DELETE is granted, so the FOR ALL
+-- policy still can't delete (mirrors messages_agent_all_own). Requires
+-- current_agent_id, which poll_messages binds (23-attobot-telegram.sql:128).
+DROP POLICY IF EXISTS config_agent_write_own ON attobot.config;
+CREATE POLICY config_agent_write_own ON attobot.config
+  FOR ALL TO attobot_agent_primary, attobot_agent_subconscious
+  USING (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint)
+  WITH CHECK (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint);
 
 -- user roles: read non-secret config rows only (e.g. model_id, not api_key)
 DROP POLICY IF EXISTS config_user_read_nonsecret ON attobot.config;

@@ -189,6 +189,12 @@ BEGIN
     RETURN v_existing;
   END IF;
 
+  -- Bind the agent GUC before any agent-scoped config read. This function is
+  -- SECURITY DEFINER owned by the agent role, so RLS on attobot.config binds us
+  -- (config_agent_read_own requires current_agent_id) — same requirement as
+  -- poll_messages. Without this the init-time call can't see telegram_token.
+  PERFORM set_config('attobot.current_agent_id', attobot.agent_id(p_agent_slug)::text, true);
+
   v_future := df.loop(
     format('SELECT attobot.telegram_get_updates_body(%L, %s)::text AS body', p_agent_slug, p_timeout) |=> 'req'
     ~> df.http(attobot._telegram_api_url(p_agent_slug, 'getUpdates'), 'POST', '$req',
