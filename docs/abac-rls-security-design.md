@@ -228,7 +228,7 @@ bypass policy (trusted compute); everything else scoped. Full set in
 
 When the primary agent runs the **SQL tool** during a user-requested turn, the
 query executes under the **requesting user's** RLS scope. (Other tools —
-APPEND_MESSAGE, blobs, attachments, web fetches — stay agent-scoped: they touch
+blobs, attachments, web fetches — stay agent-scoped: they touch
 agent-global state with no per-user dimension.)
 
 **Threading the requesting user.** Intake stamps the user onto the assistant

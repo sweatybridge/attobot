@@ -11,10 +11,6 @@ CREATE TABLE IF NOT EXISTS attotools.blobs (
 
 ALTER TABLE attotools.blobs ALTER COLUMN content SET STORAGE EXTERNAL;
 
--- Role values accepted by APPEND_MESSAGE. Declared as an enum so the tool-schema
--- introspection (attotools.tool_schemas) derives the role enum list from pg_enum.
-CREATE TYPE attotools.memory_role AS ENUM ('system', 'user');
-
 CREATE OR REPLACE FUNCTION attotools._append_tool_message(
   p_agent_id bigint,
   p_tool_call_id text,
@@ -82,30 +78,6 @@ BEGIN
 END;
 $$;
 COMMENT ON FUNCTION attotools._tool_send_attachment(text, text, text, text) IS 'Send blob content as a Telegram document attachment. Use WRITE_BLOB first, then pass the returned hash.';
-
-CREATE OR REPLACE FUNCTION attotools._tool_append_message(
-  p_content text,
-  p_role attotools.memory_role DEFAULT 'system',
-  p_agent text DEFAULT NULL
-)
-RETURNS text
-LANGUAGE plpgsql
-AS $$
-DECLARE
-  v_slug text := p_agent;
-BEGIN
-  -- Default to the current agent (from the harness GUC) when no target is given.
-  IF v_slug IS NULL THEN
-    SELECT a.slug INTO v_slug
-    FROM attobot.agents a
-    WHERE a.id = nullif(current_setting('attobot.current_agent_id', true), '')::bigint;
-  END IF;
-
-  PERFORM attobot.append_message(v_slug, p_role::text, coalesce(p_content, ''));
-  RETURN 'appended';
-END;
-$$;
-COMMENT ON FUNCTION attotools._tool_append_message(text, attotools.memory_role, text) IS 'Append a message to an agent stream.';
 
 CREATE OR REPLACE FUNCTION attotools._blob_decode_content(
   p_content text,
@@ -610,10 +582,6 @@ BEGIN
             coalesce(p_args->>'filename', ''),
             coalesce(p_args->>'caption', ''),
             coalesce(p_args->>'mime_type', ''))
-      WHEN 'APPEND_MESSAGE' THEN attotools._tool_append_message(
-            coalesce(p_args->>'content', ''),
-            coalesce(p_args->>'role', 'system')::attotools.memory_role,
-            p_args->>'agent')
       WHEN 'WRITE_BLOB' THEN attotools._tool_write_blob(
             coalesce(p_args->>'content', ''), coalesce(p_args->>'encoding', ''))
       WHEN 'READ_BLOB' THEN attotools._tool_read_blob(

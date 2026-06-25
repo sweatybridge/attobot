@@ -253,7 +253,6 @@ The LLM sees these database-native tools:
 - `WEBFETCH`: fetch a public HTTP(S) URL and return status, content type, effective URL, and a truncated text body.
 - `SQL`: run a single SQL query that returns rows.
 - `SEND_ATTACHMENT`: send a stored blob as a Telegram document attachment.
-- `APPEND_MESSAGE`: append a message to an agent stream.
 - `WRITE_BLOB`: write large or binary content into `attotools.blobs` using an explicit encoding.
 - `READ_BLOB`: read blob content by hash as `UTF8` text, `base64`, `hex`, `escape`, or another PostgreSQL text encoding.
 
