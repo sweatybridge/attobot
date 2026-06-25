@@ -573,8 +573,7 @@ DECLARE
 BEGIN
   EXECUTE format('SET ROLE %I', p_acting_role);
   PERFORM set_config('attobot.current_agent_id', p_agent_id::text, true);
-  PERFORM set_config('attobot.current_telegram_user_id', coalesce(p_user_external_id, ''), true);
-  PERFORM set_config('attobot.current_telegram_chat_id', coalesce(p_chat_id, ''), true);
+  PERFORM set_config('attobot.current_chat_id', coalesce(p_chat_id, ''), true);
   PERFORM set_config('attobot.current_user_id', coalesce(p_user_id::text, ''), true);
   BEGIN
     -- Agent context reaches the tool functions via GUCs (they no longer take an

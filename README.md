@@ -122,17 +122,17 @@ secret-free scope — so it can read every agent's `messages`/`memory` and inser
 or update any agent's `memory`/`memory_sources` (never delete) to review and
 correct them, without ever seeing secrets.
 
-| Table | `anonymous` | `authenticated` | `agent_primary` | `agent_subconscious` | `service` | `admin` |
-|---|---|---|---|---|---|---|
-| `agents` | SELECT | SELECT | SELECT | SELECT | SELECT | ALL |
-| `models` | SELECT | SELECT | SELECT | SELECT | SELECT | ALL |
-| `messages` | **SELECT chat-wide**; INSERT/UPDATE own; **no DELETE** | same | SELECT/INSERT/UPDATE own agent; no DELETE | SELECT/INSERT/UPDATE own agent; no DELETE | ALL | ALL |
-| `memory` | — | — | ALL own agent | **SELECT/INSERT/UPDATE all agents** | ALL | ALL |
-| `memory_sources` | — | — | ALL own agent | SELECT/INSERT/UPDATE all agents | ALL | ALL |
-| `config` | — | — | SELECT own (incl. secrets) | SELECT own (incl. secrets) | SELECT non-secret | ALL |
-| `lifecycle` | — | — | SELECT; INSERT | SELECT; INSERT | SELECT/INSERT/UPDATE | ALL |
-| `attotools.blobs` | — | — | SELECT/INSERT/UPDATE own agent | SELECT/INSERT/UPDATE own agent | ALL | ALL |
-| `users` | SELECT own row | SELECT own row | SELECT all; INSERT/UPDATE | SELECT all | SELECT all; INSERT | ALL |
+| Table | `anonymous` | `authenticated` | `agent_primary` | `agent_subconscious` | `service` |
+|---|---|---|---|---|---|
+| `agents` | SELECT | SELECT | SELECT | SELECT | SELECT |
+| `models` | SELECT | SELECT | SELECT | SELECT | SELECT |
+| `messages` | **SELECT chat-wide**; INSERT/UPDATE own; **no DELETE** | same | SELECT/INSERT/UPDATE own agent; no DELETE | SELECT/INSERT/UPDATE own agent; no DELETE | ALL |
+| `memory` | — | — | ALL own agent | **SELECT/INSERT/UPDATE all agents** | ALL |
+| `memory_sources` | — | — | ALL own agent | SELECT/INSERT/UPDATE all agents | ALL |
+| `config` | — | — | SELECT own (incl. secrets) | SELECT own (incl. secrets) | SELECT non-secret |
+| `lifecycle` | — | — | SELECT; INSERT | SELECT; INSERT | SELECT/INSERT/UPDATE |
+| `attotools.blobs` | — | — | SELECT/INSERT/UPDATE own agent | SELECT/INSERT/UPDATE own agent | ALL |
+| `users` | SELECT own row | SELECT own row | SELECT all; INSERT/UPDATE | SELECT all | SELECT all; INSERT |
 
 Two least-privilege decisions:
 
@@ -140,8 +140,8 @@ Two least-privilege decisions:
   `secret = true` config (`api_key`, `telegram_token`) — but only from fixed loop
   code that needs the key to call the model. The scopes the LLM actually authors
   SQL in (the user tier for primary, `attobot_service` for the subconscious)
-  cannot read secrets, so the model cannot exfiltrate them. Only `admin` sees all
-  secrets directly.
+  cannot read secrets, so the model cannot exfiltrate them. Only the superuser
+  sees all secrets directly.
 - **`messages` SELECT is chat-wide for users.** The whole conversation belongs
   to one configured chat = one agent, so a user sees all of it (including other
   users' messages and the agent's replies). INSERT/UPDATE stay pinned to their

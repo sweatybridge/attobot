@@ -100,7 +100,7 @@ $$;
 CREATE OR REPLACE FUNCTION attobot.after_user_message_loop()
 RETURNS trigger
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY INVOKER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE
@@ -146,7 +146,7 @@ EXECUTE FUNCTION attobot.after_user_message_loop();
 CREATE OR REPLACE FUNCTION attobot.after_outbound_message_send()
 RETURNS trigger
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY INVOKER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 BEGIN

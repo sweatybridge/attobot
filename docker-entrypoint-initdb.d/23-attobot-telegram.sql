@@ -254,7 +254,7 @@ $$;
 CREATE OR REPLACE FUNCTION attobot.send_message(p_message_id bigint)
 RETURNS jsonb
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY INVOKER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE
@@ -345,7 +345,7 @@ $$;
 CREATE OR REPLACE FUNCTION attobot.send_message_future(p_message_id bigint)
 RETURNS text
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY INVOKER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE

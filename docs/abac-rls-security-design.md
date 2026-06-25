@@ -28,7 +28,7 @@ security-critical path:
 
 - A **separate role per agent** (`attobot_agent_primary`,
   `attobot_agent_subconscious`), plus tiers `attobot_anonymous`,
-  `attobot_authenticated`, `attobot_service`, `attobot_admin`.
+  `attobot_authenticated`, `attobot_service`.
 - **Attributes** carried as session GUCs (`attobot.current_agent_id`,
   `attobot.current_telegram_user_id`, …) that policies read fail-closed.
 - A channel-agnostic **`attobot.users`** ledger that auto-tracks telegram user
@@ -74,7 +74,6 @@ re-architecting `pg_durable`'s `worker_role`.
 |---|---|---|
 | Telegram Bot API → us | **Yes (bot-token-authenticated)** | A delivered message's `from.id`/`chat.id` are trustworthy. |
 | The DB backend (`pg_durable`, triggers) | **Yes (trusted compute)** | Runs as `postgres` superuser. This is the orchestrator. |
-| Operators / admins | **Yes, audited** | Hold `attobot_admin`; actions logged in `lifecycle`. |
 | A telegram user in the group | **No** | Constrained by RLS; the agent's SQL runs as them. |
 
 RLS only constrains principals that are **not** superuser/table-owner. The
@@ -89,11 +88,10 @@ connections.
 ## 4. Roles
 
 ```text
-attobot_admin                 # bootstrap + maintenance
-└── attobot_service           # durable backend / pg_durable / cron
-
 attobot_agent_primary         # primary agent's turn execution
 attobot_agent_subconscious    # review/meta agent; never talks to operators
+
+attobot_service               # subconscious's broad tool scope; trusted compute
 
 attobot_authenticated         # a registered telegram operator (escalation tier)
 attobot_anonymous             # any telegram user in the configured group chat
@@ -156,24 +154,24 @@ approximation; per-message turns are a later refinement.)
 "own agent" for an agent role =
 `agent_id = current_setting('attobot.current_agent_id')::bigint`.
 
-| Table | `anonymous` | `authenticated` | `agent_primary` | `agent_subconscious` | `service` | `admin` |
-|---|---|---|---|---|---|---|
-| `agents` | SELECT | SELECT | SELECT | SELECT | SELECT | ALL |
-| `models` | SELECT | SELECT | SELECT | SELECT | SELECT | ALL |
-| `messages` | **SELECT chat-wide**; INSERT/UPDATE own; **no DELETE** | same | SELECT/INSERT/UPDATE own agent; no DELETE | SELECT primary agent | ALL | ALL |
-| `memory` | — | — | ALL own agent | SELECT primary; INSERT primary; UPDATE own | ALL | ALL |
-| `config` | — | — | SELECT own (incl. secrets) | SELECT own (incl. secrets) | SELECT non-secret | ALL |
-| `outbox` | — | — | INSERT/UPDATE own agent | — | ALL | ALL |
-| `lifecycle` | — | — | SELECT; INSERT own | SELECT; INSERT own | SELECT/INSERT/UPDATE | ALL |
-| `attotools.blobs` | — | — | SELECT/INSERT/UPDATE own agent | SELECT own | ALL | ALL |
-| `users` | SELECT own row | SELECT own row | SELECT all | SELECT all | SELECT all; INSERT | ALL |
+| Table | `anonymous` | `authenticated` | `agent_primary` | `agent_subconscious` | `service` |
+|---|---|---|---|---|---|
+| `agents` | SELECT | SELECT | SELECT | SELECT | SELECT |
+| `models` | SELECT | SELECT | SELECT | SELECT | SELECT |
+| `messages` | **SELECT chat-wide**; INSERT/UPDATE own; **no DELETE** | same | SELECT/INSERT/UPDATE own agent; no DELETE | SELECT primary agent | ALL |
+| `memory` | — | — | ALL own agent | SELECT primary; INSERT primary; UPDATE own | ALL |
+| `config` | — | — | SELECT own (incl. secrets) | SELECT own (incl. secrets) | SELECT non-secret |
+| `outbox` | — | — | INSERT/UPDATE own agent | — | ALL |
+| `lifecycle` | — | — | SELECT; INSERT own | SELECT; INSERT own | SELECT/INSERT/UPDATE |
+| `attotools.blobs` | — | — | SELECT/INSERT/UPDATE own agent | SELECT own | ALL |
+| `users` | SELECT own row | SELECT own row | SELECT all | SELECT all | SELECT all; INSERT |
 
 Two least-privilege decisions:
 
 - **Secrets are kept out of every LLM-tool scope.** Agent roles now read their
   own `secret = true` config (`api_key`, `telegram_token`) from fixed loop code;
   the LLM-authored SQL scopes (user tier, `attobot_service`) still cannot. Only
-  `admin` sees all secrets directly.
+  the superuser sees all secrets directly.
 - **`messages` SELECT is chat-wide for users.** The whole conversation belongs
   to one configured chat = one agent, so a user sees all of it (including other
   users' messages and the agent's replies). INSERT/UPDATE stay pinned to their
@@ -220,15 +218,15 @@ GRANT INSERT, UPDATE, SELECT ON attobot.messages TO attobot_anonymous, attobot_a
 
 ## 9. RLS policy catalog
 
-All tables: `ENABLE ROW LEVEL SECURITY` (never `FORCE`). `service`/`admin` get a
+All tables: `ENABLE ROW LEVEL SECURITY` (never `FORCE`). `service` gets a
 bypass policy (trusted compute); everything else scoped. Full set in
 `docker-entrypoint-initdb.d/40-attobot-rbac.sql`. Highlights:
 
 - **messages** — as [§8](#8-the-worked-example-anonymous-group-chat-user-on-messages); agent roles `FOR ALL` on `agent_id = current_agent_id`.
-- **users** — own row by `id = current_user_id`; agent/service read all; service inserts; admin all.
+- **users** — own row by `id = current_user_id`; agent/service read all; service inserts; full access via service/superuser.
 - **config** — agent roles `SELECT` non-secret own rows only; writes via `set_config`.
 - **memory / outbox / blobs** — agent-scoped by `current_agent_id`; subconscious reads/writes any agent's memory.
-- **agents / models** — PUBLIC read; admin writes.
+- **agents / models** — PUBLIC read; service/superuser writes.
 - **lifecycle** — internal; agent+service read/insert; no user access.
 
 ---
@@ -306,8 +304,8 @@ so its own operations are unrestricted).
 | Agent's own context-build (`compose_llm_request`, append, outbox) | `attobot_service` | service bypass (the agent's own conversation) |
 | pg_durable background worker | `postgres` (superuser) | required by pg_durable — `worker_role` must be superuser |
 
-`df.grant_usage` is granted to the system roles (`service`, `admin` with HTTP;
-`agent_primary`, `agent_subconscious` basic). `attobot_service` is a member of
+`df.grant_usage` is granted to the agent/service roles (`service`,
+`agent_primary`, `agent_subconscious`, each with HTTP). `attobot_service` is a member of
 the user tiers so `_tool_sql_as_user` can `SET ROLE` down to them; and because
 instance sessions have `session_user = attobot_service`, `RESET ROLE` restores to
 `service` (never escalates to a superuser). End-user tiers
@@ -366,7 +364,7 @@ Loaded `10`→`40` under `ON_ERROR_STOP=1`, then a behavior harness:
 
 ## 15. Open questions
 
-1. Promote users to `authenticated` via a dedicated admin function vs. direct
+1. Promote users to `authenticated` via a dedicated promotion function vs. direct
    `UPDATE` (currently direct).
 2. Per-message turns instead of last-accepter attribution for multi-user batches.
 3. Widen the SQL tool to support writes (data-modifying CTE at top level) so
