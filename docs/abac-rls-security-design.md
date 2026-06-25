@@ -218,7 +218,7 @@ bypass policy (trusted compute); everything else scoped. Full set in
 - **messages** — as [§8](#8-the-worked-example-anonymous-group-chat-user-on-messages); agent roles `FOR ALL` on `agent_id = current_agent_id`.
 - **users** — own row by `id = current_user_id`; agent/service read all; service inserts; admin all.
 - **config** — agent roles `SELECT` non-secret own rows only; writes via `set_config`.
-- **memory / outbox / blobs** — agent-scoped by `current_agent_id`; subconscious reads/writes primary's memory.
+- **memory / outbox / blobs** — agent-scoped by `current_agent_id`; subconscious reads/writes any agent's memory.
 - **agents / models** — PUBLIC read; admin writes.
 - **lifecycle** — internal; agent+service read/insert; no user access.
 

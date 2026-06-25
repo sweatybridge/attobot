@@ -187,8 +187,8 @@ CREATE POLICY messages_service_bypass ON attobot.messages
 
 -- ============================================================================
 -- TABLE: attobot.memory
---   primary owns its memory; subconscious reads primary + writes corrections
---   into primary and updates its own; service/admin full.
+--   primary owns its memory; subconscious reviews and corrects memory across
+--   ALL agents (read + insert + update); service/admin full. No DELETE by agents.
 -- ============================================================================
 
 GRANT SELECT, INSERT, UPDATE ON attobot.memory
@@ -203,24 +203,23 @@ CREATE POLICY memory_primary_all_own ON attobot.memory
   USING (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint)
   WITH CHECK (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint);
 
--- subconscious can read everything the primary owns...
+-- subconscious reads every agent's memory (to review)...
 DROP POLICY IF EXISTS memory_subconscious_read_primary ON attobot.memory;
-CREATE POLICY memory_subconscious_read_primary ON attobot.memory
-  FOR SELECT TO attobot_agent_subconscious
-  USING (agent_id = (SELECT id FROM attobot.agents WHERE slug = 'primary'));
+DROP POLICY IF EXISTS memory_subconscious_read_all ON attobot.memory;
+CREATE POLICY memory_subconscious_read_all ON attobot.memory
+  FOR SELECT TO attobot_agent_subconscious USING (true);
 
--- ...insert corrections into the primary's memory...
+-- ...inserts corrections into any agent's memory...
 DROP POLICY IF EXISTS memory_subconscious_insert_primary ON attobot.memory;
-CREATE POLICY memory_subconscious_insert_primary ON attobot.memory
-  FOR INSERT TO attobot_agent_subconscious
-  WITH CHECK (agent_id = (SELECT id FROM attobot.agents WHERE slug = 'primary'));
+DROP POLICY IF EXISTS memory_subconscious_insert_all ON attobot.memory;
+CREATE POLICY memory_subconscious_insert_all ON attobot.memory
+  FOR INSERT TO attobot_agent_subconscious WITH CHECK (true);
 
--- ...and update its own memory rows.
+-- ...and updates any agent's memory.
 DROP POLICY IF EXISTS memory_subconscious_update_own ON attobot.memory;
-CREATE POLICY memory_subconscious_update_own ON attobot.memory
-  FOR UPDATE TO attobot_agent_subconscious
-  USING (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint)
-  WITH CHECK (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint);
+DROP POLICY IF EXISTS memory_subconscious_update_all ON attobot.memory;
+CREATE POLICY memory_subconscious_update_all ON attobot.memory
+  FOR UPDATE TO attobot_agent_subconscious USING (true) WITH CHECK (true);
 
 DROP POLICY IF EXISTS memory_service_bypass ON attobot.memory;
 CREATE POLICY memory_service_bypass ON attobot.memory
@@ -230,8 +229,8 @@ CREATE POLICY memory_service_bypass ON attobot.memory
 -- TABLE: attobot.memory_sources
 --   Junction backing memory's source messages (the composite FKs enforce
 --   same-agent integrity and cascade). Ownership mirrors attobot.memory: primary
---   owns its own, subconscious reads the primary's and inserts corrections into
---   it (and updates its own), service/admin full.
+--   owns its own, subconscious reads and corrects source links across ALL agents,
+--   service/admin full.
 -- ============================================================================
 
 GRANT SELECT, INSERT, UPDATE ON attobot.memory_sources
@@ -246,24 +245,23 @@ CREATE POLICY memory_sources_primary_all_own ON attobot.memory_sources
   USING (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint)
   WITH CHECK (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint);
 
--- subconscious can read the primary's source links...
+-- subconscious reads every agent's source links...
 DROP POLICY IF EXISTS memory_sources_subconscious_read_primary ON attobot.memory_sources;
-CREATE POLICY memory_sources_subconscious_read_primary ON attobot.memory_sources
-  FOR SELECT TO attobot_agent_subconscious
-  USING (agent_id = (SELECT id FROM attobot.agents WHERE slug = 'primary'));
+DROP POLICY IF EXISTS memory_sources_subconscious_read_all ON attobot.memory_sources;
+CREATE POLICY memory_sources_subconscious_read_all ON attobot.memory_sources
+  FOR SELECT TO attobot_agent_subconscious USING (true);
 
--- ...insert corrections into the primary's source links...
+-- ...inserts source links for any agent...
 DROP POLICY IF EXISTS memory_sources_subconscious_insert_primary ON attobot.memory_sources;
-CREATE POLICY memory_sources_subconscious_insert_primary ON attobot.memory_sources
-  FOR INSERT TO attobot_agent_subconscious
-  WITH CHECK (agent_id = (SELECT id FROM attobot.agents WHERE slug = 'primary'));
+DROP POLICY IF EXISTS memory_sources_subconscious_insert_all ON attobot.memory_sources;
+CREATE POLICY memory_sources_subconscious_insert_all ON attobot.memory_sources
+  FOR INSERT TO attobot_agent_subconscious WITH CHECK (true);
 
--- ...and update its own.
+-- ...and updates any agent's source links.
 DROP POLICY IF EXISTS memory_sources_subconscious_update_own ON attobot.memory_sources;
-CREATE POLICY memory_sources_subconscious_update_own ON attobot.memory_sources
-  FOR UPDATE TO attobot_agent_subconscious
-  USING (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint)
-  WITH CHECK (agent_id = NULLIF(current_setting('attobot.current_agent_id', true), '')::bigint);
+DROP POLICY IF EXISTS memory_sources_subconscious_update_all ON attobot.memory_sources;
+CREATE POLICY memory_sources_subconscious_update_all ON attobot.memory_sources
+  FOR UPDATE TO attobot_agent_subconscious USING (true) WITH CHECK (true);
 
 DROP POLICY IF EXISTS memory_sources_service_bypass ON attobot.memory_sources;
 CREATE POLICY memory_sources_service_bypass ON attobot.memory_sources

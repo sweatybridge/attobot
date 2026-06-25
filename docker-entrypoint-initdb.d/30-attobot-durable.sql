@@ -196,7 +196,7 @@ CREATE OR REPLACE FUNCTION attobot.ensure_agent_cron_loop(
   p_agent_slug text DEFAULT 'subconscious',
   p_name text DEFAULT 'review',
   p_cron text DEFAULT '*/10 * * * *',
-  p_message text DEFAULT 'review the primary agent stream for actionable corrections'
+  p_message text DEFAULT 'review agent streams for actionable memory corrections'
 )
 RETURNS text
 LANGUAGE plpgsql
