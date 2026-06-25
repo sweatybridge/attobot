@@ -1,4 +1,4 @@
-SELECT attobot.ensure_model(
+SELECT attobot.upsert_model(
   p_model => COALESCE(NULLIF(:'model', ''), 'deepseek-v4-pro'),
   p_api_base => COALESCE(NULLIF(:'api_base', ''), 'https://api.deepseek.com/v1'),
   p_temperature => COALESCE(NULLIF(:'temperature', ''), '1.0')::numeric,
@@ -8,7 +8,7 @@ SELECT attobot.ensure_model(
 ) AS model_id
 \gset
 
-SELECT attobot.ensure_agent(
+SELECT attobot.upsert_agent(
   p_slug => 'primary',
   p_soul => $primary_soul$
 You are the primary attobot agent.
@@ -31,7 +31,7 @@ $primary_soul$,
   p_model_id => :model_id
 );
 
-SELECT attobot.ensure_agent(
+SELECT attobot.upsert_agent(
   p_slug => 'subconscious',
   p_soul => $subconscious_soul$
 You are the subconscious attobot agent.

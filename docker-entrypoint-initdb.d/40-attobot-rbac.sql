@@ -15,7 +15,7 @@
 --
 -- What this file deliberately does NOT do:
 --   * It does NOT redefine any existing function (append_message,
---     process_telegram_updates, ensure_agent, set_config, configure_telegram,
+--     process_telegram_updates, upsert_agent, set_config, configure_telegram,
 --     ...). SECURITY DEFINER conversion is Phase 3, owned separately, to avoid
 --     the inline-duplication drift hazard of the prior attempt.
 --   * It does NOT FORCE RLS, so the table owner / superuser still bypasses it.
@@ -39,9 +39,6 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'attobot_admin') THEN
     CREATE ROLE attobot_admin NOLOGIN;
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'attobot_service') THEN
-    CREATE ROLE attobot_service NOLOGIN;
-  END IF;
 
   -- One role per agent
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'attobot_agent_primary') THEN
@@ -51,23 +48,23 @@ BEGIN
     CREATE ROLE attobot_agent_subconscious NOLOGIN;
   END IF;
 
-  -- Telegram user tiers
+  -- User tiers for tool calling
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'attobot_authenticated') THEN
     CREATE ROLE attobot_authenticated NOLOGIN;
   END IF;
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'attobot_anonymous') THEN
     CREATE ROLE attobot_anonymous NOLOGIN;
   END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'attobot_service') THEN
+    CREATE ROLE attobot_service NOLOGIN;
+  END IF;
 END $$;
 
 -- Agent roles run their own loops now: the pg_durable worker connects as the
 -- submitted role (the agent role), so they must be LOGIN (non-superuser, so
--- enable_superuser_instances=off is satisfied). attobot_service is no longer the
--- orchestrator — it is only the subconscious's broad, secret-free SET ROLE
--- target — so it is NOLOGIN.
+-- enable_superuser_instances=off is satisfied).
 ALTER ROLE attobot_agent_primary LOGIN;
 ALTER ROLE attobot_agent_subconscious LOGIN;
-ALTER ROLE attobot_service NOLOGIN;
 
 -- ============================================================================
 -- SCHEMA USAGE
@@ -373,7 +370,7 @@ CREATE POLICY blobs_service_bypass ON attotools.blobs
 -- ============================================================================
 -- TABLE: attobot.users   (channel identity ledger; intake upserts telegram users)
 --   A user reads only their own row; agent/service read all (to resolve the
---   requesting user during a turn); service inserts (ensure_user); the primary
+--   requesting user during a turn); service inserts (upsert_user); the primary
 --   agent role may also create and edit users (insert/update, no delete — e.g.
 --   to promote tier); admin manages the ledger incl. promoting tier
 --   anonymous -> authenticated.
@@ -402,7 +399,7 @@ CREATE POLICY users_agent_service_read ON attobot.users
   FOR SELECT TO attobot_agent_primary, attobot_agent_subconscious, attobot_service
   USING (true);
 
--- service inserts new users (ensure_user from intake)
+-- service inserts new users (upsert_user from intake)
 DROP POLICY IF EXISTS users_service_insert ON attobot.users;
 CREATE POLICY users_service_insert ON attobot.users
   FOR INSERT TO attobot_service WITH CHECK (true);
@@ -433,7 +430,7 @@ CREATE POLICY users_admin_all ON attobot.users
 -- function surface.
 -- Agent roles now run their own loops, so they also need the full attobot
 -- function surface (compose_llm_request, record_assistant, poll_messages,
--- ensure_user, helpers, ...).
+-- upsert_user, helpers, ...).
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA attobot
   TO attobot_service, attobot_admin, attobot_agent_primary, attobot_agent_subconscious;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA attotools TO attobot_service, attobot_admin;

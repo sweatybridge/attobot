@@ -165,7 +165,7 @@ BEGIN
     -- track the sender (channel-agnostic ledger)
     v_from_id := v_message #>> '{from,id}';
     IF v_from_id IS NOT NULL AND v_from_id <> '' THEN
-      PERFORM attobot.ensure_user(
+      PERFORM attobot.upsert_user(
         'telegram', v_from_id,
         v_message #>> '{from,username}',
         v_message #>> '{from,first_name}',

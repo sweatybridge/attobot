@@ -50,7 +50,7 @@ Communication to the outside world is driven by long polling Telegram.
 -> df.loop (attobot.ensure_telegram_inbox_loop) as primary
   -> df.http(getUpdates)
     -> attobot.poll_messages() as primary
-       -> track each sender with attobot.ensure_user() (channel identity ledger)
+       -> track each sender with attobot.upsert_user() (channel identity ledger)
        -> batch-insert accepted messages as role => 'user', channel => 'telegram'
           (one statement -> one user->loop trigger fire)
 -> trigger after insert on messages for each row
@@ -184,7 +184,7 @@ docker compose exec harness psql -U postgres -d postgres
 
 ```sql
 WITH model AS (
-  SELECT attobot.ensure_model(
+  SELECT attobot.upsert_model(
     p_model => 'deepseek-v4-pro',
     p_api_base => 'https://api.deepseek.com/v1',
     p_temperature => 1.0,
@@ -193,7 +193,7 @@ WITH model AS (
     p_multimodal_support => false
   ) AS id
 )
-SELECT attobot.ensure_agent(
+SELECT attobot.upsert_agent(
   p_slug => 'primary',
   p_soul => $$
 You are a persistent agent running inside PostgreSQL.
@@ -317,7 +317,7 @@ SELECT attobot.ensure_agent_cron_loop(
 - `attobot.lifecycle`: append-only audit log of operational events (agent
   ensure, message appends, telegram poll/send outcomes, security markers).
 - `attobot.users`: channel-agnostic identity ledger. One row per
-  `(channel, external_id)`; telegram intake (`poll_messages` → `ensure_user`)
+  `(channel, external_id)`; telegram intake (`poll_messages` → `upsert_user`)
   upserts senders, and `tier` maps a user to an RLS role suffix
   (`anonymous` / `authenticated`).
 - `attotools.blobs`: content-addressed large content storage as external `bytea`.

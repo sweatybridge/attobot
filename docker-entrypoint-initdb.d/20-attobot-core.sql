@@ -27,7 +27,7 @@ AS $$
   RETURNING id;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.ensure_model(
+CREATE OR REPLACE FUNCTION attobot.upsert_model(
   p_model text DEFAULT 'deepseek-v4-pro',
   p_api_base text DEFAULT 'https://api.deepseek.com/v1',
   p_temperature numeric DEFAULT 1.0,
@@ -58,7 +58,7 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attobot.ensure_agent(
+CREATE OR REPLACE FUNCTION attobot.upsert_agent(
   p_slug text DEFAULT 'primary',
   p_soul text DEFAULT '',
   p_api_key text DEFAULT NULL,
@@ -78,7 +78,7 @@ BEGIN
   END IF;
 
   IF v_model_id IS NULL THEN
-    RAISE EXCEPTION 'agent % requires p_model_id; configure a model with attobot.ensure_model first', p_slug;
+    RAISE EXCEPTION 'agent % requires p_model_id; configure a model with attobot.upsert_model first', p_slug;
   END IF;
 
   INSERT INTO attobot.agents(slug, soul, model_id)
@@ -101,7 +101,7 @@ $$;
 -- Upsert a channel user by (channel, external_id), refreshing profile fields,
 -- and return its internal id + tier. Called by intake to auto-track telegram
 -- users; tier is whatever is stored (default 'anonymous').
-CREATE OR REPLACE FUNCTION attobot.ensure_user(
+CREATE OR REPLACE FUNCTION attobot.upsert_user(
   p_channel text,
   p_external_id text,
   p_username text DEFAULT NULL,

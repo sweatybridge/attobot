@@ -141,7 +141,7 @@ CREATE TABLE attobot.users (
 ```
 
 `attobot.process_telegram_updates` upserts each accepted sender via
-`attobot.ensure_user('telegram', from.id, from.username, from.first_name,
+`attobot.upsert_user('telegram', from.id, from.username, from.first_name,
 from)` and remembers the **last accepted** user's internal id as the turn's
 **requesting user** (`start_turn(p_agent_slug, p_requesting_user_id)`).
 (Multi-user poll batches attribute the turn to the last accepter — a documented
@@ -354,7 +354,7 @@ never merged. Defects fixed here:
 
 Loaded `10`→`40` under `ON_ERROR_STOP=1`, then a behavior harness:
 
-- `ensure_user` upserts with stable id; tier preserved across re-upsert after promotion.
+- `upsert_user` upserts with stable id; tier preserved across re-upsert after promotion.
 - Expanded anonymous `SELECT` returns the whole chat (incl. other users + assistant).
 - SQL tool via `_execute_sync_tool_call` as user 111: reads chat-wide messages;
   `SELECT … FROM attobot.config` → `permission denied`; forged INSERT (as 222)
