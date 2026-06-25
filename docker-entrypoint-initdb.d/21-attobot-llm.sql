@@ -162,6 +162,10 @@ BEGIN
     RAISE EXCEPTION 'agent is missing or disabled: %', p_agent_slug;
   END IF;
 
+  -- Bind the agent GUC so the agent-scoped history/memory reads below resolve
+  -- under RLS (the loop now runs as the agent role, not service-bypass).
+  PERFORM set_config('attobot.current_agent_id', v_agent.id::text, true);
+
   SELECT m.*
   INTO v_model
   FROM attobot.models m

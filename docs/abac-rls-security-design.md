@@ -1,7 +1,15 @@
 # ABAC / Row-Level Security for AttoBot
 
-**Status:** Implemented (this PR) — roles, RLS policies, the `users` ledger, and
-**active enforcement of user-scoped tool execution**.
+**Status:** Implemented — roles, RLS policies, the `users` ledger, and active
+enforcement of user-scoped tool execution.
+**Evolution since this doc was written:** each agent's loop now runs as that
+agent's own role (`attobot_agent_*`, `LOGIN`) rather than as `attobot_service`;
+`attobot_service` is repurposed as the subconscious's broad, **secret-free**
+tool-call scope; and agent roles read their own secrets from fixed loop code
+while every LLM-authored SQL scope (user tier / `attobot_service`) stays
+secret-free. The **README access matrix is the current source of truth**. Some
+mechanics described below (notably `start_turn`, the `outbox`, and
+`process_telegram_updates`) predate the trigger-driven loop and are stale.
 **Branch:** `docs/abac-rls-security` → `develop`.
 **Supersedes:** the stale `feature/abac-rls-security` attempt (see [§12](#12-prior-attempt--why-this-is-different)).
 
@@ -154,7 +162,7 @@ approximation; per-message turns are a later refinement.)
 | `models` | SELECT | SELECT | SELECT | SELECT | SELECT | ALL |
 | `messages` | **SELECT chat-wide**; INSERT/UPDATE own; **no DELETE** | same | SELECT/INSERT/UPDATE own agent; no DELETE | SELECT primary agent | ALL | ALL |
 | `memory` | — | — | ALL own agent | SELECT primary; INSERT primary; UPDATE own | ALL | ALL |
-| `config` | — | — | SELECT **non-secret** own | SELECT non-secret own | ALL | ALL |
+| `config` | — | — | SELECT own (incl. secrets) | SELECT own (incl. secrets) | SELECT non-secret | ALL |
 | `outbox` | — | — | INSERT/UPDATE own agent | — | ALL | ALL |
 | `lifecycle` | — | — | SELECT; INSERT own | SELECT; INSERT own | SELECT/INSERT/UPDATE | ALL |
 | `attotools.blobs` | — | — | SELECT/INSERT/UPDATE own agent | SELECT own | ALL | ALL |
@@ -162,9 +170,10 @@ approximation; per-message turns are a later refinement.)
 
 Two least-privilege decisions:
 
-- **Secrets are never readable by agent/user roles.** `config` rows with
-  `secret = true` (`api_key`, `telegram_token`) are hidden even from the owning
-  agent role. Only `service`/`admin` see them.
+- **Secrets are kept out of every LLM-tool scope.** Agent roles now read their
+  own `secret = true` config (`api_key`, `telegram_token`) from fixed loop code;
+  the LLM-authored SQL scopes (user tier, `attobot_service`) still cannot. Only
+  `admin` sees all secrets directly.
 - **`messages` SELECT is chat-wide for users.** The whole conversation belongs
   to one configured chat = one agent, so a user sees all of it (including other
   users' messages and the agent's replies). INSERT/UPDATE stay pinned to their

@@ -184,6 +184,10 @@ DECLARE
   v_agent_id bigint := attobot.agent_id(p_agent_slug);
   v_id bigint;
 BEGIN
+  -- Bind the agent GUC so the INSERT satisfies the agent-scoped WITH CHECK
+  -- policy (loop runs as the agent role, not service-bypass).
+  PERFORM set_config('attobot.current_agent_id', v_agent_id::text, true);
+
   INSERT INTO attobot.messages(agent_id, role, content, payload, channel, chat_id, tool_call_id)
   VALUES (v_agent_id, p_role, coalesce(p_content, ''), coalesce(p_payload, '{}'::jsonb), p_channel, p_chat_id, p_tool_call_id)
   RETURNING id INTO v_id;

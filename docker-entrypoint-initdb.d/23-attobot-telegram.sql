@@ -112,8 +112,8 @@ DECLARE
   v_update jsonb;
   v_update_id bigint;
   v_max_update_id bigint := NULL;
-  v_chat_id text := attobot._config_text(v_agent_id, 'telegram_chat_id');
-  v_thread_id text := attobot._config_text(v_agent_id, 'telegram_thread_id');
+  v_chat_id text;
+  v_thread_id text;
   v_message jsonb;
   v_message_chat_id text;
   v_message_thread_id text;
@@ -123,6 +123,12 @@ DECLARE
   v_accepted_count integer := 0;
   v_ignored integer := 0;
 BEGIN
+  -- Bind the agent GUC (the inbox loop runs as the agent role, not
+  -- service-bypass) before any agent-scoped config/message read.
+  PERFORM set_config('attobot.current_agent_id', v_agent_id::text, true);
+  v_chat_id := attobot._config_text(v_agent_id, 'telegram_chat_id');
+  v_thread_id := attobot._config_text(v_agent_id, 'telegram_thread_id');
+
   v_status := attobot._http_status(p_http_response);
   v_body := attobot._http_body_json(p_http_response);
 

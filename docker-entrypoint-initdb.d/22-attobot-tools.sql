@@ -20,6 +20,10 @@ RETURNS void
 LANGUAGE plpgsql
 AS $$
 BEGIN
+  -- Bind the agent GUC so the INSERT satisfies the agent-scoped WITH CHECK
+  -- policy (run_tool_calls runs as the loop/agent role, not service-bypass).
+  PERFORM set_config('attobot.current_agent_id', p_agent_id::text, true);
+
   INSERT INTO attobot.messages(agent_id, role, content, tool_call_id)
   VALUES (p_agent_id, 'tool', coalesce(p_result, ''), p_tool_call_id)
   ON CONFLICT (agent_id, tool_call_id)

@@ -14,7 +14,7 @@ CREATE OR REPLACE FUNCTION attobot.start_agent_loop(
 )
 RETURNS text
 LANGUAGE plpgsql
-SECURITY DEFINER
+SECURITY INVOKER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE
@@ -43,16 +43,25 @@ BEGIN
 
   SELECT max_turn INTO v_max_turn FROM attobot.agents WHERE id = v_agent_id;
 
-  -- acting role + user context: the requesting user's tier (primary), or the
-  -- agent's own role (cron-driven subconscious, no requesting user)
+  -- SECURITY INVOKER: this runs as the entry-starter's owner (attobot_agent_primary
+  -- via the inbox/user-message trigger, attobot_agent_subconscious via the cron
+  -- loop). Bind the agent GUC for this session so the agent-scoped reads below
+  -- resolve under RLS (no service bypass anymore).
+  PERFORM set_config('attobot.current_agent_id', v_agent_id::text, true);
+
+  -- acting role + user context. Primary user turns drop tool calls to the
+  -- requesting user's tier; subconscious (no requesting user) drops to
+  -- attobot_service (broad, secret-free) so it can review any agent; otherwise
+  -- tools run at the agent's own role.
   IF p_requesting_user_id IS NOT NULL THEN
     SELECT 'attobot_' || u.tier, u.external_id, u.id::text
       INTO v_acting_role, v_ext_id, v_user_id
       FROM attobot.users u WHERE u.id = p_requesting_user_id;
     v_channel := 'telegram';
     SELECT chat_id INTO v_chat_id FROM attobot.messages WHERE id = p_trigger_message_id;
-  END IF;
-  IF v_acting_role IS NULL THEN
+  ELSIF p_agent_slug = 'subconscious' THEN
+    v_acting_role := 'attobot_service';
+  ELSE
     v_acting_role := 'attobot_agent_' || p_agent_slug;
   END IF;
 
@@ -75,9 +84,11 @@ BEGIN
          df.break('done')
        );
 
+  -- The loop condition runs as its own statement in the instance, so bind the
+  -- agent GUC inline (FROM is evaluated before WHERE) before the messages count.
   v_cond := format(
-    'SELECT (SELECT count(*) FROM attobot.messages WHERE agent_id = %s AND role = ''assistant'' AND id > %s) < coalesce((SELECT max_turn FROM attobot.agents WHERE id = %s), 1)',
-    v_agent_id, p_trigger_message_id, v_agent_id
+    'SELECT (SELECT count(*) FROM attobot.messages CROSS JOIN (SELECT set_config(''attobot.current_agent_id'', %L, true)) AS cfg WHERE agent_id = %s AND role = ''assistant'' AND id > %s) < coalesce((SELECT max_turn FROM attobot.agents WHERE id = %s), 1)',
+    v_agent_id::text, v_agent_id, p_trigger_message_id, v_agent_id
   );
 
   SELECT df.start(df.loop(v_body, v_cond), v_label) INTO v_instance;
@@ -139,6 +150,9 @@ SECURITY DEFINER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 BEGIN
+  -- Bind the agent GUC so send_message_future's build-time read of the outbound
+  -- message resolves under primary scope (no service bypass).
+  PERFORM set_config('attobot.current_agent_id', NEW.agent_id::text, true);
   PERFORM df.start(attobot.send_message_future(NEW.id), format('attobot:send:%s', NEW.id));
   RETURN NULL;
 END;
