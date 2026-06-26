@@ -76,7 +76,7 @@ BEGIN
          format('SELECT attobot.append_message(%L, ''system'', format(''[llm http error %%s]'', attobot._http_status($response::jsonb)))::text AS e',
                 p_agent_slug)
            ~> df.break('llm_error')
-       )
+       ) |=> 'assistant'
     ~> df.if(
          'SELECT coalesce(jsonb_array_length(($assistant::jsonb)->''tool_calls''), 0) > 0',
          format('SELECT attotools.run_tool_calls(%L, ($assistant::jsonb)->>''message_id'', ($assistant::jsonb)->''tool_calls'', %L, %L, %L, %s)::text AS tools',
