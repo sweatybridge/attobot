@@ -432,3 +432,44 @@ BEGIN
     );
 END;
 $$;
+
+-- Build the graph for a Telegram sendChatAction (used for the typing indicator).
+-- SELF-BINDS the agent GUC like send_message_future so the token + thread reads
+-- resolve under RLS; meant to be fire-and-forget via df.start. Falls back to the
+-- configured telegram_chat_id when p_chat_id is empty, and targets the same
+-- message_thread_id replies use. The status set here auto-expires after ~5s and
+-- is cleared automatically once the bot's reply is delivered, so callers need
+-- not (and cannot) send an explicit reset.
+CREATE OR REPLACE FUNCTION attobot.send_chat_action_future(
+  p_agent_slug text,
+  p_chat_id text,
+  p_action text DEFAULT 'typing'
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = attobot, attotools, public, pg_temp
+AS $$
+DECLARE
+  v_agent_id bigint := attobot.agent_id(p_agent_slug);
+  v_chat_id text;
+  v_thread_id text;
+  v_body jsonb;
+BEGIN
+  PERFORM set_config('attobot.current_agent_id', v_agent_id::text, true);
+  v_chat_id := coalesce(nullif(p_chat_id, ''), attobot._config_text(v_agent_id, 'telegram_chat_id'));
+  -- no resolvable chat (not configured): emit a no-op node so df.start still works
+  IF v_chat_id IS NULL OR v_chat_id = '' THEN
+    RETURN format('SELECT %L::text AS result', 'no_chat');
+  END IF;
+  v_thread_id := attobot._config_text(v_agent_id, 'telegram_thread_id');
+  v_body := jsonb_build_object('chat_id', v_chat_id, 'action', coalesce(nullif(p_action, ''), 'typing'));
+  IF v_thread_id IS NOT NULL AND v_thread_id <> '' THEN
+    v_body := v_body || jsonb_build_object('message_thread_id', v_thread_id::bigint);
+  END IF;
+  RETURN df.http(
+    attobot._telegram_api_url(p_agent_slug, 'sendChatAction'), 'POST', v_body::text,
+    attobot._telegram_headers(), 15
+  );
+END;
+$$;
