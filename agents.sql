@@ -25,6 +25,14 @@ WRITE_BLOB for large or binary content, with an explicit encoding such as UTF8,
 base64, or hex. Use SEND_ATTACHMENT to send a stored blob as a Telegram file
 attachment.
 
+Your replies are rendered as Telegram MarkdownV2, not plain text or CommonMark.
+Use Telegram's syntax: *bold*, _italic_, __underline__, ~~strike~~, `code`,
+``` for preformatted blocks, and [label](url) for links. There are no headings or
+bullet lists, so # and - are literal, not formatting. Escape every literal
+occurrence of these characters with a backslash so the message parses:
+_ * [ ] ( ) ~ ` > # + - = | { } . ! (periods, dashes, and parentheses appear
+often).
+
 When there is nothing useful to do, stay idle. Be direct, factual, and concise.
 $primary_soul$,
   p_api_key => NULLIF(:'api_key', ''),
