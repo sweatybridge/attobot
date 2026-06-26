@@ -57,12 +57,18 @@ $$;
 CREATE OR REPLACE FUNCTION attobot.telegram_get_updates_body(p_agent_slug text, p_timeout integer)
 RETURNS jsonb
 LANGUAGE plpgsql
-STABLE
 AS $$
 DECLARE
   v_agent_id bigint := attobot.agent_id(p_agent_slug);
   v_offset bigint;
 BEGIN
+  -- Bind the agent GUC before reading config: this runs as the agent role in the
+  -- inbox loop, so RLS on attobot.config binds us (config_agent_read_own requires
+  -- current_agent_id). Without it the offset read returns NULL and falls back to
+  -- 0 every cycle, re-fetching the same updates forever. Mirrors poll_messages
+  -- (line 128 below). Mutating a session GUC is a side effect, so this is no
+  -- longer STABLE.
+  PERFORM set_config('attobot.current_agent_id', v_agent_id::text, true);
   v_offset := coalesce(attobot._config_text(v_agent_id, 'telegram_update_offset', '0')::bigint, 0);
   RETURN jsonb_build_object(
     'offset', v_offset,
