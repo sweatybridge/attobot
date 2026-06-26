@@ -79,8 +79,10 @@ BEGIN
        ) |=> 'assistant'
     ~> df.if(
          'SELECT coalesce(jsonb_array_length(($assistant::jsonb)->''tool_calls''), 0) > 0',
-         format('SELECT attotools.run_tool_calls(%L, (($assistant::jsonb)->>''message_id'')::bigint, ($assistant::jsonb)->''tool_calls'', %L, %L, %L, %s)::text AS tools',
-                p_agent_slug, v_acting_role, coalesce(v_ext_id, ''), coalesce(v_chat_id, ''), coalesce(v_user_id, 'NULL')),
+         format('SELECT attotools.start_tool_calls(%L, (($assistant::jsonb)->>''message_id'')::bigint, ($assistant::jsonb)->''tool_calls'', %L, %L, %L, %s)::text AS started',
+                p_agent_slug, v_acting_role, coalesce(v_ext_id, ''), coalesce(v_chat_id, ''), coalesce(v_user_id, 'NULL'))
+           |=> 'started'
+           ~> format('SELECT attotools.await_tool_calls(%L, $started)::text AS tools', p_agent_slug),
          df.break('done')
        );
 

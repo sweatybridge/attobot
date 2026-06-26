@@ -652,19 +652,24 @@ BEGIN
 END;
 $$;
 
--- Orchestrator: run all tool calls for an assistant message as per-call durable
--- instances, in parallel (start all before awaiting), with timeout + cancel,
--- then append each result as role='tool' (as service). Runs as attobot_service
--- inside the agent-loop instance. Returns a summary.
-CREATE OR REPLACE FUNCTION attotools.run_tool_calls(
+-- Orchestrator for an assistant message's tool calls, split across TWO graph
+-- nodes so the per-call durable instances actually run:
+--   start_tool_calls: df.start every call (parallel), return [{id,tc_id},...].
+--     Its transaction commits when the node ends, so workers can SEE and run the
+--     instances. (Starting and awaiting in the SAME node left the starts
+--     uncommitted in that node's transaction, so no worker picked them up and
+--     every call timed out as "Instance not found".)
+--   await_tool_calls: poll df.status per call (cancel on timeout) and append each
+--     result as role='tool'. Runs in the NEXT node, by which point the starts are
+--     committed and the tool instances are executing on other workers.
+CREATE OR REPLACE FUNCTION attotools.start_tool_calls(
   p_agent_slug text,
   p_message_id bigint,
   p_tool_calls jsonb,
   p_acting_role text,
   p_user_external_id text DEFAULT NULL,
   p_chat_id text DEFAULT NULL,
-  p_user_id bigint DEFAULT NULL,
-  p_timeout integer DEFAULT 120
+  p_user_id bigint DEFAULT NULL
 )
 RETURNS text
 LANGUAGE plpgsql
@@ -679,18 +684,13 @@ DECLARE
   v_args jsonb;
   v_future text;
   v_tc text;
-  v_ids text[] := '{}';
-  v_callids text[] := '{}';
-  v_status text;
-  v_result text;
-  v_deadline timestamptz;
-  v_i integer;
+  v_started jsonb := '[]'::jsonb;
 BEGIN
   IF p_acting_role IS NULL OR p_acting_role = '' THEN
     p_acting_role := 'attobot_agent_primary';
   END IF;
 
-  -- 1. start every tool call as its own instance (parallel: all started first)
+  -- start every tool call as its own instance (all started before any awaiting)
   FOR v_call IN SELECT value FROM jsonb_array_elements(coalesce(p_tool_calls, '[]'::jsonb))
   LOOP
     v_tool_call_id := coalesce(v_call->>'id', 'call_' || md5(v_call::text));
@@ -701,25 +701,54 @@ BEGIN
       p_user_external_id, p_chat_id, p_user_id
     );
     SELECT df.start(v_future, format('attobot:tool:%s:%s', p_message_id, v_tool_call_id)) INTO v_tc;
-    v_ids := array_append(v_ids, v_tc);
-    v_callids := array_append(v_callids, v_tool_call_id);
+    v_started := v_started || jsonb_build_array(
+      jsonb_build_object('id', v_tc, 'tc_id', v_tool_call_id)
+    );
   END LOOP;
 
-  -- 2. await each (poll df.status, cancel on timeout), 3. append result as service
-  FOR v_i IN 1..coalesce(array_length(v_ids, 1), 0)
+  RETURN v_started::text;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION attotools.await_tool_calls(
+  p_agent_slug text,
+  p_started text,
+  p_timeout integer DEFAULT 120
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = attobot, attotools, public, pg_temp
+AS $$
+DECLARE
+  v_agent_id bigint := attobot.agent_id(p_agent_slug);
+  v_item jsonb;
+  v_id text;
+  v_tcid text;
+  v_status text;
+  v_result text;
+  v_deadline timestamptz;
+  v_count integer := 0;
+BEGIN
+  FOR v_item IN SELECT value FROM jsonb_array_elements(
+    coalesce(attobot._try_jsonb(p_started), '[]'::jsonb)
+  )
   LOOP
+    v_count := v_count + 1;
+    v_id := v_item->>'id';
+    v_tcid := v_item->>'tc_id';
     v_deadline := clock_timestamp() + make_interval(secs => p_timeout);
     v_status := NULL;
     LOOP
       BEGIN
-        SELECT df.status(v_ids[v_i]) INTO v_status;
+        SELECT df.status(v_id) INTO v_status;
       EXCEPTION WHEN OTHERS THEN
         v_status := 'error';
       END;
       EXIT WHEN v_status IN ('completed', 'failed', 'cancelled', 'error');
       IF clock_timestamp() >= v_deadline THEN
         BEGIN
-          PERFORM df.cancel(v_ids[v_i], 'tool call timeout');
+          PERFORM df.cancel(v_id, 'tool call timeout');
         EXCEPTION WHEN OTHERS THEN
           NULL;
         END;
@@ -730,7 +759,7 @@ BEGIN
     END LOOP;
 
     BEGIN
-      SELECT df.result(v_ids[v_i]) INTO v_result;
+      SELECT df.result(v_id) INTO v_result;
       v_result := coalesce((attobot._try_jsonb(v_result)->>'result'), v_result);
     EXCEPTION WHEN OTHERS THEN
       v_result := 'error: ' || SQLERRM;
@@ -739,9 +768,9 @@ BEGIN
       v_result := coalesce(v_result, 'error: tool ' || v_status);
     END IF;
 
-    PERFORM attotools._append_tool_message(v_agent_id, v_callids[v_i], v_result);
+    PERFORM attotools._append_tool_message(v_agent_id, v_tcid, v_result);
   END LOOP;
 
-  RETURN jsonb_build_object('tool_calls', array_length(v_ids, 1))::text;
+  RETURN jsonb_build_object('tool_calls', v_count)::text;
 END;
 $$;
