@@ -308,6 +308,13 @@ BEGIN
     -- Stamp the requesting user so tool calls can run with that user's scope.
     || jsonb_build_object('requesting_user_id', p_requesting_user_id);
 
+  -- Only mark a turn for delivery when it is a final reply: an assistant turn
+  -- that carries tool calls is an intermediate step (often with empty text), so
+  -- leaving its channel NULL keeps the outbound trigger from sending an empty
+  -- message to Telegram. The final no-tool-call reply is delivered as usual.
+  -- Always stamp the delivery channel: a final reply is sent as-is, and a
+  -- tool-call turn (usually empty text) is rendered to its tool name + params
+  -- by send_message_future, so the outbound trigger delivers both.
   v_message_id := attobot.append_message(
     p_agent_slug, 'assistant', v_content, v_payload,
     NULL, p_channel, p_chat_id

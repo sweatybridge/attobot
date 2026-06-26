@@ -79,7 +79,7 @@ BEGIN
        ) |=> 'assistant'
     ~> df.if(
          'SELECT coalesce(jsonb_array_length(($assistant::jsonb)->''tool_calls''), 0) > 0',
-         format('SELECT attotools.run_tool_calls(%L, ($assistant::jsonb)->>''message_id'', ($assistant::jsonb)->''tool_calls'', %L, %L, %L, %s)::text AS tools',
+         format('SELECT attotools.run_tool_calls(%L, (($assistant::jsonb)->>''message_id'')::bigint, ($assistant::jsonb)->''tool_calls'', %L, %L, %L, %s)::text AS tools',
                 p_agent_slug, v_acting_role, coalesce(v_ext_id, ''), coalesce(v_chat_id, ''), coalesce(v_user_id, 'NULL')),
          df.break('done')
        );
@@ -164,7 +164,12 @@ $$;
 CREATE TRIGGER messages_outbound_send_trigger
 AFTER INSERT ON attobot.messages
 FOR EACH ROW
-WHEN (NEW.role IN ('assistant', 'system') AND NEW.channel = 'telegram')
+WHEN (NEW.role IN ('assistant', 'system') AND NEW.channel = 'telegram'
+      AND (coalesce(NEW.content, '') <> ''
+           OR NEW.payload ? 'attachment'
+           OR (NEW.payload ? 'tool_calls'
+               AND jsonb_typeof(NEW.payload->'tool_calls') = 'array'
+               AND jsonb_array_length(NEW.payload->'tool_calls') > 0)))
 EXECUTE FUNCTION attobot.after_outbound_message_send();
 
 -- ============================================================================

@@ -360,6 +360,24 @@ BEGIN
 END;
 $$;
 
+-- Render an OpenAI tool_calls array as a compact, human-readable block so a
+-- tool-call assistant turn can be delivered to Telegram (where the raw turn is
+-- usually empty text). One line per call: "🔧 NAME(<arguments json>)". Returns
+-- '' when there are no calls or the input is not an array.
+CREATE OR REPLACE FUNCTION attobot._render_tool_calls(p_tool_calls jsonb)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $$
+  SELECT coalesce(string_agg(
+    format('🔧 %s(%s)', tc -> 'function' ->> 'name', tc -> 'function' ->> 'arguments'),
+    E'\n'
+  ), '')
+  FROM jsonb_array_elements(
+    CASE WHEN jsonb_typeof(p_tool_calls) = 'array' THEN p_tool_calls ELSE '[]'::jsonb END
+  ) AS t(tc);
+$$;
+
 -- Build the send-graph for an outbound message. Text → df.http sendMessage then
 -- send_message (logs the status); attachment → send_message (curl + log). Used
 -- by the outbound trigger to df.start a send instance. SELF-BINDS the agent GUC
@@ -377,6 +395,7 @@ DECLARE
   v_chat_id text;
   v_thread_id text;
   v_blob_hash text;
+  v_tools text;
   v_body jsonb;
 BEGIN
   PERFORM set_config('attobot.current_agent_id', v_agent_id::text, true);
@@ -391,8 +410,14 @@ BEGIN
     RETURN format('SELECT attobot.send_message(%L, %s)::jsonb AS result', p_agent_slug, p_message_id);
   END IF;
 
-  -- text: df.http sends via sendMessage, then send_message logs the status
-  v_body := jsonb_build_object('chat_id', v_chat_id, 'text', left(coalesce(v_msg.content, ''), 4096));
+  -- text: df.http sends via sendMessage, then send_message logs the status.
+  -- A tool-call turn with empty content is rendered to its tool name + params
+  -- so the chat sees what the agent is doing instead of an empty message.
+  v_tools := attobot._render_tool_calls(v_msg.payload->'tool_calls');
+  v_body := jsonb_build_object(
+    'chat_id', v_chat_id,
+    'text', left(concat_ws(E'\n', nullif(v_msg.content, ''), nullif(v_tools, '')), 4096)
+  );
   IF v_thread_id IS NOT NULL AND v_thread_id <> '' THEN
     v_body := v_body || jsonb_build_object('message_thread_id', v_thread_id::bigint);
   END IF;

@@ -79,8 +79,10 @@ The durable turn workflow is SQL:
   with a timeout, cancelled on timeout), not as child workflows that signal a
   parent. The orchestrator appends each result as a `tool` message as
   `attobot_service`.
-- Assistant replies with no tool calls are delivered by the outbound trigger
-  when `channel = 'telegram'`; otherwise they simply stay in `attobot.messages`.
+- Assistant turns are delivered by the outbound trigger when
+  `channel = 'telegram'`: final replies go out as their text, and tool-call
+  turns (usually empty text) are rendered to the tool name + params so the chat
+  sees what the agent is doing.
 - `SEND_ATTACHMENT` queues an attachment by inserting a `system` message
   (channel `telegram`) whose payload references a stored blob; the outbound
   trigger then delivers it.
@@ -280,10 +282,12 @@ accepted messages as `[telegram <update_id>] ...` user messages. It accepts only
 the configured chat, and the configured topic when `telegram_thread_id` is set.
 
 Outbound delivery is trigger-driven: any `assistant` or `system` row inserted
-into `attobot.messages` with `channel = 'telegram'` fires a row-level trigger
-that starts a one-shot durable send workflow for that message. Text replies go
-out via `sendMessage`; a row whose payload carries an `attachment` (e.g. queued
-by `SEND_ATTACHMENT`) goes out as a document.
+into `attobot.messages` with `channel = 'telegram'` (and with something to send
+— text, tool calls, or an attachment) fires a row-level trigger that starts a
+one-shot durable send workflow for that message. Text replies go out via
+`sendMessage`; a tool-call turn is rendered to `🔧 NAME(<params>)` (one line per
+call) and sent the same way; a row whose payload carries an `attachment` (e.g.
+queued by `SEND_ATTACHMENT`) goes out as a document.
 
 Attachment delivery exports the blob to a temporary file inside the Postgres
 container, then uploads it with Telegram `sendDocument` using `curl`.
