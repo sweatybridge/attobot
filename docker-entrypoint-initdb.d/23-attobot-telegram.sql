@@ -362,17 +362,22 @@ $$;
 
 -- Render an OpenAI tool_calls array as a compact, human-readable block so a
 -- tool-call assistant turn can be delivered to Telegram (where the raw turn is
--- usually empty text). One line per call: "🔧 NAME(<arguments json>)". Returns
--- '' when there are no calls or the input is not an array.
+-- usually empty text). One line per call: "🔧 NAME(<arguments json>)", wrapped
+-- in a MarkdownV2 fenced code block so the JSON arguments need no escaping
+-- (outbound messages are sent with parse_mode=MarkdownV2). Returns '' when
+-- there are no calls or the input is not an array.
 CREATE OR REPLACE FUNCTION attobot._render_tool_calls(p_tool_calls jsonb)
 RETURNS text
 LANGUAGE sql
 IMMUTABLE
 AS $$
-  SELECT coalesce(string_agg(
-    format('🔧 %s(%s)', tc -> 'function' ->> 'name', tc -> 'function' ->> 'arguments'),
-    E'\n'
-  ), '')
+  SELECT coalesce(
+    E'```\n' || string_agg(
+      format('🔧 %s(%s)', tc -> 'function' ->> 'name', tc -> 'function' ->> 'arguments'),
+      E'\n'
+    ) || E'\n```',
+    ''
+  )
   FROM jsonb_array_elements(
     CASE WHEN jsonb_typeof(p_tool_calls) = 'array' THEN p_tool_calls ELSE '[]'::jsonb END
   ) AS t(tc);
@@ -416,7 +421,8 @@ BEGIN
   v_tools := attobot._render_tool_calls(v_msg.payload->'tool_calls');
   v_body := jsonb_build_object(
     'chat_id', v_chat_id,
-    'text', left(concat_ws(E'\n', nullif(v_msg.content, ''), nullif(v_tools, '')), 4096)
+    'text', left(concat_ws(E'\n', nullif(v_msg.content, ''), nullif(v_tools, '')), 4096),
+    'parse_mode', 'MarkdownV2'
   );
   IF v_thread_id IS NOT NULL AND v_thread_id <> '' THEN
     v_body := v_body || jsonb_build_object('message_thread_id', v_thread_id::bigint);
