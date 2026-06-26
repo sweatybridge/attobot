@@ -149,11 +149,14 @@ LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
+DECLARE
+  v_slug text;
 BEGIN
-  -- Bind the agent GUC so send_message_future's build-time read of the outbound
-  -- message resolves under primary scope (no service bypass).
-  PERFORM set_config('attobot.current_agent_id', NEW.agent_id::text, true);
-  PERFORM df.start(attobot.send_message_future(NEW.id), format('attobot:send:%s', NEW.id));
+  -- send_message_future takes the slug and self-binds the agent GUC, so the
+  -- trigger no longer needs to bind it (the prior is_local bind never reached
+  -- the send instance's own transaction anyway). Resolve the owning agent's slug.
+  SELECT slug INTO v_slug FROM attobot.agents WHERE id = NEW.agent_id;
+  PERFORM df.start(attobot.send_message_future(v_slug, NEW.id), format('attobot:send:%s', NEW.id));
   RETURN NULL;
 END;
 $$;

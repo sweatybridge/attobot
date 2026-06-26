@@ -255,18 +255,30 @@ BEGIN
 END;
 $$;
 
--- Send one outbound message via Telegram. Called inside a send instance (df.start
--- from the outbound trigger). Text → df.http sendMessage; attachment → curl.
-CREATE OR REPLACE FUNCTION attobot.send_message(p_message_id bigint)
+-- Send one outbound message via Telegram and record the outcome in lifecycle.
+-- Called inside a send instance (df.start from the outbound trigger). A text
+-- reply is delivered upstream by df.http (sendMessage) in the send graph and
+-- only logged here (p_http_response carries that result); an attachment is
+-- uploaded here via curl (sendDocument) and then logged.
+--
+-- SELF-BINDS the agent GUC: the send instance runs in its own transaction,
+-- separate from the outbound trigger whose is_local bind does not survive into
+-- here, so the agent-scoped reads (messages/config/blobs) and the lifecycle
+-- write resolve under RLS. The slug is threaded in (rather than read from the
+-- message) so the GUC can be bound before the agent-scoped message read.
+CREATE OR REPLACE FUNCTION attobot.send_message(
+  p_agent_slug text,
+  p_message_id bigint,
+  p_http_response jsonb DEFAULT NULL
+)
 RETURNS jsonb
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE
+  v_agent_id bigint := attobot.agent_id(p_agent_slug);
   v_msg attobot.messages%ROWTYPE;
-  v_agent_id bigint;
-  v_slug text;
   v_chat_id text;
   v_thread_id text;
   v_blob_hash text;
@@ -282,110 +294,116 @@ DECLARE
   v_status integer := 0;
   v_response_text text := '';
 BEGIN
+  PERFORM set_config('attobot.current_agent_id', v_agent_id::text, true);
+
+  -- Text reply: df.http already delivered it upstream; record the status only.
+  -- (p_http_response non-NULL is the text-path signal; attachments omit it.)
+  IF p_http_response IS NOT NULL THEN
+    v_status := attobot._http_status(p_http_response);
+    PERFORM attobot.log_event(v_agent_id, 'telegram.send',
+      jsonb_build_object('message_id', p_message_id, 'kind', 'text', 'status', v_status));
+    RETURN jsonb_build_object('sent', v_status >= 200 AND v_status < 300, 'status', v_status);
+  END IF;
+
+  -- Attachment via curl multipart.
   SELECT * INTO v_msg FROM attobot.messages WHERE id = p_message_id;
   IF v_msg.id IS NULL THEN
     RETURN jsonb_build_object('sent', false, 'reason', 'message not found');
   END IF;
-
-  v_agent_id := v_msg.agent_id;
-  SELECT slug INTO v_slug FROM attobot.agents WHERE id = v_agent_id;
-  v_chat_id := coalesce(nullif(v_msg.chat_id, ''), attobot._config_text(v_agent_id, 'telegram_chat_id'));
-  v_thread_id := attobot._config_text(v_agent_id, 'telegram_thread_id');
   v_blob_hash := v_msg.payload #>> '{attachment,blob_hash}';
 
-  IF v_blob_hash IS NOT NULL THEN
-    -- attachment via curl multipart
-    SELECT content INTO v_content FROM attotools.blobs WHERE agent_id = v_agent_id AND hash = v_blob_hash;
-    IF v_content IS NULL THEN
-      PERFORM attobot.log_event(v_agent_id, 'telegram.send.error', jsonb_build_object('message_id', p_message_id, 'error', 'blob not found'));
-      RETURN jsonb_build_object('sent', false, 'reason', 'blob not found');
-    END IF;
-
-    v_filename := attobot._telegram_attachment_filename(v_msg.payload #>> '{attachment,filename}', v_blob_hash);
-    v_mime_type := coalesce(nullif(btrim(v_msg.payload #>> '{attachment,mime_type}'), ''), 'application/octet-stream');
-    IF v_mime_type !~ '^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$' THEN
-      v_mime_type := 'application/octet-stream';
-    END IF;
-    v_caption := left(coalesce(v_msg.payload #>> '{attachment,caption}', ''), 1024);
-    v_url := attobot._telegram_api_url(v_slug, 'sendDocument');
-
-    PERFORM attobot._program_output('mkdir -p /tmp/attobot-telegram');
-    v_oid := lo_from_bytea(0, v_content);
-    v_path := '/tmp/attobot-telegram/' || p_message_id || '-' || v_filename;
-    PERFORM lo_export(v_oid, v_path);
-
-    v_command :=
-      'curl --silent --show-error --request POST --write-out ' || attobot._shell_quote(E'\n%{http_code}') ||
-      ' ' || attobot._shell_quote(v_url) ||
-      ' --form-string ' || attobot._shell_quote('chat_id=' || v_chat_id) ||
-      CASE WHEN v_thread_id IS NOT NULL AND v_thread_id <> ''
-        THEN ' --form-string ' || attobot._shell_quote('message_thread_id=' || v_thread_id) ELSE '' END ||
-      CASE WHEN v_caption <> ''
-        THEN ' --form-string ' || attobot._shell_quote('caption=' || v_caption) ELSE '' END ||
-      ' --form ' || attobot._shell_quote('document=@' || v_path || ';filename=' || v_filename || ';type=' || v_mime_type);
-
-    BEGIN
-      v_output := attobot._program_output(v_command);
-      v_status := coalesce(nullif(substring(v_output from '([0-9]{3})\s*$'), '')::integer, 0);
-      v_response_text := regexp_replace(v_output, E'\n[0-9]{3}\\s*$', '');
-    EXCEPTION WHEN others THEN
-      v_response_text := SQLERRM;
-    END;
-
-    BEGIN IF v_oid IS NOT NULL THEN PERFORM lo_unlink(v_oid); END IF; EXCEPTION WHEN others THEN NULL; END;
-    BEGIN PERFORM attobot._program_output('rm -f -- ' || attobot._shell_quote(v_path)); EXCEPTION WHEN others THEN NULL; END;
-
-    PERFORM attobot.log_event(v_agent_id, 'telegram.send',
-      jsonb_build_object('message_id', p_message_id, 'kind', 'attachment', 'status', v_status));
-    RETURN jsonb_build_object('sent', v_status >= 200 AND v_status < 300, 'status', v_status);
+  SELECT content INTO v_content FROM attotools.blobs WHERE agent_id = v_agent_id AND hash = v_blob_hash;
+  IF v_content IS NULL THEN
+    PERFORM attobot.log_event(v_agent_id, 'telegram.send.error', jsonb_build_object('message_id', p_message_id, 'error', 'blob not found'));
+    RETURN jsonb_build_object('sent', false, 'reason', 'blob not found');
   END IF;
 
-  -- text via df.http sendMessage
-  RETURN jsonb_build_object('deferred', true, 'note', 'text send handled by df.http in the send graph');
+  v_chat_id := coalesce(nullif(v_msg.chat_id, ''), attobot._config_text(v_agent_id, 'telegram_chat_id'));
+  v_thread_id := attobot._config_text(v_agent_id, 'telegram_thread_id');
+  v_filename := attobot._telegram_attachment_filename(v_msg.payload #>> '{attachment,filename}', v_blob_hash);
+  v_mime_type := coalesce(nullif(btrim(v_msg.payload #>> '{attachment,mime_type}'), ''), 'application/octet-stream');
+  IF v_mime_type !~ '^[A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+$' THEN
+    v_mime_type := 'application/octet-stream';
+  END IF;
+  v_caption := left(coalesce(v_msg.payload #>> '{attachment,caption}', ''), 1024);
+  v_url := attobot._telegram_api_url(p_agent_slug, 'sendDocument');
+
+  PERFORM attobot._program_output('mkdir -p /tmp/attobot-telegram');
+  v_oid := lo_from_bytea(0, v_content);
+  v_path := '/tmp/attobot-telegram/' || p_message_id || '-' || v_filename;
+  PERFORM lo_export(v_oid, v_path);
+
+  v_command :=
+    'curl --silent --show-error --request POST --write-out ' || attobot._shell_quote(E'\n%{http_code}') ||
+    ' ' || attobot._shell_quote(v_url) ||
+    ' --form-string ' || attobot._shell_quote('chat_id=' || v_chat_id) ||
+    CASE WHEN v_thread_id IS NOT NULL AND v_thread_id <> ''
+      THEN ' --form-string ' || attobot._shell_quote('message_thread_id=' || v_thread_id) ELSE '' END ||
+    CASE WHEN v_caption <> ''
+      THEN ' --form-string ' || attobot._shell_quote('caption=' || v_caption) ELSE '' END ||
+    ' --form ' || attobot._shell_quote('document=@' || v_path || ';filename=' || v_filename || ';type=' || v_mime_type);
+
+  BEGIN
+    v_output := attobot._program_output(v_command);
+    v_status := coalesce(nullif(substring(v_output from '([0-9]{3})\s*$'), '')::integer, 0);
+    v_response_text := regexp_replace(v_output, E'\n[0-9]{3}\\s*$', '');
+  EXCEPTION WHEN others THEN
+    v_response_text := SQLERRM;
+  END;
+
+  BEGIN IF v_oid IS NOT NULL THEN PERFORM lo_unlink(v_oid); END IF; EXCEPTION WHEN others THEN NULL; END;
+  BEGIN PERFORM attobot._program_output('rm -f -- ' || attobot._shell_quote(v_path)); EXCEPTION WHEN others THEN NULL; END;
+
+  PERFORM attobot.log_event(v_agent_id, 'telegram.send',
+    jsonb_build_object('message_id', p_message_id, 'kind', 'attachment', 'status', v_status));
+  RETURN jsonb_build_object('sent', v_status >= 200 AND v_status < 300, 'status', v_status);
 END;
 $$;
 
--- Build the send-graph for an outbound message. Text → df.http sendMessage;
--- attachment → a node that runs send_message (curl). Used by the outbound
--- trigger to df.start a send instance.
-CREATE OR REPLACE FUNCTION attobot.send_message_future(p_message_id bigint)
+-- Build the send-graph for an outbound message. Text → df.http sendMessage then
+-- send_message (logs the status); attachment → send_message (curl + log). Used
+-- by the outbound trigger to df.start a send instance. SELF-BINDS the agent GUC
+-- for the build-time message read; send_message re-binds it at execution time,
+-- so no graph node depends on session state carried over from the trigger.
+CREATE OR REPLACE FUNCTION attobot.send_message_future(p_agent_slug text, p_message_id bigint)
 RETURNS text
 LANGUAGE plpgsql
 SECURITY INVOKER
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE
+  v_agent_id bigint := attobot.agent_id(p_agent_slug);
   v_msg attobot.messages%ROWTYPE;
-  v_agent_id bigint;
-  v_slug text;
   v_chat_id text;
   v_thread_id text;
   v_blob_hash text;
   v_body jsonb;
 BEGIN
+  PERFORM set_config('attobot.current_agent_id', v_agent_id::text, true);
+
   SELECT * INTO v_msg FROM attobot.messages WHERE id = p_message_id;
-  v_agent_id := v_msg.agent_id;
-  SELECT slug INTO v_slug FROM attobot.agents WHERE id = v_agent_id;
   v_chat_id := coalesce(nullif(v_msg.chat_id, ''), attobot._config_text(v_agent_id, 'telegram_chat_id'));
   v_thread_id := attobot._config_text(v_agent_id, 'telegram_thread_id');
   v_blob_hash := v_msg.payload #>> '{attachment,blob_hash}';
 
   IF v_blob_hash IS NOT NULL THEN
-    RETURN format('SELECT attobot.send_message(%s)::jsonb AS result', p_message_id);
+    -- attachment: send_message uploads via curl and logs (self-binds the GUC)
+    RETURN format('SELECT attobot.send_message(%L, %s)::jsonb AS result', p_agent_slug, p_message_id);
   END IF;
 
+  -- text: df.http sends via sendMessage, then send_message logs the status
   v_body := jsonb_build_object('chat_id', v_chat_id, 'text', left(coalesce(v_msg.content, ''), 4096));
   IF v_thread_id IS NOT NULL AND v_thread_id <> '' THEN
     v_body := v_body || jsonb_build_object('message_thread_id', v_thread_id::bigint);
   END IF;
 
   RETURN df.http(
-    attobot._telegram_api_url(v_slug, 'sendMessage'), 'POST', v_body::text,
+    attobot._telegram_api_url(p_agent_slug, 'sendMessage'), 'POST', v_body::text,
     attobot._telegram_headers(), 30
   ) |=> 'r'
     ~> format(
-      'SELECT attobot.log_event(%s, ''telegram.send'', jsonb_build_object(''message_id'', %s, ''status'', ($r::jsonb->>''status'')::int))::text AS result',
-      v_agent_id, p_message_id
+      'SELECT attobot.send_message(%L, %s, $r::jsonb)::jsonb AS result',
+      p_agent_slug, p_message_id
     );
 END;
 $$;
