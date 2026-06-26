@@ -31,14 +31,11 @@ $primary_soul$,
   p_model_id => :model_id
 );
 
--- Per-agent Exa API key for the SEARCH tool. Stored as a secret; only the
--- primary agent searches the web, so only it gets the key.
-SELECT attobot.set_config(
-  p_agent_slug => 'primary',
-  p_key        => 'exa_api_key',
-  p_value      => to_jsonb(NULLIF(:'exa_api_key', '')),
-  p_secret     => true
-)
+-- Per-agent Exa API key for the SEARCH tool, shared by both agents (one Exa
+-- account). Stored as a secret in each agent's config so either agent's SEARCH
+-- graph builder can read its own key under RLS.
+SELECT attobot.set_config(slug, 'exa_api_key', to_jsonb(NULLIF(:'exa_api_key', '')), true)
+FROM (VALUES ('primary'), ('subconscious')) AS t(slug)
 WHERE NULLIF(:'exa_api_key', '') IS NOT NULL;
 
 SELECT attobot.upsert_agent(
