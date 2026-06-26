@@ -110,6 +110,7 @@ DECLARE
   v_trigger_id bigint;
   v_from_id text;
   v_req_user_id bigint;
+  v_chat_id text;
 BEGIN
   SELECT id INTO v_primary_id FROM attobot.agents WHERE slug = 'primary';
   IF v_primary_id IS NULL OR NOT EXISTS (
@@ -118,8 +119,8 @@ BEGIN
     RETURN NULL;
   END IF;
 
-  SELECT id, payload #>> '{telegram_update,message,from,id}'
-    INTO v_trigger_id, v_from_id
+  SELECT id, chat_id, payload #>> '{telegram_update,message,from,id}'
+    INTO v_trigger_id, v_chat_id, v_from_id
     FROM new_rows
     WHERE role = 'user' AND agent_id = v_primary_id
     ORDER BY id DESC LIMIT 1;
@@ -127,6 +128,14 @@ BEGIN
   IF v_from_id IS NOT NULL THEN
     SELECT id INTO v_req_user_id FROM attobot.users
       WHERE channel = 'telegram' AND external_id = v_from_id;
+    -- Show a typing indicator in the originating chat while the agent loop runs.
+    -- Fire-and-forget before start_agent_loop: the indicator auto-expires (~5s)
+    -- and is cleared once the loop's reply is delivered by the outbound send
+    -- trigger, so there is no reset step.
+    PERFORM df.start(
+      attobot.send_chat_action_future('primary', v_chat_id, 'typing'),
+      format('attobot:typing:%s', v_trigger_id)
+    );
   END IF;
 
   PERFORM attobot.start_agent_loop('primary', v_trigger_id, v_req_user_id);
