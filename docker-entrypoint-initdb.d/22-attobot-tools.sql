@@ -281,41 +281,6 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE FUNCTION attotools._search_result_url(p_href text)
-RETURNS text
-LANGUAGE plpgsql
-IMMUTABLE
-AS $$
-DECLARE
-  v_href text := coalesce(p_href, '');
-  v_uddg text;
-  v_bing_u text;
-  v_b64 text;
-BEGIN
-  v_href := replace(v_href, '&amp;', '&');
-  v_uddg := substring(v_href from '[?&]uddg=([^&]+)');
-  IF v_uddg IS NOT NULL THEN
-    RETURN attotools._url_decode(v_uddg);
-  END IF;
-
-  v_bing_u := substring(v_href from '[?&]u=([^&]+)');
-  IF v_bing_u IS NOT NULL AND v_bing_u LIKE 'a1%' THEN
-    v_b64 := replace(replace(substr(v_bing_u, 3), '-', '+'), '_', '/');
-    WHILE length(v_b64) % 4 <> 0 LOOP
-      v_b64 := v_b64 || '=';
-    END LOOP;
-    RETURN convert_from(decode(v_b64, 'base64'), 'UTF8');
-  END IF;
-
-  IF v_href LIKE '//%' THEN
-    RETURN 'https:' || v_href;
-  END IF;
-  RETURN v_href;
-EXCEPTION WHEN others THEN
-  RETURN v_href;
-END;
-$$;
-
 CREATE OR REPLACE FUNCTION attotools._http_url_allowed(p_url text)
 RETURNS boolean
 LANGUAGE plpgsql
@@ -347,61 +312,6 @@ BEGIN
   END IF;
 
   RETURN true;
-END;
-$$;
-
-CREATE OR REPLACE FUNCTION attotools._search_results_from_html(
-  p_query text,
-  p_limit integer,
-  p_html text
-)
-RETURNS jsonb
-LANGUAGE plpgsql
-IMMUTABLE
-AS $$
-DECLARE
-  v_limit integer := least(greatest(coalesce(p_limit, 5), 1), 10);
-  v_results jsonb := '[]'::jsonb;
-  v_count integer := 0;
-  v_block text;
-  v_h2 text;
-  v_caption text;
-  v_url text;
-  v_title text;
-  v_snippet text;
-BEGIN
-  FOR v_block IN
-    SELECT block
-    FROM unnest(regexp_split_to_array(coalesce(p_html, ''), '<li class="b_algo"')) WITH ORDINALITY AS t(block, ord)
-    WHERE ord > 1
-  LOOP
-    v_h2 := substring(v_block from '<h2[^>]*>.*</h2>');
-    IF v_h2 IS NULL THEN
-      CONTINUE;
-    END IF;
-
-    v_url := attotools._search_result_url(substring(v_h2 from 'href="([^"]+)"'));
-    v_title := attotools._html_text(v_h2);
-    v_caption := substring(v_block from '<div class="b_caption"><p[^>]*>.*</p>');
-    v_snippet := attotools._html_text(coalesce(v_caption, ''));
-
-    IF v_url = '' OR v_title = '' THEN
-      CONTINUE;
-    END IF;
-
-    v_results := v_results || jsonb_build_array(jsonb_build_object(
-      'title', v_title, 'url', v_url, 'snippet', v_snippet
-    ));
-
-    v_count := v_count + 1;
-    EXIT WHEN v_count >= v_limit;
-  END LOOP;
-
-  RETURN jsonb_build_object(
-    'query', p_query,
-    'results', v_results,
-    'result_count', jsonb_array_length(v_results)
-  );
 END;
 $$;
 
@@ -464,7 +374,7 @@ BEGIN
 END;
 $$;
 
--- Build the result text of a SEARCH from its http response (no append).
+-- Build the result text of a SEARCH from its Exa JSON http response (no append).
 CREATE OR REPLACE FUNCTION attotools._search_result(
   p_args jsonb,
   p_http_response jsonb
@@ -473,17 +383,48 @@ RETURNS text
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  v_limit integer;
+  v_limit integer := least(greatest(coalesce((p_args->>'limit')::integer, 5), 1), 10);
+  v_body jsonb;
+  v_row jsonb;
+  v_results jsonb := '[]'::jsonb;
 BEGIN
-  v_limit := least(greatest(coalesce((p_args->>'limit')::integer, 5), 1), 10);
-  RETURN (attotools._search_results_from_html(
-    p_args->>'query', v_limit, coalesce(p_http_response->>'body', '')
+  v_body := attobot._try_jsonb(coalesce(p_http_response->>'body', ''));
+
+  -- Gracefully surface a non-JSON / unexpected Exa body instead of crashing the
+  -- turn (e.g. bad key -> 401, or a stray HTML error page). _try_jsonb never
+  -- returns NULL (it yields {} or {"_raw": ...}), so test the results array
+  -- directly: IS DISTINCT FROM catches missing/null/non-array alike.
+  IF jsonb_typeof(v_body->'results') IS DISTINCT FROM 'array' THEN
+    RETURN jsonb_build_object(
+      'query', p_args->>'query',
+      'results', '[]'::jsonb,
+      'result_count', 0,
+      'status', coalesce((p_http_response->>'status')::integer, 0),
+      'error', 'exa returned no parseable results'
+    )::text;
+  END IF;
+
+  FOR v_row IN
+    SELECT value FROM jsonb_array_elements(v_body->'results') LIMIT v_limit
+  LOOP
+    v_results := v_results || jsonb_build_array(jsonb_build_object(
+      'title',   coalesce(v_row->>'title', ''),
+      'url',     coalesce(v_row->>'url', ''),
+      'snippet', left(coalesce(v_row->>'text', ''), 500)
+    ));
+  END LOOP;
+
+  RETURN (jsonb_build_object(
+    'query', p_args->>'query',
+    'results', v_results,
+    'result_count', jsonb_array_length(v_results)
   ) || jsonb_build_object('status', coalesce((p_http_response->>'status')::integer, 0)))::text;
 END;
 $$;
 
--- Build the SEARCH future (a df http graph). Returns the graph text, or an error
--- result text when the query is empty. Introspected as the SEARCH tool schema.
+-- Build the SEARCH future (a df http graph) against the Exa search API. Returns
+-- the graph text, or an error result text when the query is empty or the agent
+-- has no exa_api_key. Introspected as the SEARCH tool schema.
 CREATE OR REPLACE FUNCTION attotools._tool_search(
   p_query text,
   p_limit integer DEFAULT 5
@@ -493,21 +434,36 @@ LANGUAGE plpgsql
 SET search_path = attobot, attotools, public, pg_temp
 AS $$
 DECLARE
-  v_url text;
   v_limit integer := least(greatest(coalesce(p_limit, 5), 1), 10);
+  v_agent_id bigint;
+  v_key text;
+  v_body text;
 BEGIN
   IF btrim(coalesce(p_query, '')) = '' THEN
     RETURN format('SELECT %L::text AS result', 'error: SEARCH requires query');
   END IF;
 
-  v_url := 'https://www.bing.com/search?q=' || attotools._url_encode(p_query);
-  RETURN df.http(
-    v_url, 'GET', '',
-    jsonb_build_object(
-      'User-Agent', 'Mozilla/5.0 (compatible; attobot-search/1.0)',
-      'Accept', 'text/html,application/xhtml+xml,application/xml,text/plain,*/*;q=0.8'
-    ), 30
-  ) |=> 'http'
+  -- Agent context reaches the tool via GUC (there are no agent params: the
+  -- signature is introspected as the LLM-facing schema). start_tool_calls binds
+  -- it for this path; the agent role can SELECT its own secret config under RLS.
+  v_agent_id := nullif(current_setting('attobot.current_agent_id', true), '')::bigint;
+  v_key := attobot._config_text(v_agent_id, 'exa_api_key');
+  IF v_key IS NULL OR v_key = '' THEN
+    RETURN format('SELECT %L::text AS result', 'error: SEARCH requires exa_api_key config');
+  END IF;
+
+  v_body := jsonb_build_object(
+    'query', p_query,
+    'numResults', v_limit,
+    'contents', jsonb_build_object('text', jsonb_build_object('maxCharacters', 500))
+  )::text;
+
+  RETURN format('SELECT %L::text AS body', v_body) |=> 'request'
+    ~> df.http(
+      'https://api.exa.ai/search', 'POST', '$request',
+      jsonb_build_object('x-api-key', v_key, 'Content-Type', 'application/json'),
+      30
+    ) |=> 'http'
     ~> format(
       'SELECT attotools._search_result(%L::jsonb, $http::jsonb)::text AS result',
       jsonb_build_object('query', p_query, 'limit', v_limit)::text
@@ -686,6 +642,11 @@ DECLARE
   v_tc text;
   v_started jsonb := '[]'::jsonb;
 BEGIN
+  -- Bind agent context so the SEARCH graph builder (_tool_search) can read the
+  -- agent's own secret config (exa_api_key) under RLS. The synchronous tools
+  -- bind it again inside run_tool_call_as_role; setting it here is harmless.
+  PERFORM set_config('attobot.current_agent_id', v_agent_id::text, true);
+
   IF p_acting_role IS NULL OR p_acting_role = '' THEN
     p_acting_role := 'attobot_agent_primary';
   END IF;

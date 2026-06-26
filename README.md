@@ -165,10 +165,12 @@ Postgres passes its healthcheck, the one-shot `agent-init` service runs `psql`
 against the `harness` service and loads the mounted `agents.sql` seed file. That
 job creates the `primary` and `subconscious` agents. Set `ATTOBOT_API_KEY`
 before first boot, or rerun `agent-init` later, to seed both agents with an LLM
-key. Secrets are stored in agent-scoped `attobot.config` rows:
+key. Set `ATTOBOT_EXA_API_KEY` the same way to give the `primary` agent a key
+for the Exa-backed SEARCH tool. Secrets are stored in agent-scoped
+`attobot.config` rows:
 
 ```bash
-ATTOBOT_API_KEY=sk-... docker compose up -d
+ATTOBOT_API_KEY=sk-... ATTOBOT_EXA_API_KEY=... docker compose up -d
 ```
 
 You can also override the shared model with `ATTOBOT_MODEL`,
@@ -344,7 +346,9 @@ call as its own durable instance (all started before awaiting, so they run in
 parallel) and polls `df.status` per call with a timeout. A call that does not
 finish in time is cancelled with `df.cancel` and its `tool` message records the
 timeout/error. `SEARCH` and `WEBFETCH` are themselves `df.http` graphs;
-`SEARCH` queries Bing's HTML endpoint and returns up to 10 parsed results.
+`SEARCH` queries the [Exa](https://exa.ai) search API and returns up to 10 parsed
+results; it needs a per-agent `exa_api_key` secret (set `ATTOBOT_EXA_API_KEY`
+at boot for the `primary` agent).
 `WEBFETCH` is limited to public `http` and `https` URLs and blocks obvious
 local/private hosts. Synchronous tools (`SQL`, the blob tools,
 `SEND_ATTACHMENT`) run under the acting role via `SET ROLE` + session GUCs, so

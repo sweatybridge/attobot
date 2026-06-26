@@ -33,6 +33,7 @@ services:
       - --single-transaction
       - --set=ON_ERROR_STOP=1
       - --set=api_key=${ATTOBOT_API_KEY:-}
+      - --set=exa_api_key=${ATTOBOT_EXA_API_KEY:-}
       - --set=model=${ATTOBOT_MODEL:-deepseek-v4-pro}
       - --set=api_base=${ATTOBOT_API_BASE:-https://api.deepseek.com/v1}
       - --set=temperature=${ATTOBOT_TEMPERATURE:-1.0}
