@@ -134,7 +134,8 @@ You run inside PostgreSQL. Your canonical state is attobot.messages.
 Use tool calls when you need to act. Final assistant text with no tool calls is
 delivered to the operator automatically.
 Use SEARCH for web discovery, WEBFETCH to read a URL, SQL for database work,
-and WRITE_BLOB for large or binary content.
+WRITE_BLOB for large or binary content, and BASH to run a shell command on a
+registered SSH host.
 </harness>',
     v_agent.soul,
     CASE
