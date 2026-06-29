@@ -345,6 +345,50 @@ END;
 $$;
 COMMENT ON FUNCTION attotools._tool_sql(text) IS 'Run one semicolon-free SQL query inside PostgreSQL. The query must return rows. For writes, use a data-modifying CTE with RETURNING.';
 
+-- BASH: run a shell command on a remote host registered in ssh.hosts (the pg_ssh
+-- catalog). ssh.ssh_exec is SECURITY DEFINER, owned by the postgres superuser
+-- that ran CREATE EXTENSION, with EXECUTE granted to PUBLIC by default, so the
+-- acting role can call it with no extra grants. The PEM keys never leave
+-- ssh.hosts (superuser-only); the operator registers hosts and pins host-key
+-- fingerprints out of band, and can REVOKE EXECUTE FROM PUBLIC to restrict which
+-- roles may run remote commands. On connection/auth failure ssh_exec raises,
+-- which run_tool_call_as_role turns into an 'error: ...' result.
+CREATE OR REPLACE FUNCTION attotools._tool_bash(
+  p_host text,
+  p_command text
+)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = attobot, attotools, public, pg_temp
+AS $$
+DECLARE
+  v_host text := btrim(coalesce(p_host, ''));
+  v_command text := coalesce(p_command, '');
+  v_stdout text;
+  v_stderr text;
+  v_exit integer;
+BEGIN
+  IF v_host = '' THEN
+    RAISE EXCEPTION 'BASH requires host';
+  END IF;
+  IF v_command = '' THEN
+    RAISE EXCEPTION 'BASH requires command';
+  END IF;
+
+  SELECT stdout, stderr, exit_code
+    INTO v_stdout, v_stderr, v_exit
+  FROM ssh.ssh_exec(v_host, v_command);
+
+  RETURN jsonb_build_object(
+    'host', v_host,
+    'exit_code', coalesce(v_exit, -1),
+    'stdout', coalesce(v_stdout, ''),
+    'stderr', coalesce(v_stderr, '')
+  )::text;
+END;
+$$;
+COMMENT ON FUNCTION attotools._tool_bash(text, text) IS 'Run a shell command on a remote host over SSH and return stdout, stderr, and exit_code. The host must already be registered in ssh.hosts.';
+
 -- Build the result text of a WEBFETCH from its http response (no append).
 CREATE OR REPLACE FUNCTION attotools._webfetch_result(
   p_args jsonb,
@@ -536,6 +580,9 @@ BEGIN
     -- agent_id/agent_slug param, so every parameter is LLM-facing & introspectable).
     v_result := CASE p_name
       WHEN 'SQL' THEN attotools._tool_sql(coalesce(p_args->>'query', ''))
+      WHEN 'BASH' THEN attotools._tool_bash(
+            coalesce(p_args->>'host', ''),
+            coalesce(p_args->>'command', ''))
       WHEN 'SEND_ATTACHMENT' THEN attotools._tool_send_attachment(
             coalesce(p_args->>'hash', ''),
             coalesce(p_args->>'filename', ''),
